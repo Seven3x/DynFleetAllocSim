@@ -1,0 +1,522 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
+
+from .config import SimulationConfig
+from .cost_estimator import fast_cost_estimate, heading_to_point
+from .entities import Task, Vehicle
+from .map_utils import WorldMap
+from .neighbor_coordination import CoordinationLog, TaskRecord, build_neighbors, run_coordination
+from .planner_astar import AStarPlanner
+from .verification import VerificationResult, verify_bid
+
+
+AUCTIONABLE_STATES = {"unassigned", "withdrawn"}
+
+
+@dataclass
+class Bid:
+    vehicle_id: int
+    task_id: int
+    value: float
+
+
+@dataclass
+class AuctionRoundLog:
+    round_idx: int
+    phase: str
+    bids: List[Bid]
+    tentative_winners: List[Bid]
+
+
+@dataclass
+class VerificationLog:
+    round_idx: int
+    task_id: int
+    vehicle_id: int
+    c_hat: float
+    c_tilde: float
+    e_under: float
+    passed: bool
+    forced_accept: bool
+
+
+@dataclass
+class EventLog:
+    step: int
+    event_type: str
+    task_id: int
+    message: str
+
+
+@dataclass
+class AllocationResult:
+    vehicles: List[Vehicle]
+    tasks: List[Task]
+    auction_logs: List[AuctionRoundLog]
+    coordination_logs: List[CoordinationLog]
+    verification_logs: List[VerificationLog]
+    event_logs: List[EventLog]
+    system_total_time: float
+
+
+class AllocationEngine:
+    def __init__(
+        self,
+        vehicles: List[Vehicle],
+        tasks: List[Task],
+        world: WorldMap,
+        cfg: SimulationConfig,
+        planner: AStarPlanner,
+    ) -> None:
+        self.vehicles = vehicles
+        self.tasks = tasks
+        self.world = world
+        self.cfg = cfg
+        self.planner = planner
+
+        self.tasks_by_id: Dict[int, Task] = {t.id: t for t in self.tasks}
+        self.records: Dict[int, TaskRecord] = {}
+        self.corrected_bid_cache: Dict[Tuple[int, int], float] = {}
+        self.force_accept_pairs: set[Tuple[int, int]] = set()
+
+        self.auction_logs: List[AuctionRoundLog] = []
+        self.coordination_logs: List[CoordinationLog] = []
+        self.verification_logs: List[VerificationLog] = []
+        self.event_logs: List[EventLog] = []
+
+        self._round_idx = 0
+
+    def reset(self) -> None:
+        for v in self.vehicles:
+            v.reset_runtime_state()
+
+        self.records = {}
+        for t in self.tasks:
+            t.status = "unassigned"
+            t.assigned_vehicle = None
+            self.records[t.id] = TaskRecord(
+                task_id=t.id,
+                winner=None,
+                bid=float("inf"),
+                status="unassigned",
+                version=0,
+            )
+
+        self.corrected_bid_cache.clear()
+        self.force_accept_pairs.clear()
+
+        self.auction_logs.clear()
+        self.coordination_logs.clear()
+        self.verification_logs.clear()
+        self.event_logs.clear()
+        self._round_idx = 0
+
+    def add_dynamic_task(self, task: Task, step: int) -> None:
+        if task.id in self.tasks_by_id:
+            raise ValueError(f"Task id {task.id} already exists.")
+
+        task.status = "unassigned"
+        task.assigned_vehicle = None
+        self.tasks.append(task)
+        self.tasks_by_id[task.id] = task
+        self.records[task.id] = TaskRecord(
+            task_id=task.id,
+            winner=None,
+            bid=float("inf"),
+            status="unassigned",
+            version=0,
+        )
+
+        self.event_logs.append(
+            EventLog(
+                step=step,
+                event_type="add_task",
+                task_id=task.id,
+                message=f"added task T{task.id} at {task.position} demand={task.demand}",
+            )
+        )
+
+    def cancel_task(self, task_id: int, step: int) -> None:
+        if task_id not in self.tasks_by_id:
+            return
+
+        task = self.tasks_by_id[task_id]
+        if task.status == "canceled":
+            return
+
+        if task.status != "locked":
+            self._apply_canceled_record(task_id=task_id, step=step, message="canceled before lock")
+            task.status = "canceled"
+            task.assigned_vehicle = None
+            return
+
+        # locked but not executed in current simulator model
+        owner = task.assigned_vehicle
+        if owner is not None:
+            vehicle = self.vehicles[owner]
+            if task_id in vehicle.task_sequence:
+                vehicle.task_sequence = [tid for tid in vehicle.task_sequence if tid != task_id]
+            self._recompute_vehicle_state(vehicle)
+
+        task.status = "canceled"
+        task.assigned_vehicle = None
+        self._apply_canceled_record(task_id=task_id, step=step, message="canceled and removed from vehicle sequence")
+
+    def allocate_until_stable(self, phase: str) -> None:
+        guard = 0
+        while self._has_pending_auction_tasks():
+            guard += 1
+            if guard > 3000:
+                raise RuntimeError("Auction loop exceeded safety limit.")
+
+            bids = self._collect_bids()
+            if not bids:
+                pending = [t.id for t in self.tasks if t.status in AUCTIONABLE_STATES]
+                raise RuntimeError(f"No feasible bids for pending tasks: {pending}")
+
+            winners = self._choose_tentative_winners(bids)
+            self.auction_logs.append(
+                AuctionRoundLog(
+                    round_idx=self._round_idx,
+                    phase=phase,
+                    bids=bids,
+                    tentative_winners=winners,
+                )
+            )
+
+            self._run_neighbor_sync_for_winners(bids=bids, winners=winners, event=f"{phase}:auction")
+            self._verify_tentatives(phase=phase)
+            self._round_idx += 1
+
+    def finalize(self) -> AllocationResult:
+        self._build_routes_and_time()
+        total_time = sum(v.route_length / v.speed for v in self.vehicles)
+
+        return AllocationResult(
+            vehicles=self.vehicles,
+            tasks=self.tasks,
+            auction_logs=self.auction_logs,
+            coordination_logs=self.coordination_logs,
+            verification_logs=self.verification_logs,
+            event_logs=self.event_logs,
+            system_total_time=total_time,
+        )
+
+    def _has_pending_auction_tasks(self) -> bool:
+        for t in self.tasks:
+            if t.status == "canceled":
+                continue
+            if t.status in AUCTIONABLE_STATES:
+                return True
+        return False
+
+    def _estimate_task_cost(self, vehicle: Vehicle, task: Task) -> float:
+        detail = fast_cost_estimate(vehicle=vehicle, task=task, world=self.world, cfg=self.cfg)
+        cached = self.corrected_bid_cache.get((vehicle.id, task.id))
+        return detail.estimated_time if cached is None else cached
+
+    def _collect_bids(self) -> List[Bid]:
+        candidate_tasks = [t for t in self.tasks if t.status in AUCTIONABLE_STATES]
+        bids: List[Bid] = []
+
+        for v in self.vehicles:
+            best_tid: Optional[int] = None
+            best_cost = float("inf")
+            for t in candidate_tasks:
+                if t.demand > v.remaining_capacity:
+                    continue
+                c_hat = self._estimate_task_cost(v, t)
+                if c_hat < best_cost:
+                    best_cost = c_hat
+                    best_tid = t.id
+
+            if best_tid is not None:
+                bids.append(Bid(vehicle_id=v.id, task_id=best_tid, value=best_cost))
+
+        return bids
+
+    @staticmethod
+    def _choose_tentative_winners(bids: List[Bid]) -> List[Bid]:
+        grouped: Dict[int, List[Bid]] = {}
+        for b in bids:
+            grouped.setdefault(b.task_id, []).append(b)
+
+        winners: List[Bid] = []
+        for task_id, task_bids in grouped.items():
+            task_bids.sort(key=lambda x: (x.value, x.vehicle_id))
+            winners.append(task_bids[0])
+
+        winners.sort(key=lambda x: (x.task_id, x.value, x.vehicle_id))
+        return winners
+
+    def _run_neighbor_sync_for_winners(self, bids: List[Bid], winners: List[Bid], event: str) -> None:
+        neighbors = build_neighbors(self.vehicles, self.cfg.comm_radius)
+        bids_by_task: Dict[int, List[Bid]] = {}
+        for b in bids:
+            bids_by_task.setdefault(b.task_id, []).append(b)
+
+        winner_ids = {w.task_id for w in winners}
+        for task_id in winner_ids:
+            task = self.tasks_by_id[task_id]
+            if task.status == "canceled":
+                continue
+
+            base = self.records[task_id]
+            proposals: Dict[int, TaskRecord] = {}
+            for b in bids_by_task.get(task_id, []):
+                proposals[b.vehicle_id] = TaskRecord(
+                    task_id=task_id,
+                    winner=b.vehicle_id,
+                    bid=b.value,
+                    status="tentative",
+                    version=base.version + 1,
+                )
+
+            final_rec, clog = run_coordination(
+                task_id=task_id,
+                event=event,
+                base_record=base,
+                proposals=proposals,
+                neighbors=neighbors,
+                cfg=self.cfg,
+            )
+            self.coordination_logs.append(clog)
+
+            if final_rec.status == "tentative" and final_rec.winner is not None:
+                owner = self.vehicles[final_rec.winner]
+                if task.demand <= owner.remaining_capacity:
+                    task.status = "tentative"
+                    task.assigned_vehicle = final_rec.winner
+                    self.records[task_id] = final_rec
+                    continue
+
+            # fallback when tentative winner is infeasible due capacity drift
+            self.records[task_id] = TaskRecord(
+                task_id=task_id,
+                winner=None,
+                bid=float("inf"),
+                status="withdrawn",
+                version=base.version + 1,
+            )
+            task.status = "withdrawn"
+            task.assigned_vehicle = None
+
+    def _verify_tentatives(self, phase: str) -> None:
+        tentative = [t for t in self.tasks if t.status == "tentative" and t.assigned_vehicle is not None]
+
+        for task in tentative:
+            vid = int(task.assigned_vehicle)
+            vehicle = self.vehicles[vid]
+            rec = self.records[task.id]
+            c_hat = rec.bid
+            pair = (vid, task.id)
+            forced_accept = pair in self.force_accept_pairs
+
+            task.status = "verifying"
+            self.records[task.id] = TaskRecord(
+                task_id=task.id,
+                winner=vid,
+                bid=c_hat,
+                status="verifying",
+                version=rec.version + 1,
+            )
+
+            if forced_accept:
+                verify_res = VerificationResult(
+                    passed=True,
+                    path_length=0.0,
+                    c_tilde=c_hat,
+                    e_under=0.0,
+                )
+            else:
+                verify_res = verify_bid(
+                    vehicle=vehicle,
+                    task=task,
+                    c_hat=c_hat,
+                    cfg=self.cfg,
+                    planner=self.planner,
+                )
+
+            self.verification_logs.append(
+                VerificationLog(
+                    round_idx=self._round_idx,
+                    task_id=task.id,
+                    vehicle_id=vid,
+                    c_hat=c_hat,
+                    c_tilde=verify_res.c_tilde,
+                    e_under=verify_res.e_under,
+                    passed=verify_res.passed,
+                    forced_accept=forced_accept,
+                )
+            )
+
+            if verify_res.passed:
+                self._lock_task(task=task, vehicle=vehicle, bid=c_hat)
+                if forced_accept:
+                    self.force_accept_pairs.discard(pair)
+                continue
+
+            self.corrected_bid_cache[pair] = verify_res.c_tilde
+            self.force_accept_pairs.add(pair)
+            task.status = "withdrawn"
+            task.assigned_vehicle = None
+            self.records[task.id] = TaskRecord(
+                task_id=task.id,
+                winner=None,
+                bid=float("inf"),
+                status="withdrawn",
+                version=rec.version + 2,
+            )
+
+            neighbors = build_neighbors(self.vehicles, self.cfg.comm_radius)
+            final_rec, clog = run_coordination(
+                task_id=task.id,
+                event=f"{phase}:withdraw",
+                base_record=self.records[task.id],
+                proposals={},
+                neighbors=neighbors,
+                cfg=self.cfg,
+            )
+            self.coordination_logs.append(clog)
+            self.records[task.id] = final_rec
+
+    def _lock_task(self, task: Task, vehicle: Vehicle, bid: float) -> None:
+        if task.id not in vehicle.task_sequence:
+            vehicle.task_sequence.append(task.id)
+            vehicle.remaining_capacity -= task.demand
+
+        task.status = "locked"
+        task.assigned_vehicle = vehicle.id
+
+        new_heading = heading_to_point(vehicle.current_pos, task.position)
+        vehicle.current_pos = task.position
+        vehicle.current_heading = new_heading
+
+        rec = self.records[task.id]
+        self.records[task.id] = TaskRecord(
+            task_id=task.id,
+            winner=vehicle.id,
+            bid=bid,
+            status="locked",
+            version=rec.version + 1,
+        )
+
+    def _recompute_vehicle_state(self, vehicle: Vehicle) -> None:
+        filtered: List[int] = []
+        pos = vehicle.start_pos
+        heading = vehicle.heading
+        remaining = vehicle.capacity
+
+        for tid in vehicle.task_sequence:
+            task = self.tasks_by_id.get(tid)
+            if task is None or task.status != "locked":
+                continue
+            if task.demand > remaining:
+                continue
+            filtered.append(tid)
+            remaining -= task.demand
+            heading = heading_to_point(pos, task.position)
+            pos = task.position
+
+        vehicle.task_sequence = filtered
+        vehicle.remaining_capacity = remaining
+        vehicle.current_pos = pos
+        vehicle.current_heading = heading
+
+    def _apply_canceled_record(self, task_id: int, step: int, message: str) -> None:
+        base = self.records[task_id]
+        self.records[task_id] = TaskRecord(
+            task_id=task_id,
+            winner=None,
+            bid=float("inf"),
+            status="canceled",
+            version=base.version + 1,
+        )
+
+        neighbors = build_neighbors(self.vehicles, self.cfg.comm_radius)
+        final_rec, clog = run_coordination(
+            task_id=task_id,
+            event="cancel",
+            base_record=base,
+            proposals={
+                v.id: TaskRecord(
+                    task_id=task_id,
+                    winner=None,
+                    bid=float("inf"),
+                    status="canceled",
+                    version=base.version + 1,
+                )
+                for v in self.vehicles
+            },
+            neighbors=neighbors,
+            cfg=self.cfg,
+        )
+        self.records[task_id] = final_rec
+        self.coordination_logs.append(clog)
+
+        self.event_logs.append(
+            EventLog(step=step, event_type="cancel_task", task_id=task_id, message=message)
+        )
+
+    def _build_routes_and_time(self) -> None:
+        for v in self.vehicles:
+            self._recompute_vehicle_state(v)
+            v.route_points = [v.start_pos]
+            v.route_length = 0.0
+            cur = v.start_pos
+
+            for tid in v.task_sequence:
+                task = self.tasks_by_id[tid]
+                path, length = self.planner.plan(cur, task.position)
+                if not path or length == float("inf"):
+                    raise RuntimeError(
+                        f"A* planning failed for vehicle={v.id}, task={tid}, from={cur} to={task.position}."
+                    )
+
+                if len(path) > 1:
+                    v.route_points.extend(path[1:])
+                v.route_length += length
+                cur = task.position
+
+
+def run_static_auction(
+    vehicles: List[Vehicle],
+    tasks: List[Task],
+    world: WorldMap,
+    cfg: SimulationConfig,
+    planner: AStarPlanner,
+) -> AllocationResult:
+    engine = AllocationEngine(vehicles=vehicles, tasks=tasks, world=world, cfg=cfg, planner=planner)
+    engine.reset()
+    engine.allocate_until_stable(phase="initial")
+    return engine.finalize()
+
+
+def run_online_allocation(
+    vehicles: List[Vehicle],
+    tasks: List[Task],
+    world: WorldMap,
+    cfg: SimulationConfig,
+    planner: AStarPlanner,
+    events: Sequence[dict],
+) -> AllocationResult:
+    engine = AllocationEngine(vehicles=vehicles, tasks=tasks, world=world, cfg=cfg, planner=planner)
+    engine.reset()
+
+    engine.allocate_until_stable(phase="initial")
+
+    for evt in events:
+        step = int(evt.get("step", 0))
+        etype = evt.get("event_type")
+        if etype == "add_task":
+            task = evt["task"]
+            engine.add_dynamic_task(task=task, step=step)
+            engine.allocate_until_stable(phase=f"step{step}:add")
+        elif etype == "cancel_task":
+            task_id = int(evt["task_id"])
+            engine.cancel_task(task_id=task_id, step=step)
+            engine.allocate_until_stable(phase=f"step{step}:cancel")
+
+    return engine.finalize()
