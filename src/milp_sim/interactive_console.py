@@ -23,6 +23,8 @@ def _print_help() -> None:
     print("  online_pause                      Pause online runtime")
     print("  online_resume                     Resume online runtime")
     print("  tick [n]                          Advance online runtime by n ticks (default 1)")
+    print("  frame_prev                        Move to previous frame (online mode)")
+    print("  frame_next                        Move to next frame (online mode)")
     print("  remove_obstacle idx               Remove obstacle by index")
     print("  quit / exit                       Exit console")
 
@@ -122,6 +124,20 @@ class InteractiveConsole:
             elif cmd == "tick":
                 n = int(tokens[1]) if len(tokens) > 1 else 1
                 snap = self.session.tick(n=n)
+                print(
+                    f"t={snap.sim_time:.2f}s running={snap.online_running} "
+                    f"pending_events={len(snap.pending_events)}"
+                )
+            elif cmd == "frame_prev":
+                self.session.pause_online()
+                snap = self.session.frame_prev()
+                print(
+                    f"t={snap.sim_time:.2f}s running={snap.online_running} "
+                    f"pending_events={len(snap.pending_events)}"
+                )
+            elif cmd == "frame_next":
+                self.session.pause_online()
+                snap = self.session.frame_next()
                 print(
                     f"t={snap.sim_time:.2f}s running={snap.online_running} "
                     f"pending_events={len(snap.pending_events)}"

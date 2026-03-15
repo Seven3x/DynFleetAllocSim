@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .config import SimulationConfig
-from .cost_estimator import heading_to_point
+from .cost_estimator import heading_to_point, wrap_to_pi
 from .dubins_path import build_dubins_hybrid_path
 from .entities import Task, Vehicle
 from .planner_astar import AStarPlanner
@@ -50,7 +50,9 @@ def verify_bid(
     else:
         path_length = astar_len
 
-    c_tilde = path_length / vehicle.speed
+    delta_heading = abs(wrap_to_pi(target_heading - vehicle.current_heading))
+    corrected_length = path_length + cfg.lambda_psi * turn_radius * delta_heading
+    c_tilde = corrected_length / vehicle.speed
     if c_tilde <= 1e-12:
         return VerificationResult(passed=True, path_length=path_length, c_tilde=c_tilde, e_under=0.0)
 

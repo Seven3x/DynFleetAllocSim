@@ -130,18 +130,21 @@ class MilpGuiApp:
         ttk.Button(online_frame, text="Step x1", command=lambda: self._on_online_step(1)).grid(
             row=6, column=0, sticky="ew", pady=(5, 0)
         )
-        ttk.Button(online_frame, text="Step x10", command=lambda: self._on_online_step(10)).grid(
+        ttk.Button(online_frame, text="Next Frame", command=self._on_frame_next).grid(
             row=6, column=1, sticky="ew", pady=(5, 0)
         )
-        ttk.Label(online_frame, text="speed").grid(row=7, column=0, sticky="w", pady=(6, 0))
+        ttk.Button(online_frame, text="Prev Frame", command=self._on_frame_prev).grid(
+            row=7, column=0, sticky="ew", pady=(5, 0)
+        )
+        ttk.Label(online_frame, text="speed").grid(row=8, column=0, sticky="w", pady=(6, 0))
         speed_box = ttk.Combobox(
             online_frame,
             textvariable=self.sim_speed_var,
-            values=("1x", "2x", "5x"),
+            values=("1x",),
             state="readonly",
             width=8,
         )
-        speed_box.grid(row=7, column=1, sticky="ew", pady=(6, 0))
+        speed_box.grid(row=8, column=1, sticky="ew", pady=(6, 0))
         online_frame.columnconfigure(0, weight=1)
         online_frame.columnconfigure(1, weight=1)
 
@@ -437,9 +440,7 @@ class MilpGuiApp:
     def _schedule_refresh(self) -> None:
         try:
             if self.session.online_enabled and self.session.online_running:
-                speed_map = {"1x": 1, "2x": 2, "5x": 5}
-                n = speed_map.get(self.sim_speed_var.get(), 1)
-                self.session.tick(n=n)
+                self.session.tick(n=1)
         except Exception as exc:
             self.last_action_var.set(f"tick error: {exc}")
         self._refresh_all()
@@ -526,6 +527,28 @@ class MilpGuiApp:
             self._refresh_all()
         except Exception as exc:
             messagebox.showerror("Online Step Error", str(exc))
+
+    def _on_frame_prev(self) -> None:
+        try:
+            if not self.session.online_enabled:
+                self.session.start_online()
+            self.session.pause_online()
+            self.session.frame_prev()
+            self.last_action_var.set("Moved to previous frame")
+            self._refresh_all()
+        except Exception as exc:
+            messagebox.showerror("Prev Frame Error", str(exc))
+
+    def _on_frame_next(self) -> None:
+        try:
+            if not self.session.online_enabled:
+                self.session.start_online()
+            self.session.pause_online()
+            self.session.frame_next()
+            self.last_action_var.set("Moved to next frame")
+            self._refresh_all()
+        except Exception as exc:
+            messagebox.showerror("Next Frame Error", str(exc))
 
     def _on_add_random(self) -> None:
         try:

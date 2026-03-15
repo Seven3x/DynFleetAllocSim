@@ -56,6 +56,20 @@ class RuntimeSnapshot:
     last_event_message: str
 
 
+@dataclass
+class OnlineFrameState:
+    artifacts: SimulationArtifacts
+    engine: AllocationEngine
+    sim_time: float
+    step: int
+    next_periodic_replan: float
+    pending_events: list[OnlineEvent]
+    event_history: list[OnlineEvent]
+    last_replan_reason: str
+    last_event_message: str
+    rng_state: dict[str, Any]
+
+
 class SimulationSession:
     def __init__(self, cfg: SimulationConfig = DEFAULT_CONFIG) -> None:
         self.cfg = cfg
@@ -80,6 +94,9 @@ class SimulationSession:
         self.event_history: list[OnlineEvent] = []
         self.last_replan_reason = ""
         self.last_event_message = ""
+        self._frame_history: list[OnlineFrameState] = []
+        self._frame_cursor: int = -1
+        self.max_frame_history = 800
 
         self.reset()
 
@@ -107,6 +124,8 @@ class SimulationSession:
         self.event_history.clear()
         self.last_replan_reason = ""
         self.last_event_message = ""
+        self._frame_history.clear()
+        self._frame_cursor = -1
 
     def start_online(self, dt: float | None = None, replan_period_s: float | None = None) -> RuntimeSnapshot:
         self._assert_ready()
@@ -149,6 +168,26 @@ class SimulationSession:
             last_event_message=self.last_event_message,
         )
 
+    def frame_prev(self) -> RuntimeSnapshot:
+        self._assert_ready()
+        if not self.online_enabled:
+            self.start_online(dt=self.online_dt, replan_period_s=self.replan_period_s)
+        if self._frame_cursor <= 0:
+            return self.runtime_snapshot()
+        self._frame_cursor -= 1
+        self._restore_frame(self._frame_history[self._frame_cursor])
+        return self.runtime_snapshot()
+
+    def frame_next(self) -> RuntimeSnapshot:
+        self._assert_ready()
+        if not self.online_enabled:
+            self.start_online(dt=self.online_dt, replan_period_s=self.replan_period_s)
+        if self._frame_cursor < len(self._frame_history) - 1:
+            self._frame_cursor += 1
+            self._restore_frame(self._frame_history[self._frame_cursor])
+            return self.runtime_snapshot()
+        return self.tick(n=1)
+
     def schedule_event(self, at_time: float, event_type: str, payload: Optional[dict[str, Any]] = None) -> OnlineEvent:
         at = float(at_time)
         if at < 0.0:
@@ -174,6 +213,7 @@ class SimulationSession:
 
         if n == 0:
             self._process_due_events_and_replan()
+            self._capture_frame()
             return self.runtime_snapshot()
 
         for _ in range(n):
@@ -181,6 +221,7 @@ class SimulationSession:
             self._advance_vehicles(self.online_dt)
             self.sim_time += self.online_dt
             self.step += 1
+            self._capture_frame()
 
         return self.runtime_snapshot()
 
@@ -210,6 +251,51 @@ class SimulationSession:
         self.next_periodic_replan = self.replan_period_s
         self.last_replan_reason = "startup"
         self._replan_online_routes(reason="startup")
+        self._frame_history.clear()
+        self._frame_cursor = -1
+        self._capture_frame()
+
+    def _snapshot_frame(self) -> OnlineFrameState:
+        self._assert_ready()
+        assert self.artifacts is not None
+        assert self.engine is not None
+        return OnlineFrameState(
+            artifacts=copy.deepcopy(self.artifacts),
+            engine=copy.deepcopy(self.engine),
+            sim_time=float(self.sim_time),
+            step=int(self.step),
+            next_periodic_replan=float(self.next_periodic_replan),
+            pending_events=copy.deepcopy(self.pending_events),
+            event_history=copy.deepcopy(self.event_history),
+            last_replan_reason=str(self.last_replan_reason),
+            last_event_message=str(self.last_event_message),
+            rng_state=copy.deepcopy(self.rng.bit_generator.state),
+        )
+
+    def _restore_frame(self, frame: OnlineFrameState) -> None:
+        self.artifacts = copy.deepcopy(frame.artifacts)
+        self.engine = copy.deepcopy(frame.engine)
+        self.sim_time = float(frame.sim_time)
+        self.step = int(frame.step)
+        self.next_periodic_replan = float(frame.next_periodic_replan)
+        self.pending_events = copy.deepcopy(frame.pending_events)
+        self.event_history = copy.deepcopy(frame.event_history)
+        self.last_replan_reason = str(frame.last_replan_reason)
+        self.last_event_message = str(frame.last_event_message)
+        self.rng.bit_generator.state = copy.deepcopy(frame.rng_state)
+
+    def _capture_frame(self) -> None:
+        if not self.online_enabled:
+            return
+        frame = self._snapshot_frame()
+        if self._frame_cursor < len(self._frame_history) - 1:
+            self._frame_history = self._frame_history[: self._frame_cursor + 1]
+        self._frame_history.append(frame)
+        if len(self._frame_history) > self.max_frame_history:
+            overflow = len(self._frame_history) - self.max_frame_history
+            self._frame_history = self._frame_history[overflow:]
+            self._frame_cursor = max(-1, self._frame_cursor - overflow)
+        self._frame_cursor = len(self._frame_history) - 1
 
     def _process_due_events_and_replan(self) -> None:
         self._assert_ready()
@@ -220,11 +306,14 @@ class SimulationSession:
             due_events.append(self.pending_events.pop(0))
 
         event_trigger = False
+        route_refresh_trigger = False
         for evt in due_events:
             try:
-                evt.result_message = self._apply_online_event(evt)
+                msg, should_reauction, should_refresh_routes = self._apply_online_event(evt)
+                evt.result_message = msg
                 evt.applied = True
-                event_trigger = True
+                event_trigger = event_trigger or should_reauction
+                route_refresh_trigger = route_refresh_trigger or should_refresh_routes
                 self.last_event_message = evt.result_message
             except Exception as exc:
                 evt.result_message = f"failed: {exc}"
@@ -248,8 +337,13 @@ class SimulationSession:
 
             if periodic_trigger:
                 self.next_periodic_replan = self.sim_time + self.replan_period_s
+        elif route_refresh_trigger:
+            self._refresh_active_tasks_and_routes()
+            self.last_replan_reason = "event:route_refresh"
+            for v in self.engine.vehicles:
+                v.last_replan_time = self.sim_time
 
-    def _apply_online_event(self, evt: OnlineEvent) -> str:
+    def _apply_online_event(self, evt: OnlineEvent) -> tuple[str, bool, bool]:
         self._assert_ready()
         assert self.engine is not None
         assert self.artifacts is not None
@@ -259,7 +353,7 @@ class SimulationSession:
             if not isinstance(task, Task):
                 raise ValueError("add_task event requires payload['task']=Task")
             self.engine.add_dynamic_task(task=task, step=self.step)
-            return f"event add_task applied: T{task.id}"
+            return f"event add_task applied: T{task.id}", True, False
 
         if evt.event_type == "cancel_task":
             tid = int(evt.payload.get("task_id"))
@@ -270,20 +364,20 @@ class SimulationSession:
                     pos, heading = pose_cache[v.id]
                     v.current_pos = pos
                     v.current_heading = heading
-            return f"event cancel_task applied: T{tid}"
+            return f"event cancel_task applied: T{tid}", True, False
 
         if evt.event_type == "add_obstacle":
             points = evt.payload.get("points")
             if not isinstance(points, list):
                 raise ValueError("add_obstacle event requires payload['points']=list")
             poly = self._apply_obstacle_polygon_now(points)
-            return f"event add_obstacle applied: area={poly.area:.2f}"
+            return f"event add_obstacle applied: area={poly.area:.2f}", False, True
 
         if evt.event_type == "remove_obstacle":
             idx = int(evt.payload.get("obstacle_idx"))
             poly = self.artifacts.world.remove_obstacle(idx)
             self._rebuild_planner()
-            return f"event remove_obstacle applied: idx={idx} area={poly.area:.2f}"
+            return f"event remove_obstacle applied: idx={idx} area={poly.area:.2f}", False, True
 
         raise ValueError(f"unsupported event_type: {evt.event_type}")
 
@@ -704,6 +798,8 @@ class SimulationSession:
         )
         self.artifacts.planner = planner
         self.engine.planner = planner
+        self.engine.corrected_bid_cache.clear()
+        self.engine.force_accept_pairs.clear()
 
     def _validate_obstacle_polygon(self, points: list[tuple[float, float]]) -> Polygon:
         self._assert_ready()

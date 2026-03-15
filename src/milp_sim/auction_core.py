@@ -144,7 +144,7 @@ class AllocationEngine:
             return
 
         task = self.tasks_by_id[task_id]
-        if task.status == "canceled":
+        if task.status in {"canceled", "completed"}:
             return
 
         if task.status not in {"locked", "in_progress"}:
