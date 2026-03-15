@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
@@ -25,6 +26,7 @@ class MilpGuiApp:
         self.root = tk.Tk()
         self.root.title("MILP Dynamic Task Allocation GUI")
         self.root.geometry("1600x920")
+        self._configure_ui_style()
 
         self.refresh_interval_ms = 500
         self.log_count_var = tk.StringVar(value="8")
@@ -36,6 +38,32 @@ class MilpGuiApp:
         self._build_layout()
         self._refresh_all()
         self._schedule_refresh()
+
+    def _configure_ui_style(self) -> None:
+        self.root.configure(bg="#e9edf2")
+        # Improve readability on HiDPI/WSLg displays.
+        self.root.tk.call("tk", "scaling", 1.25)
+
+        style = ttk.Style(self.root)
+        available_themes = set(style.theme_names())
+        preferred_theme = "clam" if "clam" in available_themes else style.theme_use()
+        style.theme_use(preferred_theme)
+
+        default_font = tkfont.nametofont("TkDefaultFont")
+        default_font.configure(family="Segoe UI", size=10)
+        text_font = tkfont.nametofont("TkTextFont")
+        text_font.configure(family="Segoe UI", size=10)
+        fixed_font = tkfont.nametofont("TkFixedFont")
+        fixed_font.configure(family="Cascadia Mono", size=10)
+
+        self.root.option_add("*Font", default_font)
+
+        style.configure("TFrame", background="#e9edf2")
+        style.configure("TLabelframe", background="#e9edf2")
+        style.configure("TLabelframe.Label", font=("Segoe UI Semibold", 10), foreground="#1f2937")
+        style.configure("TLabel", background="#e9edf2", foreground="#111827")
+        style.configure("TButton", padding=(10, 4), font=("Segoe UI", 10))
+        style.configure("TEntry", fieldbackground="#ffffff")
 
     def _build_layout(self) -> None:
         self.root.columnconfigure(0, weight=0)
@@ -160,7 +188,8 @@ class MilpGuiApp:
         misc.columnconfigure(1, weight=1)
 
     def _build_center_plot(self, parent) -> None:
-        self.figure = plt.Figure(figsize=(8, 8), dpi=100)
+        plt.style.use("seaborn-v0_8-whitegrid")
+        self.figure = plt.Figure(figsize=(8, 8), dpi=130)
         self.ax = self.figure.add_subplot(111)
         self.canvas = FigureCanvasTkAgg(self.figure, master=parent)
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
@@ -182,13 +211,40 @@ class MilpGuiApp:
         tasks_frame.rowconfigure(0, weight=1)
         tasks_frame.columnconfigure(0, weight=1)
 
-        self.status_text = ScrolledText(status_frame, wrap="word", font=("Consolas", 10))
+        self.status_text = ScrolledText(
+            status_frame,
+            wrap="word",
+            font=("Cascadia Mono", 10),
+            bg="#f8fafc",
+            fg="#0f172a",
+            insertbackground="#0f172a",
+            relief="flat",
+            borderwidth=0,
+        )
         self.status_text.grid(row=0, column=0, sticky="nsew")
 
-        self.logs_text = ScrolledText(logs_frame, wrap="word", font=("Consolas", 10))
+        self.logs_text = ScrolledText(
+            logs_frame,
+            wrap="word",
+            font=("Cascadia Mono", 10),
+            bg="#f8fafc",
+            fg="#0f172a",
+            insertbackground="#0f172a",
+            relief="flat",
+            borderwidth=0,
+        )
         self.logs_text.grid(row=0, column=0, sticky="nsew")
 
-        self.tasks_text = ScrolledText(tasks_frame, wrap="word", font=("Consolas", 10))
+        self.tasks_text = ScrolledText(
+            tasks_frame,
+            wrap="word",
+            font=("Cascadia Mono", 10),
+            bg="#f8fafc",
+            fg="#0f172a",
+            insertbackground="#0f172a",
+            relief="flat",
+            borderwidth=0,
+        )
         self.tasks_text.grid(row=0, column=0, sticky="nsew")
 
     @staticmethod
