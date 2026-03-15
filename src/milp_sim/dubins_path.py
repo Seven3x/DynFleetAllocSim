@@ -4,6 +4,8 @@ import math
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
+from shapely.geometry import LineString
+
 from .cost_estimator import heading_to_point, wrap_to_pi
 from .map_utils import WorldMap
 from .planner_astar import AStarPlanner
@@ -211,6 +213,50 @@ def _collision_free(points: List[Point2D], world: WorldMap, margin: float) -> bo
     return True
 
 
+def _polyline_length(points: List[Point2D]) -> float:
+    total = 0.0
+    for i in range(len(points) - 1):
+        total += math.hypot(points[i + 1][0] - points[i][0], points[i + 1][1] - points[i][1])
+    return total
+
+
+def _segment_collision_free(a: Point2D, b: Point2D, world: WorldMap, margin: float) -> bool:
+    line = LineString([a, b])
+    if margin > 0.0:
+        swept = line.buffer(margin, cap_style=2, join_style=2)
+        return not swept.intersects(world.obstacle_union)
+    return not line.intersects(world.obstacle_union)
+
+
+def _polyline_collision_free(points: List[Point2D], world: WorldMap, margin: float) -> bool:
+    if len(points) < 2:
+        return True
+    line = LineString(points)
+    if margin > 0.0:
+        swept = line.buffer(margin, cap_style=2, join_style=2)
+        return not swept.intersects(world.obstacle_union)
+    return not line.intersects(world.obstacle_union)
+
+
+def _shortcut_smooth_path(path: List[Point2D], world: WorldMap, margin: float) -> List[Point2D]:
+    if len(path) <= 2:
+        return path
+
+    out: List[Point2D] = [path[0]]
+    i = 0
+    n = len(path)
+    while i < n - 1:
+        next_idx = i + 1
+        for j in range(n - 1, i + 1, -1):
+            if _segment_collision_free(path[i], path[j], world=world, margin=margin):
+                next_idx = j
+                break
+        out.append(path[next_idx])
+        i = next_idx
+
+    return out
+
+
 def _add(a: Point2D, b: Point2D) -> Point2D:
     return a[0] + b[0], a[1] + b[1]
 
@@ -357,6 +403,52 @@ def _build_fillet_polyline(
         if fillet is not None:
             corners[i] = fillet
 
+    # Resolve overlap between adjacent corner fillets on short middle segments.
+    # If both sides cut too much on one segment, keep only one corner to avoid
+    # reversed ordering (visual "jump lines"/backtracking spikes).
+    while True:
+        changed = False
+        for seg_idx in range(len(path) - 1):
+            start_corner = corners.get(seg_idx)
+            end_corner = corners.get(seg_idx + 1)
+            if start_corner is None and end_corner is None:
+                continue
+
+            seg_len = _norm(_sub(path[seg_idx + 1], path[seg_idx]))
+            if seg_len <= 1e-9:
+                if start_corner is not None:
+                    del corners[seg_idx]
+                if end_corner is not None:
+                    del corners[seg_idx + 1]
+                changed = True
+                break
+
+            start_cut = (
+                _norm(_sub(start_corner.t_out, path[seg_idx]))
+                if start_corner is not None
+                else 0.0
+            )
+            end_cut = (
+                _norm(_sub(path[seg_idx + 1], end_corner.t_in))
+                if end_corner is not None
+                else 0.0
+            )
+
+            if start_cut + end_cut > seg_len - 1e-6:
+                if start_corner is not None and end_corner is not None:
+                    if start_cut >= end_cut:
+                        del corners[seg_idx]
+                    else:
+                        del corners[seg_idx + 1]
+                elif start_corner is not None:
+                    del corners[seg_idx]
+                else:
+                    del corners[seg_idx + 1]
+                changed = True
+                break
+        if not changed:
+            break
+
     out: List[Point2D] = [path[0]]
     for seg_idx in range(len(path) - 1):
         start_pt = corners[seg_idx].t_out if seg_idx in corners else path[seg_idx]
@@ -436,29 +528,100 @@ def build_dubins_hybrid_path(
             ),
         )
 
+    smoothing_margin = max(
+        float(getattr(cfg, "dubins_collision_margin", 0.0)),
+        float(getattr(cfg, "vehicle_radius", 0.0)) + float(getattr(cfg, "safety_margin", 0.0)),
+    )
+    if getattr(cfg, "astar_smooth_before_dubins", True):
+        base_path = _shortcut_smooth_path(astar_path, world=world, margin=smoothing_margin)
+        if not _polyline_collision_free(base_path, world=world, margin=smoothing_margin):
+            base_path = astar_path
+    else:
+        base_path = astar_path
+    base_len = _polyline_length(base_path)
+
     if not getattr(cfg, "use_dubins_hybrid", False):
         return (
-            astar_path,
-            astar_length,
+            base_path,
+            base_len,
             DubinsHybridMeta(
                 used_fallback=False,
                 fallback_segments=0,
                 dubins_segments=0,
-                sample_count=len(astar_path),
+                sample_count=len(base_path),
                 dubins_ratio=0.0,
             ),
         )
 
-    sparse_path = _compress_astar_path(astar_path)
+    sparse_path = _compress_astar_path(base_path)
     if len(sparse_path) < 2:
         return (
-            astar_path,
-            0.0,
+            base_path,
+            base_len,
             DubinsHybridMeta(
                 used_fallback=False,
                 fallback_segments=0,
                 dubins_segments=0,
-                sample_count=len(astar_path),
+                sample_count=len(base_path),
+                dubins_ratio=0.0,
+            ),
+        )
+
+    if len(sparse_path) == 2:
+        dubins_sol = _build_shortest_dubins_local(start_pose=start_pose, goal_pose=goal_pose, turn_radius=turn_radius)
+        if dubins_sol is not None:
+            word, params = dubins_sol
+            dubins_points = _sample_dubins_segment(
+                start_pose=start_pose,
+                word=word,
+                params=params,
+                turn_radius=turn_radius,
+                sample_step=cfg.dubins_sample_step,
+            )
+            dubins_points[0] = (start_pose[0], start_pose[1])
+            dubins_points[-1] = (goal_pose[0], goal_pose[1])
+
+            if force_mode or _polyline_collision_free(
+                dubins_points,
+                world=world,
+                margin=cfg.dubins_collision_margin,
+            ):
+                dubins_len = _polyline_length(dubins_points)
+                straight_len = math.hypot(goal_pose[0] - start_pose[0], goal_pose[1] - start_pose[1])
+                added_curve = max(0.0, dubins_len - straight_len)
+                ratio = 0.0 if dubins_len <= 1e-9 else max(0.0, min(1.0, added_curve / dubins_len))
+                return (
+                    dubins_points,
+                    dubins_len,
+                    DubinsHybridMeta(
+                        used_fallback=False,
+                        fallback_segments=0,
+                        dubins_segments=1,
+                        sample_count=len(dubins_points),
+                        dubins_ratio=ratio,
+                    ),
+                )
+
+        if cfg.dubins_fallback_to_astar:
+            return (
+                base_path,
+                base_len,
+                DubinsHybridMeta(
+                    used_fallback=True,
+                    fallback_segments=1,
+                    dubins_segments=0,
+                    sample_count=len(base_path),
+                    dubins_ratio=0.0,
+                ),
+            )
+        return (
+            [],
+            float("inf"),
+            DubinsHybridMeta(
+                used_fallback=True,
+                fallback_segments=1,
+                dubins_segments=0,
+                sample_count=0,
                 dubins_ratio=0.0,
             ),
         )
@@ -486,6 +649,36 @@ def build_dubins_hybrid_path(
     out_points = fillet_points
     out_points[0] = (start_pose[0], start_pose[1])
     out_points[-1] = (goal_pose[0], goal_pose[1])
+
+    if not force_mode and not _polyline_collision_free(
+        out_points,
+        world=world,
+        margin=cfg.dubins_collision_margin,
+    ):
+        rejected_segments = max(1, fallback_count)
+        if cfg.dubins_fallback_to_astar:
+            return (
+                base_path,
+                base_len,
+                DubinsHybridMeta(
+                    used_fallback=True,
+                    fallback_segments=rejected_segments,
+                    dubins_segments=fillet_count,
+                    sample_count=len(base_path),
+                    dubins_ratio=0.0,
+                ),
+            )
+        return (
+            [],
+            float("inf"),
+            DubinsHybridMeta(
+                used_fallback=True,
+                fallback_segments=rejected_segments,
+                dubins_segments=fillet_count,
+                sample_count=0,
+                dubins_ratio=0.0,
+            ),
+        )
 
     total_len = 0.0
     for i in range(len(out_points) - 1):

@@ -3,12 +3,13 @@ import unittest
 from dataclasses import replace
 
 try:
-    from shapely.geometry import box
+    from shapely.geometry import LineString, box
 
     from milp_sim.config import DEFAULT_CONFIG
     from milp_sim.dubins_path import DUBINS_WORDS, build_dubins_hybrid_path, solve_dubins_word
     from milp_sim.map_utils import WorldMap
     from milp_sim.planner_astar import AStarPlanner
+    from milp_sim.session import SimulationSession
 
     HAS_SHAPELY = True
 except ModuleNotFoundError:
@@ -82,6 +83,7 @@ class TestDubinsPath(unittest.TestCase):
         cfg = replace(
             DEFAULT_CONFIG,
             use_dubins_hybrid=True,
+            astar_smooth_before_dubins=False,
             dubins_sample_step=0.8,
             dubins_collision_margin=40.0,
             dubins_fallback_to_astar=True,
@@ -107,6 +109,7 @@ class TestDubinsPath(unittest.TestCase):
         cfg = replace(
             DEFAULT_CONFIG,
             use_dubins_hybrid=True,
+            astar_smooth_before_dubins=False,
             dubins_sample_step=0.8,
             dubins_collision_margin=40.0,
             dubins_fallback_to_astar=False,
@@ -126,6 +129,116 @@ class TestDubinsPath(unittest.TestCase):
         self.assertEqual(points, [])
         self.assertEqual(length, float("inf"))
         self.assertTrue(meta.used_fallback)
+
+    def test_astar_shortcut_smoothing_reduces_samples_when_dubins_disabled(self) -> None:
+        start = (12.0, 14.0, 0.0)
+        goal = (85.0, 76.0, 0.0)
+        raw_path, raw_len = self.planner.plan((start[0], start[1]), (goal[0], goal[1]))
+        self.assertGreater(len(raw_path), 2)
+        self.assertTrue(math.isfinite(raw_len))
+
+        cfg = replace(DEFAULT_CONFIG, use_dubins_hybrid=False, astar_smooth_before_dubins=True)
+        points, length, meta = build_dubins_hybrid_path(
+            world=self.world,
+            cfg=cfg,
+            start_pose=start,
+            goal_pose=goal,
+            astar_planner=self.planner,
+            turn_radius=10.0,
+            astar_path=raw_path,
+            astar_length=raw_len,
+        )
+
+        self.assertLess(len(points), len(raw_path))
+        self.assertTrue(math.isfinite(length))
+        self.assertLessEqual(length, raw_len + 1e-6)
+        self.assertEqual(meta.sample_count, len(points))
+
+    def test_two_point_smoothed_path_still_uses_dubins_curve(self) -> None:
+        start = (12.0, 14.0, 0.0)
+        goal = (85.0, 76.0, 1.2)
+        two_point = [(start[0], start[1]), (goal[0], goal[1])]
+        line_len = math.hypot(goal[0] - start[0], goal[1] - start[1])
+
+        cfg = replace(DEFAULT_CONFIG, use_dubins_hybrid=True, astar_smooth_before_dubins=True)
+        points, length, meta = build_dubins_hybrid_path(
+            world=self.world,
+            cfg=cfg,
+            start_pose=start,
+            goal_pose=goal,
+            astar_planner=self.planner,
+            turn_radius=10.0,
+            astar_path=two_point,
+            astar_length=line_len,
+        )
+
+        self.assertGreater(len(points), 2)
+        self.assertTrue(math.isfinite(length))
+        self.assertGreater(length, line_len)
+        self.assertGreater(meta.dubins_segments, 0)
+
+    def test_seeded_session_routes_do_not_cross_obstacles(self) -> None:
+        cfg = replace(
+            DEFAULT_CONFIG,
+            seed=0,
+            use_dubins_hybrid=True,
+            dubins_fallback_to_astar=True,
+            dubins_force_mode=False,
+        )
+        session = SimulationSession(cfg=cfg)
+        result = session.result()
+        assert session.artifacts is not None
+        world = session.artifacts.world
+
+        for vehicle in result.vehicles:
+            pts = vehicle.route_points
+            for i in range(len(pts) - 1):
+                seg = LineString([pts[i], pts[i + 1]])
+                crossed = seg.crosses(world.obstacle_union) or seg.within(world.obstacle_union)
+                self.assertFalse(
+                    crossed,
+                    msg=(
+                        f"V{vehicle.id} route segment {i}->{i + 1} crosses obstacles: "
+                        f"{pts[i]} -> {pts[i + 1]}"
+                    ),
+                )
+
+    def test_seeded_session_routes_have_no_jump_backtracking_turns(self) -> None:
+        cfg = replace(
+            DEFAULT_CONFIG,
+            seed=7,
+            use_dubins_hybrid=True,
+            dubins_fallback_to_astar=True,
+            dubins_force_mode=False,
+        )
+        session = SimulationSession(cfg=cfg)
+        result = session.result()
+
+        for vehicle in result.vehicles:
+            pts = vehicle.route_points
+            for i in range(1, len(pts) - 1):
+                ax = pts[i][0] - pts[i - 1][0]
+                ay = pts[i][1] - pts[i - 1][1]
+                bx = pts[i + 1][0] - pts[i][0]
+                by = pts[i + 1][1] - pts[i][1]
+                la = math.hypot(ax, ay)
+                lb = math.hypot(bx, by)
+                if la <= 0.2 or lb <= 0.2:
+                    continue
+
+                dot = (ax * bx + ay * by) / (la * lb)
+                dot = max(-1.0, min(1.0, dot))
+                angle_deg = math.degrees(math.acos(dot))
+                # Real jump-lines are short local spikes with near reverse angle.
+                is_spike = angle_deg > 170.0 and min(la, lb) <= 2.0
+                self.assertFalse(
+                    is_spike,
+                    msg=(
+                        f"V{vehicle.id} has backtracking turn around point {i}: "
+                        f"angle={angle_deg:.2f} la={la:.3f} lb={lb:.3f} "
+                        f"p_prev={pts[i - 1]} p={pts[i]} p_next={pts[i + 1]}"
+                    ),
+                )
 
 
 if __name__ == "__main__":

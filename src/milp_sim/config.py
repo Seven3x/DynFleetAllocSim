@@ -44,13 +44,17 @@ class SimulationConfig:
 
     astar_resolution: float = 1.0
     astar_connect_diagonal: bool = True
+    # Pre-smooth A* polyline by line-of-sight shortcut before Dubins/fillet.
+    astar_smooth_before_dubins: bool = True
 
     # Hybrid trajectory: A* skeleton + Dubins segments
     use_dubins_hybrid: bool = True
     dubins_sample_step: float = 0.5
     dubins_collision_margin: float = 0.8
-    dubins_fallback_to_astar: bool = False
-    dubins_force_mode: bool = True
+    # Safety-first defaults: if local fillet smoothing is unsafe, keep A* geometry.
+    dubins_fallback_to_astar: bool = True
+    # Debug-only switch; when True, it may generate paths that clip obstacles.
+    dubins_force_mode: bool = False
 
     # Lightweight neighborhood coordination
     comm_radius: float = 38.0
