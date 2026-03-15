@@ -9,10 +9,11 @@ from typing import Optional
 import numpy as np
 from shapely.geometry import Point, Polygon
 
-from .auction_core import AllocationEngine, AllocationResult
+from .auction_core import AllocationEngine, AllocationResult, EventLog
 from .config import DEFAULT_CONFIG, SimulationConfig
 from .dynamic_events import generate_new_task
 from .entities import Task
+from .neighbor_coordination import TaskRecord
 from .planner_astar import AStarPlanner
 from .simulator import SimulationArtifacts, build_static_scenario
 from .visualization import draw_final_scene_on_axis, plot_final_scene
@@ -79,6 +80,17 @@ class SimulationSession:
         self._undo_stack.append(snapshot)
         if len(self._undo_stack) > self.max_undo_steps:
             self._undo_stack.pop(0)
+
+    def _validate_task_point(self, p: tuple[float, float]) -> None:
+        self._assert_ready()
+        assert self.artifacts is not None
+
+        if not self.artifacts.world.point_in_bounds(p, margin=0.0):
+            raise ValueError("point is out of map bounds")
+        if Point(p).within(self.artifacts.world.depot_polygon):
+            raise ValueError("point is inside depot")
+        if not self.artifacts.world.point_is_free(p, clearance=self.cfg.vehicle_radius + 0.2):
+            raise ValueError("point is in obstacle/safety area")
 
     def can_undo(self) -> bool:
         return len(self._undo_stack) > 0
@@ -163,15 +175,9 @@ class SimulationSession:
     def add_task(self, x: float, y: float, demand: int, task_id: int | None = None) -> Task:
         self._assert_ready()
         assert self.engine is not None
-        assert self.artifacts is not None
 
         p = (x, y)
-        if not self.artifacts.world.point_in_bounds(p, margin=0.0):
-            raise ValueError("point is out of map bounds")
-        if Point(p).within(self.artifacts.world.depot_polygon):
-            raise ValueError("point is inside depot")
-        if not self.artifacts.world.point_is_free(p, clearance=self.cfg.vehicle_radius + 0.2):
-            raise ValueError("point is in obstacle/safety area")
+        self._validate_task_point(p)
         if demand <= 0:
             raise ValueError("demand must be positive")
 
@@ -182,6 +188,65 @@ class SimulationSession:
         self.step += 1
         self.engine.add_dynamic_task(task=task, step=self.step)
         self.engine.allocate_until_stable(phase=f"session:add@{self.step}")
+        return task
+
+    def move_task(self, task_id: int, x: float, y: float) -> Task:
+        self._assert_ready()
+        assert self.engine is not None
+
+        tid = int(task_id)
+        task = self.engine.tasks_by_id.get(tid)
+        if task is None:
+            raise ValueError(f"task {tid} not found")
+        if task.status == "canceled":
+            raise ValueError(f"task T{tid} already canceled")
+
+        p = (float(x), float(y))
+        self._validate_task_point(p)
+
+        old_pos = task.position
+        if abs(old_pos[0] - p[0]) < 1e-9 and abs(old_pos[1] - p[1]) < 1e-9:
+            return task
+
+        self._push_undo_state()
+        self.step += 1
+
+        # Remove old ownership/runtime implications, then re-auction from new position.
+        owner = task.assigned_vehicle
+        if owner is not None:
+            vehicle = self.engine.vehicles[owner]
+            if tid in vehicle.task_sequence:
+                vehicle.task_sequence = [seq_tid for seq_tid in vehicle.task_sequence if seq_tid != tid]
+            self.engine._recompute_vehicle_state(vehicle)
+
+        task.position = p
+        task.status = "withdrawn"
+        task.assigned_vehicle = None
+
+        for vid in range(len(self.engine.vehicles)):
+            pair = (vid, tid)
+            self.engine.corrected_bid_cache.pop(pair, None)
+            self.engine.force_accept_pairs.discard(pair)
+
+        base = self.engine.records.get(tid)
+        next_version = (base.version + 1) if base is not None else 1
+        self.engine.records[tid] = TaskRecord(
+            task_id=tid,
+            winner=None,
+            bid=float("inf"),
+            status="withdrawn",
+            version=next_version,
+        )
+
+        self.engine.event_logs.append(
+            EventLog(
+                step=self.step,
+                event_type="move_task",
+                task_id=tid,
+                message=f"moved task T{tid} from {old_pos} to {p}",
+            )
+        )
+        self.engine.allocate_until_stable(phase=f"session:move@{self.step}")
         return task
 
     def add_random_task(self, demand: int | None = None) -> Task:

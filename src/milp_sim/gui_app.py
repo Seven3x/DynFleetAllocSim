@@ -22,6 +22,9 @@ class MilpGuiApp:
         self.obstacle_draw_mode = False
         self.obstacle_points: list[tuple[float, float]] = []
         self.task_click_mode = False
+        self.dragging_task_id: int | None = None
+        self.drag_origin_pos: tuple[float, float] | None = None
+        self.drag_preview_pos: tuple[float, float] | None = None
 
         self.root = tk.Tk()
         self.root.title("MILP Dynamic Task Allocation GUI")
@@ -193,7 +196,9 @@ class MilpGuiApp:
         self.ax = self.figure.add_subplot(111)
         self.canvas = FigureCanvasTkAgg(self.figure, master=parent)
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
-        self.canvas.mpl_connect("button_press_event", self._on_canvas_click)
+        self.canvas.mpl_connect("button_press_event", self._on_canvas_press)
+        self.canvas.mpl_connect("motion_notify_event", self._on_canvas_motion)
+        self.canvas.mpl_connect("button_release_event", self._on_canvas_release)
 
     def _build_right_panels(self, parent) -> None:
         status_frame = ttk.LabelFrame(parent, text="Status", padding=6)
@@ -270,6 +275,19 @@ class MilpGuiApp:
 
     def _refresh_map(self) -> None:
         self.session.draw_on_axis(self.ax)
+        if self.dragging_task_id is not None and self.drag_preview_pos is not None:
+            x, y = self.drag_preview_pos
+            self.ax.scatter([x], [y], s=80, marker="x", color="#be123c", linewidth=2.0, zorder=15)
+            self.ax.text(
+                x,
+                y,
+                f"  T{self.dragging_task_id}",
+                fontsize=9,
+                color="#9f1239",
+                ha="left",
+                va="bottom",
+                zorder=16,
+            )
         if self.obstacle_points:
             xs = [p[0] for p in self.obstacle_points]
             ys = [p[1] for p in self.obstacle_points]
@@ -313,6 +331,26 @@ class MilpGuiApp:
         self.figure.tight_layout()
         self.canvas.draw_idle()
 
+    def _pick_task_id_near(self, x: float, y: float, ratio: float = 0.03) -> int | None:
+        x_min, x_max = self.ax.get_xlim()
+        y_min, y_max = self.ax.get_ylim()
+        tol = ratio * max(abs(x_max - x_min), abs(y_max - y_min))
+        tol2 = tol * tol
+
+        nearest_task_id: int | None = None
+        nearest_d2 = float("inf")
+
+        for task in self.session.list_tasks():
+            if task.status == "canceled":
+                continue
+            dx = task.position[0] - x
+            dy = task.position[1] - y
+            d2 = dx * dx + dy * dy
+            if d2 <= tol2 and d2 < nearest_d2:
+                nearest_d2 = d2
+                nearest_task_id = task.id
+        return nearest_task_id
+
     def _refresh_text_panels(self) -> None:
         log_n = self._parse_optional_int(self.log_count_var.get()) or 8
         self._set_text(self.status_text, self.session.format_status_text())
@@ -336,6 +374,9 @@ class MilpGuiApp:
             self.obstacle_points = []
             self.obstacle_draw_mode = False
             self.task_click_mode = False
+            self.dragging_task_id = None
+            self.drag_origin_pos = None
+            self.drag_preview_pos = None
             self.obstacle_mode_var.set("OFF")
             self.obstacle_point_count_var.set("0")
             self.task_mode_var.set("OFF")
@@ -349,10 +390,12 @@ class MilpGuiApp:
         try:
             self.session.undo()
             self.obstacle_points = []
+            self.dragging_task_id = None
+            self.drag_origin_pos = None
+            self.drag_preview_pos = None
             self.obstacle_point_count_var.set("0")
             self.last_action_var.set("Undo done")
             self._refresh_all()
-            messagebox.showinfo("Undo", "Reverted last mutating action.")
         except Exception as exc:
             messagebox.showerror("Undo Error", str(exc))
 
@@ -426,6 +469,94 @@ class MilpGuiApp:
                 self._refresh_all()
             except Exception as exc:
                 messagebox.showerror("Task Click Add Error", str(exc))
+
+    def _on_canvas_press(self, event) -> None:
+        if event.inaxes != self.ax:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+
+        x = float(event.xdata)
+        y = float(event.ydata)
+        button = int(getattr(event, "button", 0) or 0)
+
+        if button == 3:
+            if self.obstacle_draw_mode or self.task_click_mode:
+                return
+            task_id = self._pick_task_id_near(x, y)
+            if task_id is None:
+                return
+            try:
+                self.session.cancel_task(task_id=task_id)
+                self.last_action_var.set(f"Task deleted by right click: T{task_id}")
+                self._refresh_all()
+            except Exception as exc:
+                messagebox.showerror("Task Delete Error", str(exc))
+            return
+
+        if button != 1:
+            return
+
+        if self.obstacle_draw_mode or self.task_click_mode:
+            self._on_canvas_click(event)
+            return
+
+        task_id = self._pick_task_id_near(x, y)
+        if task_id is None:
+            return
+
+        task = next((t for t in self.session.list_tasks() if t.id == task_id), None)
+        if task is None:
+            return
+
+        self.dragging_task_id = task_id
+        self.drag_origin_pos = (task.position[0], task.position[1])
+        self.drag_preview_pos = (x, y)
+        self.last_action_var.set(f"Dragging T{task_id}...")
+        self._refresh_map()
+
+    def _on_canvas_motion(self, event) -> None:
+        if self.dragging_task_id is None:
+            return
+        if event.inaxes != self.ax:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        self.drag_preview_pos = (float(event.xdata), float(event.ydata))
+        self._refresh_map()
+
+    def _on_canvas_release(self, event) -> None:
+        button = int(getattr(event, "button", 0) or 0)
+        if button != 1:
+            return
+        if self.dragging_task_id is None:
+            return
+
+        task_id = self.dragging_task_id
+        origin = self.drag_origin_pos
+        target = self.drag_preview_pos
+        self.dragging_task_id = None
+        self.drag_origin_pos = None
+        self.drag_preview_pos = None
+
+        if origin is None or target is None:
+            self._refresh_map()
+            return
+
+        if abs(origin[0] - target[0]) < 1e-6 and abs(origin[1] - target[1]) < 1e-6:
+            self.last_action_var.set(f"Drag canceled: T{task_id}")
+            self._refresh_map()
+            return
+
+        try:
+            moved = self.session.move_task(task_id=task_id, x=target[0], y=target[1])
+            self.last_action_var.set(
+                f"Task moved: T{task_id} -> ({moved.position[0]:.2f}, {moved.position[1]:.2f})"
+            )
+            self._refresh_all()
+        except Exception as exc:
+            messagebox.showerror("Task Move Error", str(exc))
+            self._refresh_all()
 
     def _on_toggle_obstacle_draw(self) -> None:
         if not self.obstacle_draw_mode and self.task_click_mode:
