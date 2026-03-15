@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import List, Tuple
+from typing import List
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 import matplotlib.pyplot as plt
-import numpy as np
 
 from .entities import Task, Vehicle
 from .map_utils import WorldMap
@@ -28,24 +27,6 @@ def draw_world(ax, world: WorldMap) -> None:
     ax.set_ylim(0, world.height)
     ax.set_aspect("equal", adjustable="box")
     ax.grid(alpha=0.2)
-
-
-def _chaikin(points: List[Tuple[float, float]], iters: int = 2) -> List[Tuple[float, float]]:
-    if len(points) < 3:
-        return points
-    out = points[:]
-    for _ in range(iters):
-        refined = [out[0]]
-        for i in range(len(out) - 1):
-            p0 = np.asarray(out[i])
-            p1 = np.asarray(out[i + 1])
-            q = 0.75 * p0 + 0.25 * p1
-            r = 0.25 * p0 + 0.75 * p1
-            refined.append((float(q[0]), float(q[1])))
-            refined.append((float(r[0]), float(r[1])))
-        refined.append(out[-1])
-        out = refined
-    return out
 
 
 def _vehicle_colors(n: int):
@@ -156,9 +137,8 @@ def draw_final_scene_on_axis(
 
         pts = v.route_points
         if len(pts) >= 2:
-            smooth = _chaikin(pts, iters=2)
-            xs = [p[0] for p in smooth]
-            ys = [p[1] for p in smooth]
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
             ax.plot(xs, ys, color=color, linewidth=curve_width, alpha=0.95)
 
         if show_vehicle_sequences and v.task_sequence:

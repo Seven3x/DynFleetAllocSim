@@ -29,8 +29,8 @@ class SimulationConfig:
 
     vehicle_speed_min: float = 7.0
     vehicle_speed_max: float = 12.0
-    vehicle_omega_min: float = 0.35
-    vehicle_omega_max: float = 0.8
+    vehicle_omega_min: float = 1.4
+    vehicle_omega_max: float = 2.8
     vehicle_capacity_min: int = 14
     vehicle_capacity_max: int = 20
 
@@ -44,6 +44,13 @@ class SimulationConfig:
 
     astar_resolution: float = 1.0
     astar_connect_diagonal: bool = True
+
+    # Hybrid trajectory: A* skeleton + Dubins segments
+    use_dubins_hybrid: bool = True
+    dubins_sample_step: float = 0.5
+    dubins_collision_margin: float = 0.8
+    dubins_fallback_to_astar: bool = False
+    dubins_force_mode: bool = True
 
     # Lightweight neighborhood coordination
     comm_radius: float = 38.0

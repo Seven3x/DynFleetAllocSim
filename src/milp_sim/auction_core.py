@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from .config import SimulationConfig
 from .cost_estimator import fast_cost_estimate, heading_to_point
+from .dubins_path import build_dubins_hybrid_path
 from .entities import Task, Vehicle
 from .map_utils import WorldMap
 from .neighbor_coordination import CoordinationLog, TaskRecord, build_neighbors, run_coordination
@@ -466,19 +467,33 @@ class AllocationEngine:
             v.route_points = [v.start_pos]
             v.route_length = 0.0
             cur = v.start_pos
+            cur_heading = v.heading
 
             for tid in v.task_sequence:
                 task = self.tasks_by_id[tid]
-                path, length = self.planner.plan(cur, task.position)
+                turn_radius = v.speed / max(v.max_omega, 1e-6)
+                path, length, _ = build_dubins_hybrid_path(
+                    world=self.world,
+                    cfg=self.cfg,
+                    start_pose=(cur[0], cur[1], cur_heading),
+                    goal_pose=(task.position[0], task.position[1], heading_to_point(cur, task.position)),
+                    astar_planner=self.planner,
+                    turn_radius=turn_radius,
+                )
                 if not path or length == float("inf"):
                     raise RuntimeError(
-                        f"A* planning failed for vehicle={v.id}, task={tid}, from={cur} to={task.position}."
+                        f"Hybrid planning failed for vehicle={v.id}, task={tid}, from={cur} to={task.position}."
                     )
 
                 if len(path) > 1:
                     v.route_points.extend(path[1:])
                 v.route_length += length
                 cur = task.position
+                if len(path) >= 2:
+                    dx = path[-1][0] - path[-2][0]
+                    dy = path[-1][1] - path[-2][1]
+                    if abs(dx) > 1e-9 or abs(dy) > 1e-9:
+                        cur_heading = heading_to_point(path[-2], path[-1])
 
 
 def run_static_auction(

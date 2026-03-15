@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .config import SimulationConfig
-from .cost_estimator import heading_to_point, wrap_to_pi
+from .cost_estimator import heading_to_point
+from .dubins_path import build_dubins_hybrid_path
 from .entities import Task, Vehicle
 from .planner_astar import AStarPlanner
 
@@ -32,18 +33,31 @@ def verify_bid(
             e_under=1.0,
         )
 
-    tgt_heading = heading_to_point(vehicle.current_pos, task.position)
-    delta = abs(wrap_to_pi(tgt_heading - vehicle.current_heading))
     turn_radius = vehicle.speed / max(vehicle.max_omega, 1e-6)
+    target_heading = heading_to_point(vehicle.current_pos, task.position)
+    if cfg.use_dubins_hybrid:
+        hybrid_path, hybrid_len, _ = build_dubins_hybrid_path(
+            world=planner.world,
+            cfg=cfg,
+            start_pose=(vehicle.current_pos[0], vehicle.current_pos[1], vehicle.current_heading),
+            goal_pose=(task.position[0], task.position[1], target_heading),
+            astar_planner=planner,
+            turn_radius=turn_radius,
+            astar_path=path,
+            astar_length=astar_len,
+        )
+        path_length = hybrid_len if hybrid_path and hybrid_len != float("inf") else astar_len
+    else:
+        path_length = astar_len
 
-    c_tilde = (astar_len + cfg.lambda_psi * turn_radius * delta) / vehicle.speed
+    c_tilde = path_length / vehicle.speed
     if c_tilde <= 1e-12:
-        return VerificationResult(passed=True, path_length=astar_len, c_tilde=c_tilde, e_under=0.0)
+        return VerificationResult(passed=True, path_length=path_length, c_tilde=c_tilde, e_under=0.0)
 
     e_under = (c_tilde - c_hat) / c_tilde
     return VerificationResult(
         passed=e_under <= cfg.verify_epsilon,
-        path_length=astar_len,
+        path_length=path_length,
         c_tilde=c_tilde,
         e_under=e_under,
     )
