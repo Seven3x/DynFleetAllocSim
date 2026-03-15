@@ -65,6 +65,11 @@ class SimulationConfig:
     dynamic_new_tasks: int = 3
     dynamic_cancel_tasks: int = 2
 
+    # Online runtime simulation
+    online_dt: float = 0.5
+    online_replan_period_s: float = 2.0
+    preempt_gain_threshold: float = 0.10
+
     figure_dpi: int = 130
     figure_size: tuple = (11, 10)
 

@@ -19,6 +19,11 @@ def _print_help() -> None:
     print("  plot [filename]                   Save current figure to outputs/")
     print("  export_logs [prefix]              Export coordination/verification logs")
     print("  logs [n]                          Show last n verification/coordination logs")
+    print("  online_start [dt] [period]        Start online runtime")
+    print("  online_pause                      Pause online runtime")
+    print("  online_resume                     Resume online runtime")
+    print("  tick [n]                          Advance online runtime by n ticks (default 1)")
+    print("  remove_obstacle idx               Remove obstacle by index")
     print("  quit / exit                       Exit console")
 
 
@@ -103,6 +108,29 @@ class InteractiveConsole:
             elif cmd == "logs":
                 n = int(tokens[1]) if len(tokens) > 1 else 5
                 self._logs(n=n)
+            elif cmd == "online_start":
+                dt = float(tokens[1]) if len(tokens) > 1 else None
+                period = float(tokens[2]) if len(tokens) > 2 else None
+                self.session.start_online(dt=dt, replan_period_s=period)
+                print("online runtime started")
+            elif cmd == "online_pause":
+                self.session.pause_online()
+                print("online runtime paused")
+            elif cmd == "online_resume":
+                self.session.resume_online()
+                print("online runtime resumed")
+            elif cmd == "tick":
+                n = int(tokens[1]) if len(tokens) > 1 else 1
+                snap = self.session.tick(n=n)
+                print(
+                    f"t={snap.sim_time:.2f}s running={snap.online_running} "
+                    f"pending_events={len(snap.pending_events)}"
+                )
+            elif cmd == "remove_obstacle":
+                if len(tokens) != 2:
+                    raise ValueError("usage: remove_obstacle idx")
+                self.session.remove_obstacle(obstacle_idx=int(tokens[1]))
+                print(f"removed obstacle idx={tokens[1]}")
             else:
                 print(f"unknown command: {cmd}")
                 _print_help()

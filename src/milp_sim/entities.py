@@ -31,6 +31,13 @@ class Vehicle:
     route_points: List[Point2D] = field(default_factory=list)
     route_length: float = 0.0
 
+    # Online runtime fields
+    active_task_id: Optional[int] = None
+    path_cursor: int = 0
+    distance_to_next_waypoint: float = 0.0
+    is_moving: bool = False
+    last_replan_time: float = -1.0
+
     def reset_runtime_state(self) -> None:
         self.remaining_capacity = self.capacity
         self.task_sequence = []
@@ -38,3 +45,8 @@ class Vehicle:
         self.current_heading = self.heading
         self.route_points = [self.start_pos]
         self.route_length = 0.0
+        self.active_task_id = None
+        self.path_cursor = 0
+        self.distance_to_next_waypoint = 0.0
+        self.is_moving = False
+        self.last_replan_time = -1.0

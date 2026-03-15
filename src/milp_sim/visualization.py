@@ -77,6 +77,8 @@ def draw_final_scene_on_axis(
 
     color_by_status = {
         "locked": "#ef4444",
+        "in_progress": "#f97316",
+        "completed": "#10b981",
         "canceled": "#111827",
         "withdrawn": "#f59e0b",
         "unassigned": "#9ca3af",

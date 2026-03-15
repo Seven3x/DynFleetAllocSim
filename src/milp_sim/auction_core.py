@@ -147,13 +147,13 @@ class AllocationEngine:
         if task.status == "canceled":
             return
 
-        if task.status != "locked":
+        if task.status not in {"locked", "in_progress"}:
             self._apply_canceled_record(task_id=task_id, step=step, message="canceled before lock")
             task.status = "canceled"
             task.assigned_vehicle = None
             return
 
-        # locked but not executed in current simulator model
+        # locked/in-progress but not irreversibly executed in current simulator model
         owner = task.assigned_vehicle
         if owner is not None:
             vehicle = self.vehicles[owner]
@@ -412,7 +412,7 @@ class AllocationEngine:
 
         for tid in vehicle.task_sequence:
             task = self.tasks_by_id.get(tid)
-            if task is None or task.status != "locked":
+            if task is None or task.status not in {"locked", "in_progress"}:
                 continue
             if task.demand > remaining:
                 continue

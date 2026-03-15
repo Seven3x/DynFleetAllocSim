@@ -37,6 +37,12 @@ class MilpGuiApp:
         self.obstacle_mode_var = tk.StringVar(value="OFF")
         self.task_mode_var = tk.StringVar(value="OFF")
         self.last_action_var = tk.StringVar(value="Ready")
+        self.online_state_var = tk.StringVar(value="OFF")
+        self.sim_time_var = tk.StringVar(value="0.00")
+        self.next_event_var = tk.StringVar(value="-")
+        self.replan_reason_var = tk.StringVar(value="-")
+        self.sim_speed_var = tk.StringVar(value="1x")
+        self.obstacle_remove_var = tk.StringVar(value="")
 
         self._build_layout()
         self._refresh_all()
@@ -103,6 +109,42 @@ class MilpGuiApp:
         ttk.Button(top, text="Save Snapshot", command=self._on_save_snapshot).pack(fill="x", pady=3)
         ttk.Button(top, text="Export Logs", command=self._on_export_logs).pack(fill="x", pady=3)
 
+        online_frame = ttk.LabelFrame(parent, text="Online Runtime", padding=8)
+        online_frame.pack(fill="x", pady=8)
+        ttk.Label(online_frame, text="state").grid(row=0, column=0, sticky="w")
+        ttk.Label(online_frame, textvariable=self.online_state_var).grid(row=0, column=1, sticky="w")
+        ttk.Label(online_frame, text="sim time").grid(row=1, column=0, sticky="w")
+        ttk.Label(online_frame, textvariable=self.sim_time_var).grid(row=1, column=1, sticky="w")
+        ttk.Label(online_frame, text="next event").grid(row=2, column=0, sticky="w")
+        ttk.Label(online_frame, textvariable=self.next_event_var).grid(row=2, column=1, sticky="w")
+        ttk.Label(online_frame, text="replan").grid(row=3, column=0, sticky="w")
+        ttk.Label(online_frame, textvariable=self.replan_reason_var, wraplength=190).grid(
+            row=3, column=1, sticky="w"
+        )
+        ttk.Button(online_frame, text="Start Online", command=self._on_start_online).grid(
+            row=4, column=0, columnspan=2, sticky="ew", pady=(6, 0)
+        )
+        ttk.Button(online_frame, text="Pause/Resume", command=self._on_toggle_online_pause).grid(
+            row=5, column=0, columnspan=2, sticky="ew", pady=(5, 0)
+        )
+        ttk.Button(online_frame, text="Step x1", command=lambda: self._on_online_step(1)).grid(
+            row=6, column=0, sticky="ew", pady=(5, 0)
+        )
+        ttk.Button(online_frame, text="Step x10", command=lambda: self._on_online_step(10)).grid(
+            row=6, column=1, sticky="ew", pady=(5, 0)
+        )
+        ttk.Label(online_frame, text="speed").grid(row=7, column=0, sticky="w", pady=(6, 0))
+        speed_box = ttk.Combobox(
+            online_frame,
+            textvariable=self.sim_speed_var,
+            values=("1x", "2x", "5x"),
+            state="readonly",
+            width=8,
+        )
+        speed_box.grid(row=7, column=1, sticky="ew", pady=(6, 0))
+        online_frame.columnconfigure(0, weight=1)
+        online_frame.columnconfigure(1, weight=1)
+
         obstacle_frame = ttk.LabelFrame(parent, text="Draw Obstacle Polygon", padding=8)
         obstacle_frame.pack(fill="x", pady=8)
         ttk.Label(obstacle_frame, text="draw mode").grid(row=0, column=0, sticky="w")
@@ -126,6 +168,18 @@ class MilpGuiApp:
             text="Apply Obstacle",
             command=self._on_apply_obstacle,
         ).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(5, 0))
+        ttk.Label(obstacle_frame, text="remove idx").grid(row=5, column=0, sticky="w", pady=(6, 0))
+        self.obstacle_remove_combo = ttk.Combobox(
+            obstacle_frame,
+            textvariable=self.obstacle_remove_var,
+            values=(),
+            state="readonly",
+            width=12,
+        )
+        self.obstacle_remove_combo.grid(row=5, column=1, sticky="ew", pady=(6, 0))
+        ttk.Button(obstacle_frame, text="Remove Obstacle", command=self._on_remove_obstacle).grid(
+            row=6, column=0, columnspan=2, sticky="ew", pady=(5, 0)
+        )
         obstacle_frame.columnconfigure(0, weight=1)
         obstacle_frame.columnconfigure(1, weight=1)
 
@@ -356,6 +410,22 @@ class MilpGuiApp:
         self._set_text(self.status_text, self.session.format_status_text())
         self._set_text(self.logs_text, self.session.format_logs_text(n=log_n))
         self._set_text(self.tasks_text, self.session.format_tasks_text(limit=80))
+        snap = self.session.runtime_snapshot()
+        self.online_state_var.set("RUN" if snap.online_running else ("IDLE" if self.session.online_enabled else "OFF"))
+        self.sim_time_var.set(f"{snap.sim_time:.2f}s")
+        if snap.pending_events:
+            nxt = snap.pending_events[0]
+            self.next_event_var.set(f"{nxt.time_s:.2f}s:{nxt.event_type}")
+        else:
+            self.next_event_var.set("-")
+        self.replan_reason_var.set(snap.last_replan_reason or "-")
+        obstacles = self.session.list_obstacles()
+        values = [str(idx) for idx, _ in obstacles]
+        self.obstacle_remove_combo.configure(values=values)
+        if values and self.obstacle_remove_var.get() not in values:
+            self.obstacle_remove_var.set(values[0])
+        if not values:
+            self.obstacle_remove_var.set("")
 
     def _refresh_all(self) -> None:
         try:
@@ -365,6 +435,13 @@ class MilpGuiApp:
             messagebox.showerror("Refresh Error", str(exc))
 
     def _schedule_refresh(self) -> None:
+        try:
+            if self.session.online_enabled and self.session.online_running:
+                speed_map = {"1x": 1, "2x": 2, "5x": 5}
+                n = speed_map.get(self.sim_speed_var.get(), 1)
+                self.session.tick(n=n)
+        except Exception as exc:
+            self.last_action_var.set(f"tick error: {exc}")
         self._refresh_all()
         self.root.after(self.refresh_interval_ms, self._schedule_refresh)
 
@@ -416,6 +493,39 @@ class MilpGuiApp:
             messagebox.showinfo("Logs Exported", f"Coordination:\n{coord}\n\nVerification:\n{verify}")
         except Exception as exc:
             messagebox.showerror("Export Error", str(exc))
+
+    def _on_start_online(self) -> None:
+        try:
+            self.session.start_online()
+            self.last_action_var.set("Online runtime started")
+            self._refresh_all()
+        except Exception as exc:
+            messagebox.showerror("Online Start Error", str(exc))
+
+    def _on_toggle_online_pause(self) -> None:
+        try:
+            if not self.session.online_enabled:
+                self.session.start_online()
+                self.last_action_var.set("Online runtime started")
+            elif self.session.online_running:
+                self.session.pause_online()
+                self.last_action_var.set("Online runtime paused")
+            else:
+                self.session.resume_online()
+                self.last_action_var.set("Online runtime resumed")
+            self._refresh_all()
+        except Exception as exc:
+            messagebox.showerror("Online Pause/Resume Error", str(exc))
+
+    def _on_online_step(self, n: int) -> None:
+        try:
+            if not self.session.online_enabled:
+                self.session.start_online()
+            self.session.tick(n=int(n))
+            self.last_action_var.set(f"Online stepped x{n}")
+            self._refresh_all()
+        except Exception as exc:
+            messagebox.showerror("Online Step Error", str(exc))
 
     def _on_add_random(self) -> None:
         try:
@@ -603,6 +713,18 @@ class MilpGuiApp:
             )
         except Exception as exc:
             messagebox.showerror("Obstacle Error", str(exc))
+
+    def _on_remove_obstacle(self) -> None:
+        try:
+            v = self.obstacle_remove_var.get().strip()
+            if not v:
+                raise ValueError("no obstacle index selected")
+            idx = int(v)
+            self.session.remove_obstacle(obstacle_idx=idx)
+            self.last_action_var.set(f"Obstacle removed: idx={idx}")
+            self._refresh_all()
+        except Exception as exc:
+            messagebox.showerror("Obstacle Remove Error", str(exc))
 
     def run(self) -> None:
         self.root.mainloop()

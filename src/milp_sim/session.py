@@ -1,18 +1,25 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
+import math
+import os
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+
+import matplotlib.pyplot as plt
 import numpy as np
 from shapely.geometry import Point, Polygon
 
 from .auction_core import AllocationEngine, AllocationResult, EventLog
 from .config import DEFAULT_CONFIG, SimulationConfig
+from .cost_estimator import heading_to_point
+from .dubins_path import build_dubins_hybrid_path
 from .dynamic_events import generate_new_task
-from .entities import Task
+from .entities import Task, Vehicle
 from .neighbor_coordination import TaskRecord
 from .planner_astar import AStarPlanner
 from .simulator import SimulationArtifacts, build_static_scenario
@@ -27,6 +34,28 @@ class SessionSnapshot:
     system_total_time: float
 
 
+@dataclass
+class OnlineEvent:
+    event_id: int
+    time_s: float
+    event_type: str
+    payload: dict[str, Any] = field(default_factory=dict)
+    applied: bool = False
+    result_message: str = ""
+
+
+@dataclass
+class RuntimeSnapshot:
+    sim_time: float
+    online_running: bool
+    dt: float
+    replan_period_s: float
+    next_replan_time: float
+    pending_events: list[OnlineEvent]
+    last_replan_reason: str
+    last_event_message: str
+
+
 class SimulationSession:
     def __init__(self, cfg: SimulationConfig = DEFAULT_CONFIG) -> None:
         self.cfg = cfg
@@ -39,6 +68,19 @@ class SimulationSession:
 
         self.rng = np.random.default_rng(cfg.seed + 2026)
         self.step = 10_000
+
+        self.online_enabled = False
+        self.online_running = False
+        self.sim_time = 0.0
+        self.online_dt = cfg.online_dt
+        self.replan_period_s = cfg.online_replan_period_s
+        self.next_periodic_replan = cfg.online_replan_period_s
+        self._event_id_counter = 0
+        self.pending_events: list[OnlineEvent] = []
+        self.event_history: list[OnlineEvent] = []
+        self.last_replan_reason = ""
+        self.last_event_message = ""
+
         self.reset()
 
     def reset(self) -> None:
@@ -55,6 +97,544 @@ class SimulationSession:
         self.step = 10_000
         self._undo_stack.clear()
 
+        self.online_enabled = False
+        self.online_running = False
+        self.sim_time = 0.0
+        self.online_dt = self.cfg.online_dt
+        self.replan_period_s = self.cfg.online_replan_period_s
+        self.next_periodic_replan = self.replan_period_s
+        self.pending_events.clear()
+        self.event_history.clear()
+        self.last_replan_reason = ""
+        self.last_event_message = ""
+
+    def start_online(self, dt: float | None = None, replan_period_s: float | None = None) -> RuntimeSnapshot:
+        self._assert_ready()
+        assert self.engine is not None
+
+        if dt is not None:
+            if float(dt) <= 0.0:
+                raise ValueError("dt must be positive")
+            self.online_dt = float(dt)
+        if replan_period_s is not None:
+            if float(replan_period_s) <= 0.0:
+                raise ValueError("replan_period_s must be positive")
+            self.replan_period_s = float(replan_period_s)
+
+        if not self.online_enabled:
+            self._initialize_online_runtime()
+
+        self.online_enabled = True
+        self.online_running = True
+        return self.runtime_snapshot()
+
+    def pause_online(self) -> None:
+        self.online_running = False
+
+    def resume_online(self) -> None:
+        if not self.online_enabled:
+            self.start_online()
+            return
+        self.online_running = True
+
+    def runtime_snapshot(self) -> RuntimeSnapshot:
+        return RuntimeSnapshot(
+            sim_time=self.sim_time,
+            online_running=self.online_running,
+            dt=self.online_dt,
+            replan_period_s=self.replan_period_s,
+            next_replan_time=self.next_periodic_replan,
+            pending_events=list(self.pending_events),
+            last_replan_reason=self.last_replan_reason,
+            last_event_message=self.last_event_message,
+        )
+
+    def schedule_event(self, at_time: float, event_type: str, payload: Optional[dict[str, Any]] = None) -> OnlineEvent:
+        at = float(at_time)
+        if at < 0.0:
+            raise ValueError("event time must be >= 0")
+        payload = {} if payload is None else dict(payload)
+        self._event_id_counter += 1
+        evt = OnlineEvent(
+            event_id=self._event_id_counter,
+            time_s=at,
+            event_type=str(event_type),
+            payload=payload,
+        )
+        self.pending_events.append(evt)
+        self.pending_events.sort(key=lambda e: (e.time_s, e.event_id))
+        return evt
+
+    def tick(self, n: int = 1) -> RuntimeSnapshot:
+        self._assert_ready()
+        if n < 0:
+            raise ValueError("n must be >= 0")
+        if not self.online_enabled:
+            self.start_online(dt=self.online_dt, replan_period_s=self.replan_period_s)
+
+        if n == 0:
+            self._process_due_events_and_replan()
+            return self.runtime_snapshot()
+
+        for _ in range(n):
+            self._process_due_events_and_replan()
+            self._advance_vehicles(self.online_dt)
+            self.sim_time += self.online_dt
+            self.step += 1
+
+        return self.runtime_snapshot()
+
+    def _initialize_online_runtime(self) -> None:
+        self._assert_ready()
+        assert self.engine is not None
+
+        for v in self.engine.vehicles:
+            v.current_pos = v.start_pos
+            v.current_heading = v.heading
+            v.active_task_id = None
+            v.path_cursor = 0
+            v.distance_to_next_waypoint = 0.0
+            v.is_moving = False
+            v.last_replan_time = self.sim_time
+            v.route_points = [v.current_pos]
+            v.route_length = 0.0
+
+        for t in self.engine.tasks:
+            if t.status in {"tentative", "verifying"}:
+                t.status = "withdrawn"
+                t.assigned_vehicle = None
+            if t.status == "completed":
+                t.status = "locked"
+
+        self.sim_time = 0.0
+        self.next_periodic_replan = self.replan_period_s
+        self.last_replan_reason = "startup"
+        self._replan_online_routes(reason="startup")
+
+    def _process_due_events_and_replan(self) -> None:
+        self._assert_ready()
+        assert self.engine is not None
+
+        due_events = []
+        while self.pending_events and self.pending_events[0].time_s <= self.sim_time + 1e-9:
+            due_events.append(self.pending_events.pop(0))
+
+        event_trigger = False
+        for evt in due_events:
+            try:
+                evt.result_message = self._apply_online_event(evt)
+                evt.applied = True
+                event_trigger = True
+                self.last_event_message = evt.result_message
+            except Exception as exc:
+                evt.result_message = f"failed: {exc}"
+                evt.applied = False
+                self.last_event_message = evt.result_message
+            self.event_history.append(evt)
+
+        periodic_trigger = self.sim_time + 1e-9 >= self.next_periodic_replan
+
+        if event_trigger or periodic_trigger:
+            did_preempt = self._try_soft_preempt()
+            tags = []
+            if event_trigger:
+                tags.append("event")
+            if periodic_trigger:
+                tags.append("periodic")
+            if did_preempt:
+                tags.append("preempt")
+            reason = "+".join(tags) if tags else "periodic"
+            self._replan_online_routes(reason=reason)
+
+            if periodic_trigger:
+                self.next_periodic_replan = self.sim_time + self.replan_period_s
+
+    def _apply_online_event(self, evt: OnlineEvent) -> str:
+        self._assert_ready()
+        assert self.engine is not None
+        assert self.artifacts is not None
+
+        if evt.event_type == "add_task":
+            task = evt.payload.get("task")
+            if not isinstance(task, Task):
+                raise ValueError("add_task event requires payload['task']=Task")
+            self.engine.add_dynamic_task(task=task, step=self.step)
+            return f"event add_task applied: T{task.id}"
+
+        if evt.event_type == "cancel_task":
+            tid = int(evt.payload.get("task_id"))
+            pose_cache = {v.id: (v.current_pos, v.current_heading) for v in self.engine.vehicles}
+            self.engine.cancel_task(task_id=tid, step=self.step)
+            for v in self.engine.vehicles:
+                if v.id in pose_cache:
+                    pos, heading = pose_cache[v.id]
+                    v.current_pos = pos
+                    v.current_heading = heading
+            return f"event cancel_task applied: T{tid}"
+
+        if evt.event_type == "add_obstacle":
+            points = evt.payload.get("points")
+            if not isinstance(points, list):
+                raise ValueError("add_obstacle event requires payload['points']=list")
+            poly = self._apply_obstacle_polygon_now(points)
+            return f"event add_obstacle applied: area={poly.area:.2f}"
+
+        if evt.event_type == "remove_obstacle":
+            idx = int(evt.payload.get("obstacle_idx"))
+            poly = self.artifacts.world.remove_obstacle(idx)
+            self._rebuild_planner()
+            return f"event remove_obstacle applied: idx={idx} area={poly.area:.2f}"
+
+        raise ValueError(f"unsupported event_type: {evt.event_type}")
+
+    def _try_soft_preempt(self) -> bool:
+        keep = self._estimate_remaining_system_time(preempt=False)
+        switch = self._estimate_remaining_system_time(preempt=True)
+        if not self.soft_preempt_passes(keep, switch, self.cfg.preempt_gain_threshold):
+            return False
+
+        gain = (keep - switch) / keep
+        changed = self._apply_preempt_release()
+        if changed:
+            self.last_event_message = (
+                f"soft preempt accepted: gain={gain:.3f} threshold={self.cfg.preempt_gain_threshold:.3f}"
+            )
+        return changed
+
+    @staticmethod
+    def soft_preempt_passes(keep: float, switch: float, threshold: float) -> bool:
+        if not math.isfinite(keep) or keep <= 1e-9:
+            return False
+        if not math.isfinite(switch):
+            return False
+        gain = (keep - switch) / keep
+        return gain + 1e-12 >= threshold
+
+    def _estimate_remaining_system_time(self, preempt: bool) -> float:
+        self._assert_ready()
+        assert self.engine is not None
+
+        total = 0.0
+        pending_ids: set[int] = set()
+
+        for task in self.engine.tasks:
+            if task.status in {"unassigned", "withdrawn"}:
+                pending_ids.add(task.id)
+
+        for v in self.engine.vehicles:
+            pos = v.current_pos
+            seq = list(v.task_sequence)
+            if preempt and v.active_task_id is not None:
+                if seq and seq[0] == v.active_task_id:
+                    seq = seq[1:]
+                pending_ids.add(v.active_task_id)
+
+            for tid in seq:
+                task = self.engine.tasks_by_id.get(tid)
+                if task is None:
+                    continue
+                if task.status in {"canceled", "completed"}:
+                    continue
+                seg = math.hypot(task.position[0] - pos[0], task.position[1] - pos[1])
+                total += seg / max(v.speed, 1e-9)
+                pos = task.position
+
+        if pending_ids:
+            for tid in pending_ids:
+                task = self.engine.tasks_by_id.get(tid)
+                if task is None:
+                    continue
+                best = float("inf")
+                for v in self.engine.vehicles:
+                    seg = math.hypot(task.position[0] - v.current_pos[0], task.position[1] - v.current_pos[1])
+                    best = min(best, seg / max(v.speed, 1e-9))
+                if math.isfinite(best):
+                    total += best
+
+        return total
+
+    def _apply_preempt_release(self) -> bool:
+        self._assert_ready()
+        assert self.engine is not None
+
+        changed = False
+        for v in self.engine.vehicles:
+            tid = v.active_task_id
+            if tid is None:
+                continue
+            task = self.engine.tasks_by_id.get(tid)
+            if task is None:
+                continue
+
+            if tid in v.task_sequence:
+                v.task_sequence = [x for x in v.task_sequence if x != tid]
+                v.remaining_capacity = min(v.capacity, v.remaining_capacity + task.demand)
+
+            task.status = "withdrawn"
+            task.assigned_vehicle = None
+
+            base = self.engine.records.get(tid)
+            next_version = (base.version + 1) if base is not None else 1
+            self.engine.records[tid] = TaskRecord(
+                task_id=tid,
+                winner=None,
+                bid=float("inf"),
+                status="withdrawn",
+                version=next_version,
+            )
+
+            v.active_task_id = None
+            v.path_cursor = 0
+            v.distance_to_next_waypoint = 0.0
+            v.is_moving = False
+            v.route_points = [v.current_pos]
+            v.route_length = 0.0
+
+            self.engine.event_logs.append(
+                EventLog(
+                    step=self.step,
+                    event_type="soft_preempt",
+                    task_id=tid,
+                    message=f"soft preempt released in-progress task T{tid} from V{v.id}",
+                )
+            )
+            changed = True
+
+        return changed
+
+    def _replan_online_routes(self, reason: str) -> None:
+        self._assert_ready()
+        assert self.engine is not None
+
+        # Use runtime poses as bidding inputs, but keep them intact after allocation.
+        pose_cache = {v.id: (v.current_pos, v.current_heading, v.active_task_id) for v in self.engine.vehicles}
+
+        self.engine.allocate_until_stable(phase=f"online:{reason}@{self.step}")
+
+        for v in self.engine.vehicles:
+            pos, heading, active_tid = pose_cache[v.id]
+            v.current_pos = pos
+            v.current_heading = heading
+            if active_tid is not None and active_tid not in v.task_sequence:
+                v.active_task_id = None
+            elif active_tid is not None:
+                v.active_task_id = active_tid
+
+        self._refresh_active_tasks_and_routes()
+        self.last_replan_reason = reason
+        for v in self.engine.vehicles:
+            v.last_replan_time = self.sim_time
+
+    def _refresh_active_tasks_and_routes(self) -> None:
+        self._assert_ready()
+        assert self.engine is not None
+
+        for v in self.engine.vehicles:
+            filtered: list[int] = []
+            for tid in v.task_sequence:
+                task = self.engine.tasks_by_id.get(tid)
+                if task is None:
+                    continue
+                if task.status in {"canceled", "completed"}:
+                    continue
+                if task.status not in {"locked", "in_progress"}:
+                    continue
+                filtered.append(tid)
+            v.task_sequence = filtered
+
+            if v.active_task_id not in v.task_sequence:
+                v.active_task_id = None
+
+            if v.active_task_id is None and v.task_sequence:
+                v.active_task_id = v.task_sequence[0]
+
+            if v.active_task_id is not None and v.task_sequence and v.task_sequence[0] != v.active_task_id:
+                v.task_sequence = [v.active_task_id] + [x for x in v.task_sequence if x != v.active_task_id]
+
+            for tid in v.task_sequence:
+                task = self.engine.tasks_by_id[tid]
+                if tid == v.active_task_id:
+                    task.status = "in_progress"
+                    task.assigned_vehicle = v.id
+                elif task.status == "in_progress":
+                    task.status = "locked"
+
+            if v.active_task_id is None:
+                v.path_cursor = 0
+                v.distance_to_next_waypoint = 0.0
+                v.is_moving = False
+                v.route_points = [v.current_pos]
+                v.route_length = 0.0
+            else:
+                self._build_active_segment(v)
+
+    def _build_active_segment(self, v: Vehicle) -> None:
+        self._assert_ready()
+        assert self.engine is not None
+        assert self.artifacts is not None
+
+        tid = v.active_task_id
+        if tid is None:
+            v.route_points = [v.current_pos]
+            v.route_length = 0.0
+            v.path_cursor = 0
+            v.distance_to_next_waypoint = 0.0
+            v.is_moving = False
+            return
+
+        task = self.engine.tasks_by_id.get(tid)
+        if task is None:
+            v.active_task_id = None
+            v.route_points = [v.current_pos]
+            v.route_length = 0.0
+            v.path_cursor = 0
+            v.distance_to_next_waypoint = 0.0
+            v.is_moving = False
+            return
+
+        goal_heading = heading_to_point(v.current_pos, task.position)
+        if len(v.task_sequence) >= 2 and v.task_sequence[0] == tid:
+            nxt = self.engine.tasks_by_id.get(v.task_sequence[1])
+            if nxt is not None:
+                goal_heading = heading_to_point(task.position, nxt.position)
+
+        turn_radius = v.speed / max(v.max_omega, 1e-6)
+        path, length, _ = build_dubins_hybrid_path(
+            world=self.artifacts.world,
+            cfg=self.cfg,
+            start_pose=(v.current_pos[0], v.current_pos[1], v.current_heading),
+            goal_pose=(task.position[0], task.position[1], goal_heading),
+            astar_planner=self.artifacts.planner,
+            turn_radius=turn_radius,
+        )
+
+        if not path or length == float("inf"):
+            path = [v.current_pos, task.position]
+            length = math.hypot(task.position[0] - v.current_pos[0], task.position[1] - v.current_pos[1])
+
+        path[0] = v.current_pos
+        path[-1] = task.position
+        v.route_points = path
+        v.route_length = length
+        v.path_cursor = 0
+        v.distance_to_next_waypoint = self._distance_to_next_waypoint(v)
+        v.is_moving = len(path) >= 2
+
+    def _distance_to_next_waypoint(self, v: Vehicle) -> float:
+        if len(v.route_points) < 2:
+            return 0.0
+        idx = min(max(v.path_cursor, 0), len(v.route_points) - 2)
+        nxt = v.route_points[idx + 1]
+        return math.hypot(nxt[0] - v.current_pos[0], nxt[1] - v.current_pos[1])
+
+    def _advance_vehicles(self, dt: float) -> None:
+        self._assert_ready()
+        assert self.engine is not None
+
+        for v in self.engine.vehicles:
+            self._advance_vehicle(v, dt)
+
+    def _advance_vehicle(self, v: Vehicle, dt: float) -> None:
+        remaining = max(0.0, v.speed * dt)
+
+        while remaining > 1e-9:
+            if v.active_task_id is None:
+                self._activate_next_task(v)
+                if v.active_task_id is None:
+                    break
+
+            if not v.is_moving or len(v.route_points) < 2:
+                self._build_active_segment(v)
+                if not v.is_moving:
+                    break
+
+            if v.path_cursor >= len(v.route_points) - 1:
+                self._complete_active_task(v)
+                continue
+
+            nxt = v.route_points[v.path_cursor + 1]
+            dx = nxt[0] - v.current_pos[0]
+            dy = nxt[1] - v.current_pos[1]
+            seg = math.hypot(dx, dy)
+
+            if seg <= 1e-9:
+                v.path_cursor += 1
+                continue
+
+            if remaining < seg:
+                ratio = remaining / seg
+                new_pos = (v.current_pos[0] + dx * ratio, v.current_pos[1] + dy * ratio)
+                v.current_heading = heading_to_point(v.current_pos, nxt)
+                v.current_pos = new_pos
+                remaining = 0.0
+            else:
+                v.current_heading = heading_to_point(v.current_pos, nxt)
+                v.current_pos = nxt
+                remaining -= seg
+                v.path_cursor += 1
+                if v.path_cursor >= len(v.route_points) - 1:
+                    self._complete_active_task(v)
+
+            v.distance_to_next_waypoint = self._distance_to_next_waypoint(v)
+
+    def _activate_next_task(self, v: Vehicle) -> None:
+        self._assert_ready()
+        assert self.engine is not None
+
+        while v.task_sequence:
+            tid = v.task_sequence[0]
+            task = self.engine.tasks_by_id.get(tid)
+            if task is None or task.status in {"canceled", "completed"}:
+                v.task_sequence = v.task_sequence[1:]
+                continue
+            v.active_task_id = tid
+            task.status = "in_progress"
+            task.assigned_vehicle = v.id
+            self._build_active_segment(v)
+            return
+
+        v.active_task_id = None
+        v.route_points = [v.current_pos]
+        v.route_length = 0.0
+        v.path_cursor = 0
+        v.distance_to_next_waypoint = 0.0
+        v.is_moving = False
+
+    def _complete_active_task(self, v: Vehicle) -> None:
+        self._assert_ready()
+        assert self.engine is not None
+
+        tid = v.active_task_id
+        if tid is None:
+            return
+
+        task = self.engine.tasks_by_id.get(tid)
+        if task is not None:
+            task.status = "completed"
+            task.assigned_vehicle = v.id
+
+        if tid in v.task_sequence:
+            v.task_sequence = [x for x in v.task_sequence if x != tid]
+
+        self.engine.event_logs.append(
+            EventLog(
+                step=self.step,
+                event_type="complete_task",
+                task_id=tid,
+                message=f"vehicle V{v.id} completed task T{tid} at t={self.sim_time:.2f}s",
+            )
+        )
+
+        v.active_task_id = None
+        v.path_cursor = 0
+        v.distance_to_next_waypoint = 0.0
+        v.is_moving = False
+        v.route_points = [v.current_pos]
+        v.route_length = 0.0
+
+        # May continue moving in same tick if there is time left.
+        self._activate_next_task(v)
+
     def _assert_ready(self) -> None:
         if self.engine is None or self.artifacts is None:
             raise RuntimeError("Session is not initialized.")
@@ -67,6 +647,9 @@ class SimulationSession:
         return max(t.id for t in self.engine.tasks) + 1
 
     def _push_undo_state(self) -> None:
+        if self.online_enabled:
+            raise ValueError("undo is disabled in online mode")
+
         self._assert_ready()
         assert self.artifacts is not None
         assert self.engine is not None
@@ -93,10 +676,12 @@ class SimulationSession:
             raise ValueError("point is in obstacle/safety area")
 
     def can_undo(self) -> bool:
-        return len(self._undo_stack) > 0
+        return (not self.online_enabled) and len(self._undo_stack) > 0
 
     def undo(self) -> None:
         self._assert_ready()
+        if self.online_enabled:
+            raise ValueError("undo is disabled in online mode")
         if not self._undo_stack:
             raise ValueError("nothing to undo")
 
@@ -120,7 +705,7 @@ class SimulationSession:
         self.artifacts.planner = planner
         self.engine.planner = planner
 
-    def add_obstacle_polygon(self, points: list[tuple[float, float]]) -> Polygon:
+    def _validate_obstacle_polygon(self, points: list[tuple[float, float]]) -> Polygon:
         self._assert_ready()
         assert self.artifacts is not None
         assert self.engine is not None
@@ -141,16 +726,36 @@ class SimulationSession:
             raise ValueError("polygon intersects existing obstacle")
 
         inflated = poly.buffer(self.cfg.vehicle_radius + self.cfg.safety_margin)
-
         for v in self.engine.vehicles:
-            if Point(v.start_pos).within(inflated) or Point(v.current_pos).within(inflated):
-                raise ValueError(f"polygon blocks vehicle V{v.id} start/current position")
+            if Point(v.current_pos).within(inflated):
+                raise ValueError(f"polygon blocks vehicle V{v.id} current position")
 
-        for t in self.engine.tasks:
-            if t.status == "canceled":
-                continue
-            if Point(t.position).within(inflated):
-                raise ValueError(f"polygon covers task T{t.id}; move obstacle or cancel task first")
+        return poly
+
+    def _apply_obstacle_polygon_now(self, points: list[tuple[float, float]]) -> Polygon:
+        self._assert_ready()
+        assert self.artifacts is not None
+
+        poly = self._validate_obstacle_polygon(points)
+        self.artifacts.world.add_obstacle(poly)
+        self._rebuild_planner()
+        return poly
+
+    def add_obstacle_polygon(self, points: list[tuple[float, float]]) -> Polygon:
+        self._assert_ready()
+
+        poly = self._validate_obstacle_polygon(points)
+        if self.online_enabled:
+            self.schedule_event(
+                at_time=self.sim_time,
+                event_type="add_obstacle",
+                payload={"points": [(float(x), float(y)) for x, y in points]},
+            )
+            self.tick(0)
+            return poly
+
+        assert self.artifacts is not None
+        assert self.engine is not None
 
         prev_obstacle_count = len(self.artifacts.world.obstacles)
         prev_planner = self.engine.planner
@@ -159,7 +764,6 @@ class SimulationSession:
         self.artifacts.world.add_obstacle(poly)
         self._rebuild_planner()
         try:
-            # Validate that current fixed task sequences remain route-feasible.
             self.engine.finalize()
         except Exception as exc:
             self.artifacts.world.obstacles = self.artifacts.world.obstacles[:prev_obstacle_count]
@@ -172,6 +776,36 @@ class SimulationSession:
 
         return poly
 
+    def remove_obstacle(self, obstacle_idx: int) -> None:
+        self._assert_ready()
+        assert self.artifacts is not None
+
+        idx = int(obstacle_idx)
+        if idx < 0 or idx >= len(self.artifacts.world.obstacles):
+            raise ValueError(f"invalid obstacle index: {idx}")
+
+        if self.online_enabled:
+            self.schedule_event(
+                at_time=self.sim_time,
+                event_type="remove_obstacle",
+                payload={"obstacle_idx": idx},
+            )
+            self.tick(0)
+            return
+
+        self._push_undo_state()
+        self.artifacts.world.remove_obstacle(idx)
+        self._rebuild_planner()
+        self.engine.allocate_until_stable(phase=f"session:remove_obstacle@{self.step}")
+
+    def list_obstacles(self) -> list[tuple[int, float]]:
+        self._assert_ready()
+        assert self.artifacts is not None
+        out: list[tuple[int, float]] = []
+        for idx, obs in enumerate(self.artifacts.world.obstacles):
+            out.append((idx, float(obs.area)))
+        return out
+
     def add_task(self, x: float, y: float, demand: int, task_id: int | None = None) -> Task:
         self._assert_ready()
         assert self.engine is not None
@@ -183,6 +817,11 @@ class SimulationSession:
 
         tid = self._next_task_id() if task_id is None else int(task_id)
         task = Task(id=tid, position=p, demand=int(demand), status="unassigned")
+
+        if self.online_enabled:
+            self.schedule_event(at_time=self.sim_time, event_type="add_task", payload={"task": task})
+            self.tick(0)
+            return task
 
         self._push_undo_state()
         self.step += 1
@@ -208,10 +847,17 @@ class SimulationSession:
         if abs(old_pos[0] - p[0]) < 1e-9 and abs(old_pos[1] - p[1]) < 1e-9:
             return task
 
+        if self.online_enabled:
+            # Treat as cancel+add with same id to keep event model compact.
+            self.schedule_event(at_time=self.sim_time, event_type="cancel_task", payload={"task_id": tid})
+            moved = Task(id=tid, position=p, demand=task.demand, status="unassigned")
+            self.schedule_event(at_time=self.sim_time, event_type="add_task", payload={"task": moved})
+            self.tick(0)
+            return moved
+
         self._push_undo_state()
         self.step += 1
 
-        # Remove old ownership/runtime implications, then re-auction from new position.
         owner = task.assigned_vehicle
         if owner is not None:
             vehicle = self.engine.vehicles[owner]
@@ -265,6 +911,11 @@ class SimulationSession:
                 raise ValueError("demand must be positive")
             task.demand = int(demand)
 
+        if self.online_enabled:
+            self.schedule_event(at_time=self.sim_time, event_type="add_task", payload={"task": task})
+            self.tick(0)
+            return task
+
         self._push_undo_state()
         self.step += 1
         self.engine.add_dynamic_task(task=task, step=self.step)
@@ -275,17 +926,43 @@ class SimulationSession:
         self._assert_ready()
         assert self.engine is not None
 
+        tid = int(task_id)
+        if self.online_enabled:
+            self.schedule_event(at_time=self.sim_time, event_type="cancel_task", payload={"task_id": tid})
+            self.tick(0)
+            return
+
         self._push_undo_state()
         self.step += 1
-        self.engine.cancel_task(task_id=int(task_id), step=self.step)
+        self.engine.cancel_task(task_id=tid, step=self.step)
         self.engine.allocate_until_stable(phase=f"session:cancel@{self.step}")
 
     def result(self) -> AllocationResult:
         self._assert_ready()
         assert self.engine is not None
-        return self.engine.finalize()
+
+        if not self.online_enabled:
+            return self.engine.finalize()
+
+        return AllocationResult(
+            vehicles=self.engine.vehicles,
+            tasks=self.engine.tasks,
+            auction_logs=self.engine.auction_logs,
+            coordination_logs=self.engine.coordination_logs,
+            verification_logs=self.engine.verification_logs,
+            event_logs=self.engine.event_logs,
+            system_total_time=self._estimate_remaining_system_time(preempt=False),
+        )
 
     def status_snapshot(self) -> SessionSnapshot:
+        if self.online_enabled:
+            return SessionSnapshot(
+                step=self.step,
+                total_tasks=len(self.engine.tasks if self.engine else []),
+                status_counts=self.status_counts(),
+                system_total_time=self._estimate_remaining_system_time(preempt=False),
+            )
+
         result = self.result()
         return SessionSnapshot(
             step=self.step,
@@ -320,23 +997,56 @@ class SimulationSession:
         return self.engine.verification_logs[-n:], self.engine.coordination_logs[-n:]
 
     def format_status_text(self) -> str:
-        result = self.result()
+        self._assert_ready()
+        assert self.engine is not None
+
+        if not self.online_enabled:
+            result = self.result()
+            lines = [
+                "-" * 72,
+                (
+                    f"step={self.step} total_tasks={len(result.tasks)} "
+                    f"status={self.status_counts()}"
+                ),
+            ]
+            for v in result.vehicles:
+                seq = ",".join(f"T{tid}" for tid in v.task_sequence) if v.task_sequence else "(none)"
+                v_time = v.route_length / v.speed
+                lines.append(
+                    f"V{v.id}: remain={v.remaining_capacity}/{v.capacity} "
+                    f"tasks=[{seq}] time={v_time:.3f}"
+                )
+            lines.append(f"system_total_time={result.system_total_time:.3f}")
+            lines.append("-" * 72)
+            return "\n".join(lines)
+
+        snap = self.runtime_snapshot()
         lines = [
-            "-" * 72,
+            "-" * 88,
             (
-                f"step={self.step} total_tasks={len(result.tasks)} "
-                f"status={self.status_counts()}"
+                f"step={self.step} sim_time={snap.sim_time:.2f}s running={snap.online_running} "
+                f"dt={snap.dt:.2f} replan_period={snap.replan_period_s:.2f}s "
+                f"next_replan={snap.next_replan_time:.2f}s"
             ),
+            (
+                f"status={self.status_counts()} pending_events={len(snap.pending_events)} "
+                f"last_replan={snap.last_replan_reason or '-'}"
+            ),
+            f"last_event={snap.last_event_message or '-'}",
         ]
-        for v in result.vehicles:
+
+        for v in self.engine.vehicles:
             seq = ",".join(f"T{tid}" for tid in v.task_sequence) if v.task_sequence else "(none)"
-            v_time = v.route_length / v.speed
             lines.append(
-                f"V{v.id}: remain={v.remaining_capacity}/{v.capacity} "
-                f"tasks=[{seq}] time={v_time:.3f}"
+                (
+                    f"V{v.id}: pos=({v.current_pos[0]:.2f},{v.current_pos[1]:.2f}) "
+                    f"active={v.active_task_id} moving={v.is_moving} remain={v.remaining_capacity}/{v.capacity} "
+                    f"tasks=[{seq}]"
+                )
             )
-        lines.append(f"system_total_time={result.system_total_time:.3f}")
-        lines.append("-" * 72)
+
+        lines.append(f"estimated_remaining_total_time={self._estimate_remaining_system_time(preempt=False):.3f}")
+        lines.append("-" * 88)
         return "\n".join(lines)
 
     def format_logs_text(self, n: int = 8) -> str:
@@ -354,6 +1064,13 @@ class SimulationSession:
                 f"  task={item.task_id} event={item.event} rounds={item.rounds} "
                 f"converged={item.converged} final=({item.final_status}, V{item.final_winner})"
             )
+
+        if self.online_enabled and self.event_history:
+            lines.append("Online events:")
+            for evt in self.event_history[-n:]:
+                lines.append(
+                    f"  id={evt.event_id} t={evt.time_s:.2f} {evt.event_type} applied={evt.applied} {evt.result_message}"
+                )
         return "\n".join(lines)
 
     def format_tasks_text(self, status_filter: Optional[str] = None, limit: int = 60) -> str:
@@ -371,14 +1088,18 @@ class SimulationSession:
     def draw_on_axis(self, ax) -> None:
         self._assert_ready()
         assert self.artifacts is not None
+        assert self.engine is not None
 
-        result = self.result()
+        title = "Realtime Allocation View"
+        if self.online_enabled:
+            title = f"Realtime Allocation View (t={self.sim_time:.1f}s)"
+
         draw_final_scene_on_axis(
             ax=ax,
             world=self.artifacts.world,
-            vehicles=result.vehicles,
-            tasks=result.tasks,
-            title="Realtime Allocation View",
+            vehicles=self.engine.vehicles,
+            tasks=self.engine.tasks,
+            title=title,
             show_task_meta=False,
             show_vehicle_sequences=False,
             task_font_size=8,
@@ -386,6 +1107,60 @@ class SimulationSession:
             label_box=True,
             curve_width=1.6,
         )
+
+        if self.online_enabled:
+            colors = plt.get_cmap("tab10")
+            for v in self.engine.vehicles:
+                c = colors(v.id % 10)
+                ax.scatter(
+                    [v.current_pos[0]],
+                    [v.current_pos[1]],
+                    s=95,
+                    color=c,
+                    edgecolor="black",
+                    linewidth=0.8,
+                    zorder=12,
+                )
+                ux = math.cos(v.current_heading)
+                uy = math.sin(v.current_heading)
+                ax.arrow(
+                    v.current_pos[0],
+                    v.current_pos[1],
+                    ux * 1.2,
+                    uy * 1.2,
+                    color=c,
+                    linewidth=1.2,
+                    head_width=0.6,
+                    head_length=0.8,
+                    length_includes_head=True,
+                    zorder=13,
+                )
+
+                if v.active_task_id is not None:
+                    task = self.engine.tasks_by_id.get(v.active_task_id)
+                    if task is not None:
+                        ax.scatter(
+                            [task.position[0]],
+                            [task.position[1]],
+                            s=120,
+                            facecolors="none",
+                            edgecolors=c,
+                            linewidths=1.8,
+                            zorder=11,
+                        )
+
+            ax.text(
+                0.01,
+                0.98,
+                f"replan={self.last_replan_reason or '-'} | event={self.last_event_message or '-'}",
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=8,
+                color="#0f172a",
+                bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.75, edgecolor="none"),
+                zorder=20,
+            )
 
     @staticmethod
     def _timestamp() -> str:
@@ -395,7 +1170,6 @@ class SimulationSession:
         self._assert_ready()
         assert self.artifacts is not None
 
-        result = self.result()
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         if filename:
@@ -403,14 +1177,23 @@ class SimulationSession:
         else:
             path = self.output_dir / f"snapshot_{self._timestamp()}_step_{self.step}.png"
 
-        plot_final_scene(
-            world=self.artifacts.world,
-            vehicles=result.vehicles,
-            tasks=result.tasks,
-            save_path=path,
-            dpi=self.cfg.figure_dpi,
-            fig_size=self.cfg.figure_size,
-        )
+        if not self.online_enabled:
+            result = self.result()
+            plot_final_scene(
+                world=self.artifacts.world,
+                vehicles=result.vehicles,
+                tasks=result.tasks,
+                save_path=path,
+                dpi=self.cfg.figure_dpi,
+                fig_size=self.cfg.figure_size,
+            )
+            return path
+
+        fig, ax = plt.subplots(figsize=self.cfg.figure_size, dpi=self.cfg.figure_dpi)
+        self.draw_on_axis(ax)
+        fig.tight_layout()
+        fig.savefig(path)
+        plt.close(fig)
         return path
 
     def export_logs(self, prefix: str | None = None) -> tuple[Path, Path]:

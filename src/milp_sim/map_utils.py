@@ -51,5 +51,12 @@ class WorldMap:
         self.obstacles.append(polygon)
         self.invalidate_cache()
 
+    def remove_obstacle(self, idx: int) -> Polygon:
+        if idx < 0 or idx >= len(self.obstacles):
+            raise IndexError(f"obstacle index out of range: {idx}")
+        poly = self.obstacles.pop(idx)
+        self.invalidate_cache()
+        return poly
+
     def free_space_area(self) -> float:
         return self.boundary_polygon.difference(self.obstacle_union).area
