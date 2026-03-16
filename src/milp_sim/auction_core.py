@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .config import SimulationConfig
-from .cost_estimator import blended_goal_heading, fast_cost_estimate, heading_to_point
+from .cost_estimator import fast_cost_estimate, goal_heading_candidates, heading_to_point, wrap_to_pi
 from .dubins_path import build_dubins_hybrid_path
 from .entities import Task, Vehicle
 from .map_utils import WorldMap
@@ -476,21 +476,61 @@ class AllocationEngine:
                 if idx + 1 < len(v.task_sequence):
                     nxt_task = self.tasks_by_id[v.task_sequence[idx + 1]]
                     next_task_pos = nxt_task.position
-                goal_heading = blended_goal_heading(
+                headings = goal_heading_candidates(
                     current_pos=cur,
                     task_pos=task.position,
                     next_task_pos=next_task_pos,
                     turn_radius=turn_radius,
                     blend_turn_radius_factor=self.cfg.goal_heading_blend_turn_radius_factor,
+                    tolerance_rad=self.cfg.goal_heading_tolerance_rad,
+                    num_samples=self.cfg.goal_heading_num_samples,
                 )
-                path, length, _ = build_dubins_hybrid_path(
-                    world=self.world,
-                    cfg=self.cfg,
-                    start_pose=(cur[0], cur[1], cur_heading),
-                    goal_pose=(task.position[0], task.position[1], goal_heading),
-                    astar_planner=self.planner,
-                    turn_radius=turn_radius,
-                )
+                best_path: List[Tuple[float, float]] = []
+                best_len = float("inf")
+                best_score = float("inf")
+                best_goal_heading = heading_to_point(cur, task.position)
+                turn_penalty = max(0.0, float(getattr(self.cfg, "goal_heading_turn_penalty", 0.0)))
+                dpsi_limit = max(0.0, float(getattr(self.cfg, "goal_heading_max_dpsi_rad", 0.0)))
+                dpsi_slack = max(0.0, float(getattr(self.cfg, "goal_heading_max_dpsi_slack_rad", 0.0)))
+                dpsi_limit_eff = dpsi_limit + dpsi_slack
+                fallback_path: List[Tuple[float, float]] = []
+                fallback_len = float("inf")
+                fallback_score = float("inf")
+                fallback_heading = best_goal_heading
+                for goal_heading in headings:
+                    cand_path, cand_len, _ = build_dubins_hybrid_path(
+                        world=self.world,
+                        cfg=self.cfg,
+                        start_pose=(cur[0], cur[1], cur_heading),
+                        goal_pose=(task.position[0], task.position[1], goal_heading),
+                        astar_planner=self.planner,
+                        turn_radius=turn_radius,
+                    )
+                    ok = bool(cand_path) and cand_len != float("inf")
+                    if not ok:
+                        continue
+                    dpsi = abs(wrap_to_pi(goal_heading - cur_heading))
+                    score = cand_len + turn_penalty * turn_radius * dpsi
+                    if score < fallback_score:
+                        fallback_path = cand_path
+                        fallback_len = cand_len
+                        fallback_score = score
+                        fallback_heading = goal_heading
+                    if dpsi > dpsi_limit_eff + 1e-9:
+                        continue
+                    if score < best_score:
+                        best_path = cand_path
+                        best_len = cand_len
+                        best_score = score
+                        best_goal_heading = goal_heading
+
+                if not best_path and fallback_path:
+                    best_path = fallback_path
+                    best_len = fallback_len
+                    best_score = fallback_score
+                    best_goal_heading = fallback_heading
+
+                path, length = best_path, best_len
                 if not path or length == float("inf"):
                     raise RuntimeError(
                         f"Hybrid planning failed for vehicle={v.id}, task={tid}, from={cur} to={task.position}."
@@ -500,7 +540,7 @@ class AllocationEngine:
                     v.route_points.extend(path[1:])
                 v.route_length += length
                 cur = task.position
-                cur_heading = goal_heading
+                cur_heading = best_goal_heading
 
 
 def run_static_auction(

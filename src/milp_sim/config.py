@@ -29,8 +29,8 @@ class SimulationConfig:
 
     vehicle_speed_min: float = 7.0
     vehicle_speed_max: float = 12.0
-    vehicle_omega_min: float = 2.0
-    vehicle_omega_max: float = 4.1
+    vehicle_omega_min: float = 2.5
+    vehicle_omega_max: float = 4.8
     vehicle_capacity_min: int = 14
     vehicle_capacity_max: int = 20
 
@@ -58,6 +58,16 @@ class SimulationConfig:
     # Blend terminal heading between "face current task" and "face next task".
     # Smaller value reduces local looping near close targets.
     goal_heading_blend_turn_radius_factor: float = 4.0
+    # Soft terminal-heading window around blended heading (radians).
+    goal_heading_tolerance_rad: float = 0.9
+    # Number of heading samples in the soft window (>=1).
+    goal_heading_num_samples: int = 5
+    # Candidate score penalty on initial heading change (rad-weighted by turn radius).
+    goal_heading_turn_penalty: float = 0.35
+    # Hard limit on initial heading change when selecting goal-heading candidates.
+    goal_heading_max_dpsi_rad: float = 1.05
+    # Small slack above dpsi hard limit to avoid rejecting near-threshold good candidates.
+    goal_heading_max_dpsi_slack_rad: float = 0.12
 
     # Lightweight neighborhood coordination
     comm_radius: float = 38.0
@@ -73,6 +83,12 @@ class SimulationConfig:
     online_replan_period_s: float = 2.0
     preempt_gain_threshold: float = 0.10
     online_task_reach_tolerance: float = 0.25
+    online_future_task_horizon: int = 2
+    # Planner debug: dump heading-candidate scores into event logs.
+    plan_debug_enabled: bool = True
+    plan_debug_vehicle_id: int = 2
+    plan_debug_task_id: int = 7
+    plan_debug_top_k: int = 8
 
     figure_dpi: int = 130
     figure_size: tuple = (11, 10)

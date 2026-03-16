@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Tuple
+from typing import List, Tuple
 
 from shapely.geometry import LineString
 
@@ -47,6 +47,42 @@ def blended_goal_heading(
     blend_distance = max(1e-6, blend_turn_radius_factor * turn_radius)
     w = max(0.0, min(1.0, dist_to_task / blend_distance))
     return wrap_to_pi(direct_heading + w * wrap_to_pi(next_heading - direct_heading))
+
+
+def goal_heading_candidates(
+    current_pos: Tuple[float, float],
+    task_pos: Tuple[float, float],
+    next_task_pos: Tuple[float, float] | None,
+    turn_radius: float,
+    blend_turn_radius_factor: float,
+    tolerance_rad: float,
+    num_samples: int,
+) -> List[float]:
+    direct = heading_to_point(current_pos, task_pos)
+    blended = blended_goal_heading(
+        current_pos=current_pos,
+        task_pos=task_pos,
+        next_task_pos=next_task_pos,
+        turn_radius=turn_radius,
+        blend_turn_radius_factor=blend_turn_radius_factor,
+    )
+
+    out: List[float] = [wrap_to_pi(direct), wrap_to_pi(blended)]
+    tol = max(0.0, float(tolerance_rad))
+    n = max(1, int(num_samples))
+    if tol > 1e-9 and n > 1:
+        if n == 2:
+            alphas = [-1.0, 1.0]
+        else:
+            alphas = [(-1.0 + 2.0 * i / (n - 1)) for i in range(n)]
+        for a in alphas:
+            out.append(wrap_to_pi(blended + a * tol))
+
+    uniq: List[float] = []
+    for h in out:
+        if all(abs(wrap_to_pi(h - u)) > 1e-4 for u in uniq):
+            uniq.append(h)
+    return uniq
 
 
 def corridor_density(

@@ -16,7 +16,7 @@ from shapely.geometry import Point, Polygon
 
 from .auction_core import AllocationEngine, AllocationResult, EventLog
 from .config import DEFAULT_CONFIG, SimulationConfig
-from .cost_estimator import blended_goal_heading, heading_to_point
+from .cost_estimator import goal_heading_candidates, heading_to_point, wrap_to_pi
 from .dubins_path import build_dubins_hybrid_path
 from .dynamic_events import generate_new_task
 from .entities import Task, Vehicle
@@ -546,6 +546,32 @@ class SimulationSession:
             if v.active_task_id is not None and v.task_sequence and v.task_sequence[0] != v.active_task_id:
                 v.task_sequence = [v.active_task_id] + [x for x in v.task_sequence if x != v.active_task_id]
 
+            # Keep only short online horizon: active task + limited future locked tasks.
+            future_horizon = max(0, int(getattr(self.cfg, "online_future_task_horizon", 2)))
+            keep_limit = future_horizon + (1 if v.active_task_id is not None else 0)
+            if len(v.task_sequence) > keep_limit:
+                overflow = v.task_sequence[keep_limit:]
+                v.task_sequence = v.task_sequence[:keep_limit]
+                for tid in overflow:
+                    task = self.engine.tasks_by_id.get(tid)
+                    if task is None:
+                        continue
+                    if task.status in {"canceled", "completed"}:
+                        continue
+                    if task.assigned_vehicle == v.id:
+                        task.assigned_vehicle = None
+                    task.status = "withdrawn"
+                    base = self.engine.records.get(tid)
+                    next_version = (base.version + 1) if base is not None else 1
+                    self.engine.records[tid] = TaskRecord(
+                        task_id=tid,
+                        winner=None,
+                        bid=float("inf"),
+                        status="withdrawn",
+                        version=next_version,
+                    )
+                    v.remaining_capacity = min(v.capacity, v.remaining_capacity + task.demand)
+
             for tid in v.task_sequence:
                 task = self.engine.tasks_by_id[tid]
                 if tid == v.active_task_id:
@@ -593,21 +619,92 @@ class SimulationSession:
             nxt = self.engine.tasks_by_id.get(v.task_sequence[1])
             if nxt is not None:
                 next_task_pos = nxt.position
-        goal_heading = blended_goal_heading(
+        headings = goal_heading_candidates(
             current_pos=v.current_pos,
             task_pos=task.position,
             next_task_pos=next_task_pos,
             turn_radius=turn_radius,
             blend_turn_radius_factor=self.cfg.goal_heading_blend_turn_radius_factor,
+            tolerance_rad=self.cfg.goal_heading_tolerance_rad,
+            num_samples=self.cfg.goal_heading_num_samples,
         )
-        path, length, _ = build_dubins_hybrid_path(
-            world=self.artifacts.world,
-            cfg=self.cfg,
-            start_pose=(v.current_pos[0], v.current_pos[1], v.current_heading),
-            goal_pose=(task.position[0], task.position[1], goal_heading),
-            astar_planner=self.artifacts.planner,
-            turn_radius=turn_radius,
-        )
+        best_path: list[tuple[float, float]] = []
+        best_length = float("inf")
+        best_score = float("inf")
+        best_goal_heading = heading_to_point(v.current_pos, task.position)
+        cand_meta: list[tuple[float, float, bool, float, float]] = []
+        turn_penalty = max(0.0, float(getattr(self.cfg, "goal_heading_turn_penalty", 0.0)))
+        dpsi_limit = max(0.0, float(getattr(self.cfg, "goal_heading_max_dpsi_rad", 0.0)))
+        dpsi_slack = max(0.0, float(getattr(self.cfg, "goal_heading_max_dpsi_slack_rad", 0.0)))
+        dpsi_limit_eff = dpsi_limit + dpsi_slack
+        fallback_path: list[tuple[float, float]] = []
+        fallback_length = float("inf")
+        fallback_score = float("inf")
+        fallback_goal_heading = best_goal_heading
+        for goal_heading in headings:
+            cand_path, cand_length, _ = build_dubins_hybrid_path(
+                world=self.artifacts.world,
+                cfg=self.cfg,
+                start_pose=(v.current_pos[0], v.current_pos[1], v.current_heading),
+                goal_pose=(task.position[0], task.position[1], goal_heading),
+                astar_planner=self.artifacts.planner,
+                turn_radius=turn_radius,
+            )
+            ok = bool(cand_path) and cand_length != float("inf")
+            dpsi = abs(wrap_to_pi(goal_heading - v.current_heading))
+            score = float("inf")
+            if ok:
+                score = cand_length + turn_penalty * turn_radius * dpsi
+            cand_meta.append((goal_heading, cand_length, ok, score, dpsi))
+            if ok and score < fallback_score:
+                fallback_path = cand_path
+                fallback_length = cand_length
+                fallback_score = score
+                fallback_goal_heading = goal_heading
+            if ok and dpsi <= dpsi_limit_eff + 1e-9 and score < best_score:
+                best_path = cand_path
+                best_length = cand_length
+                best_score = score
+                best_goal_heading = goal_heading
+
+        if not best_path and fallback_path:
+            best_path = fallback_path
+            best_length = fallback_length
+            best_score = fallback_score
+            best_goal_heading = fallback_goal_heading
+
+        path, length = best_path, best_length
+
+        if bool(getattr(self.cfg, "plan_debug_enabled", False)):
+            target_vid = int(getattr(self.cfg, "plan_debug_vehicle_id", -1))
+            target_tid = int(getattr(self.cfg, "plan_debug_task_id", -1))
+            if (target_vid < 0 or target_vid == v.id) and (target_tid < 0 or target_tid == tid):
+                top_k = max(1, int(getattr(self.cfg, "plan_debug_top_k", 5)))
+                ranked = sorted(
+                    cand_meta,
+                    key=lambda x: (0 if x[2] else 1, x[3] if x[2] else float("inf")),
+                )[:top_k]
+                parts: list[str] = []
+                for h, l, ok, score, dpsi in ranked:
+                    dpsi_deg = math.degrees(dpsi)
+                    ls = f"{l:.3f}" if ok else "inf"
+                    ss = f"{score:.3f}" if ok else "inf"
+                    parts.append(f"h={math.degrees(h):.1f}deg dpsi={dpsi_deg:.1f} len={ls} score={ss} ok={ok}")
+                chosen_dpsi = math.degrees(abs(wrap_to_pi(best_goal_heading - v.current_heading)))
+                msg = (
+                    f"V{v.id} T{tid} choose_h={math.degrees(best_goal_heading):.1f}deg "
+                    f"choose_dpsi={chosen_dpsi:.1f} choose_len={length:.3f} choose_score={best_score:.3f} "
+                    f"dpsi_limit={math.degrees(dpsi_limit_eff):.1f}deg "
+                    f"cand[{len(cand_meta)}]: " + " | ".join(parts)
+                )
+                self.engine.event_logs.append(
+                    EventLog(
+                        step=self.step,
+                        event_type="plan_debug",
+                        task_id=tid,
+                        message=msg,
+                    )
+                )
 
         if not path or length == float("inf"):
             path = [v.current_pos, task.position]
