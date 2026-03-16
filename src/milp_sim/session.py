@@ -16,7 +16,7 @@ from shapely.geometry import Point, Polygon
 
 from .auction_core import AllocationEngine, AllocationResult, EventLog
 from .config import DEFAULT_CONFIG, SimulationConfig
-from .cost_estimator import heading_to_point
+from .cost_estimator import blended_goal_heading, heading_to_point
 from .dubins_path import build_dubins_hybrid_path
 from .dynamic_events import generate_new_task
 from .entities import Task, Vehicle
@@ -238,6 +238,7 @@ class SimulationSession:
             v.is_moving = False
             v.last_replan_time = self.sim_time
             v.route_points = [v.current_pos]
+            v.history_points = [v.current_pos]
             v.route_length = 0.0
 
         for t in self.engine.tasks:
@@ -586,13 +587,19 @@ class SimulationSession:
             v.is_moving = False
             return
 
-        goal_heading = heading_to_point(v.current_pos, task.position)
+        turn_radius = v.speed / max(v.max_omega, 1e-6)
+        next_task_pos: tuple[float, float] | None = None
         if len(v.task_sequence) >= 2 and v.task_sequence[0] == tid:
             nxt = self.engine.tasks_by_id.get(v.task_sequence[1])
             if nxt is not None:
-                goal_heading = heading_to_point(task.position, nxt.position)
-
-        turn_radius = v.speed / max(v.max_omega, 1e-6)
+                next_task_pos = nxt.position
+        goal_heading = blended_goal_heading(
+            current_pos=v.current_pos,
+            task_pos=task.position,
+            next_task_pos=next_task_pos,
+            turn_radius=turn_radius,
+            blend_turn_radius_factor=self.cfg.goal_heading_blend_turn_radius_factor,
+        )
         path, length, _ = build_dubins_hybrid_path(
             world=self.artifacts.world,
             cfg=self.cfg,
@@ -621,12 +628,34 @@ class SimulationSession:
         nxt = v.route_points[idx + 1]
         return math.hypot(nxt[0] - v.current_pos[0], nxt[1] - v.current_pos[1])
 
+    def _active_task_reached(self, v: Vehicle) -> bool:
+        self._assert_ready()
+        assert self.engine is not None
+
+        if v.active_task_id is None:
+            return False
+        task = self.engine.tasks_by_id.get(v.active_task_id)
+        if task is None:
+            return False
+        tol = max(1e-6, float(getattr(self.cfg, "online_task_reach_tolerance", 0.25)))
+        dist = math.hypot(task.position[0] - v.current_pos[0], task.position[1] - v.current_pos[1])
+        return dist <= tol
+
     def _advance_vehicles(self, dt: float) -> None:
         self._assert_ready()
         assert self.engine is not None
 
         for v in self.engine.vehicles:
             self._advance_vehicle(v, dt)
+
+    @staticmethod
+    def _append_history_point(v: Vehicle, p: tuple[float, float]) -> None:
+        if not v.history_points:
+            v.history_points = [p]
+            return
+        last = v.history_points[-1]
+        if math.hypot(p[0] - last[0], p[1] - last[1]) > 1e-6:
+            v.history_points.append(p)
 
     def _advance_vehicle(self, v: Vehicle, dt: float) -> None:
         remaining = max(0.0, v.speed * dt)
@@ -640,6 +669,9 @@ class SimulationSession:
             if not v.is_moving or len(v.route_points) < 2:
                 self._build_active_segment(v)
                 if not v.is_moving:
+                    if self._active_task_reached(v):
+                        self._complete_active_task(v)
+                        continue
                     break
 
             if v.path_cursor >= len(v.route_points) - 1:
@@ -660,10 +692,12 @@ class SimulationSession:
                 new_pos = (v.current_pos[0] + dx * ratio, v.current_pos[1] + dy * ratio)
                 v.current_heading = heading_to_point(v.current_pos, nxt)
                 v.current_pos = new_pos
+                self._append_history_point(v, v.current_pos)
                 remaining = 0.0
             else:
                 v.current_heading = heading_to_point(v.current_pos, nxt)
                 v.current_pos = nxt
+                self._append_history_point(v, v.current_pos)
                 remaining -= seg
                 v.path_cursor += 1
                 if v.path_cursor >= len(v.route_points) - 1:
@@ -704,6 +738,7 @@ class SimulationSession:
 
         task = self.engine.tasks_by_id.get(tid)
         if task is not None:
+            v.current_pos = task.position
             task.status = "completed"
             task.assigned_vehicle = v.id
 
@@ -1208,6 +1243,18 @@ class SimulationSession:
             colors = plt.get_cmap("tab10")
             for v in self.engine.vehicles:
                 c = colors(v.id % 10)
+                if len(v.history_points) >= 2:
+                    hx = [p[0] for p in v.history_points]
+                    hy = [p[1] for p in v.history_points]
+                    ax.plot(
+                        hx,
+                        hy,
+                        color=c,
+                        linewidth=1.4,
+                        linestyle="--",
+                        alpha=0.65,
+                        zorder=9,
+                    )
                 ax.scatter(
                     [v.current_pos[0]],
                     [v.current_pos[1]],
@@ -1302,6 +1349,8 @@ class SimulationSession:
 
         coord_path = self.output_dir / f"{prefix}_coordination_log.txt"
         verify_path = self.output_dir / f"{prefix}_verification_log.txt"
+        event_path = self.output_dir / f"{prefix}_event_log.txt"
+        runtime_path = self.output_dir / f"{prefix}_online_runtime_log.txt"
 
         with coord_path.open("w", encoding="utf-8") as f:
             f.write("task_id,event,rounds,converged,final_winner,final_status,trace\n")
@@ -1322,5 +1371,26 @@ class SimulationSession:
                     f"{item.c_hat:.6f},{item.c_tilde:.6f},{item.e_under:.6f},"
                     f"{item.passed},{item.forced_accept}\n"
                 )
+
+        with event_path.open("w", encoding="utf-8") as f:
+            f.write("step,event_type,task_id,message\n")
+            for item in self.engine.event_logs:
+                msg = str(item.message).replace("\n", "\\n")
+                f.write(f"{item.step},{item.event_type},{item.task_id},{msg}\n")
+
+        with runtime_path.open("w", encoding="utf-8") as f:
+            f.write(
+                "frame_idx,step,sim_time,vehicle_id,current_x,current_y,current_heading,"
+                "active_task_id,is_moving,distance_to_next,task_sequence\n"
+            )
+            for idx, frame in enumerate(self._frame_history):
+                for v in frame.engine.vehicles:
+                    seq = "|".join(str(tid) for tid in v.task_sequence)
+                    active = "" if v.active_task_id is None else str(v.active_task_id)
+                    f.write(
+                        f"{idx},{frame.step},{frame.sim_time:.3f},{v.id},"
+                        f"{v.current_pos[0]:.6f},{v.current_pos[1]:.6f},{v.current_heading:.6f},"
+                        f"{active},{v.is_moving},{v.distance_to_next_waypoint:.6f},{seq}\n"
+                    )
 
         return coord_path, verify_path

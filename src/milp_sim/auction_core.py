@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .config import SimulationConfig
-from .cost_estimator import fast_cost_estimate, heading_to_point
+from .cost_estimator import blended_goal_heading, fast_cost_estimate, heading_to_point
 from .dubins_path import build_dubins_hybrid_path
 from .entities import Task, Vehicle
 from .map_utils import WorldMap
@@ -471,12 +471,18 @@ class AllocationEngine:
 
             for idx, tid in enumerate(v.task_sequence):
                 task = self.tasks_by_id[tid]
+                turn_radius = v.speed / max(v.max_omega, 1e-6)
+                next_task_pos: Optional[Tuple[float, float]] = None
                 if idx + 1 < len(v.task_sequence):
                     nxt_task = self.tasks_by_id[v.task_sequence[idx + 1]]
-                    goal_heading = heading_to_point(task.position, nxt_task.position)
-                else:
-                    goal_heading = heading_to_point(cur, task.position)
-                turn_radius = v.speed / max(v.max_omega, 1e-6)
+                    next_task_pos = nxt_task.position
+                goal_heading = blended_goal_heading(
+                    current_pos=cur,
+                    task_pos=task.position,
+                    next_task_pos=next_task_pos,
+                    turn_radius=turn_radius,
+                    blend_turn_radius_factor=self.cfg.goal_heading_blend_turn_radius_factor,
+                )
                 path, length, _ = build_dubins_hybrid_path(
                     world=self.world,
                     cfg=self.cfg,

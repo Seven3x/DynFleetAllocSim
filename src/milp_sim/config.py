@@ -29,8 +29,8 @@ class SimulationConfig:
 
     vehicle_speed_min: float = 7.0
     vehicle_speed_max: float = 12.0
-    vehicle_omega_min: float = 1.4
-    vehicle_omega_max: float = 2.8
+    vehicle_omega_min: float = 2.0
+    vehicle_omega_max: float = 4.1
     vehicle_capacity_min: int = 14
     vehicle_capacity_max: int = 20
 
@@ -55,6 +55,9 @@ class SimulationConfig:
     dubins_fallback_to_astar: bool = True
     # Debug-only switch; when True, it may generate paths that clip obstacles.
     dubins_force_mode: bool = False
+    # Blend terminal heading between "face current task" and "face next task".
+    # Smaller value reduces local looping near close targets.
+    goal_heading_blend_turn_radius_factor: float = 4.0
 
     # Lightweight neighborhood coordination
     comm_radius: float = 38.0
@@ -69,6 +72,7 @@ class SimulationConfig:
     online_dt: float = 0.5
     online_replan_period_s: float = 2.0
     preempt_gain_threshold: float = 0.10
+    online_task_reach_tolerance: float = 0.25
 
     figure_dpi: int = 130
     figure_size: tuple = (11, 10)

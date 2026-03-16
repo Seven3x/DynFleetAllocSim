@@ -28,6 +28,27 @@ def heading_to_point(src: Tuple[float, float], dst: Tuple[float, float]) -> floa
     return math.atan2(dst[1] - src[1], dst[0] - src[0])
 
 
+def blended_goal_heading(
+    current_pos: Tuple[float, float],
+    task_pos: Tuple[float, float],
+    next_task_pos: Tuple[float, float] | None,
+    turn_radius: float,
+    blend_turn_radius_factor: float,
+) -> float:
+    direct_heading = heading_to_point(current_pos, task_pos)
+    if next_task_pos is None:
+        return direct_heading
+
+    next_heading = heading_to_point(task_pos, next_task_pos)
+    if turn_radius <= 1e-9 or blend_turn_radius_factor <= 1e-9:
+        return next_heading
+
+    dist_to_task = math.hypot(task_pos[0] - current_pos[0], task_pos[1] - current_pos[1])
+    blend_distance = max(1e-6, blend_turn_radius_factor * turn_radius)
+    w = max(0.0, min(1.0, dist_to_task / blend_distance))
+    return wrap_to_pi(direct_heading + w * wrap_to_pi(next_heading - direct_heading))
+
+
 def corridor_density(
     world: WorldMap,
     src: Tuple[float, float],
