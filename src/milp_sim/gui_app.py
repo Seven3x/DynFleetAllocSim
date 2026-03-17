@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import messagebox, ttk
@@ -44,6 +45,11 @@ class MilpGuiApp:
         self.replan_reason_var = tk.StringVar(value="-")
         self.sim_speed_var = tk.StringVar(value="1x")
         self.obstacle_remove_var = tk.StringVar(value="")
+        self._last_status_text = ""
+        self._last_logs_text = ""
+        self._last_tasks_text = ""
+        self._last_drag_refresh_ts = 0.0
+        self.drag_refresh_interval_s = 1.0 / 30.0
 
         self._build_layout()
         self._refresh_all()
@@ -433,9 +439,21 @@ class MilpGuiApp:
 
     def _refresh_text_panels(self) -> None:
         log_n = self._parse_optional_int(self.log_count_var.get()) or 8
-        self._set_text(self.status_text, self.session.format_status_text())
-        self._set_text(self.logs_text, self.session.format_logs_text(n=log_n))
-        self._set_text(self.tasks_text, self.session.format_tasks_text(limit=80))
+        status_text = self.session.format_status_text()
+        if status_text != self._last_status_text:
+            self._set_text(self.status_text, status_text)
+            self._last_status_text = status_text
+
+        logs_text = self.session.format_logs_text(n=log_n)
+        if logs_text != self._last_logs_text:
+            self._set_text(self.logs_text, logs_text)
+            self._last_logs_text = logs_text
+
+        tasks_text = self.session.format_tasks_text(limit=80)
+        if tasks_text != self._last_tasks_text:
+            self._set_text(self.tasks_text, tasks_text)
+            self._last_tasks_text = tasks_text
+
         snap = self.session.runtime_snapshot()
         self.online_state_var.set("RUN" if snap.online_running else ("IDLE" if self.session.online_enabled else "OFF"))
         self.sim_time_var.set(f"{snap.sim_time:.2f}s")
@@ -688,6 +706,7 @@ class MilpGuiApp:
         self.dragging_task_id = task_id
         self.drag_origin_pos = (task.position[0], task.position[1])
         self.drag_preview_pos = (x, y)
+        self._last_drag_refresh_ts = 0.0
         self.last_action_var.set(f"Dragging T{task_id}...")
         self._refresh_map()
 
@@ -699,6 +718,10 @@ class MilpGuiApp:
         if event.xdata is None or event.ydata is None:
             return
         self.drag_preview_pos = (float(event.xdata), float(event.ydata))
+        now = time.perf_counter()
+        if (now - self._last_drag_refresh_ts) < self.drag_refresh_interval_s:
+            return
+        self._last_drag_refresh_ts = now
         self._refresh_map()
 
     def _on_canvas_release(self, event) -> None:

@@ -116,10 +116,15 @@ class SimulationSession:
         self._frame_history: list[OnlineFrameState] = []
         self._frame_cursor: int = -1
         self.max_frame_history = 800
+        self._offline_result_cache: AllocationResult | None = None
 
         self._reset_core()
 
+    def _invalidate_offline_result_cache(self) -> None:
+        self._offline_result_cache = None
+
     def _reset_core(self) -> None:
+        self._invalidate_offline_result_cache()
         self.artifacts = build_static_scenario(self.cfg)
         self.engine = AllocationEngine(
             vehicles=self.artifacts.vehicles,
@@ -164,6 +169,7 @@ class SimulationSession:
     def start_online(self, dt: float | None = None, replan_period_s: float | None = None) -> RuntimeSnapshot:
         self._assert_ready()
         assert self.engine is not None
+        self._invalidate_offline_result_cache()
 
         if dt is not None:
             if float(dt) <= 0.0:
@@ -1211,11 +1217,13 @@ class SimulationSession:
         self.engine = engine
         self.step = step
         self.rng.bit_generator.state = rng_state
+        self._invalidate_offline_result_cache()
 
     def _rebuild_planner(self) -> None:
         self._assert_ready()
         assert self.artifacts is not None
         assert self.engine is not None
+        self._invalidate_offline_result_cache()
 
         planner = AStarPlanner(
             world=self.artifacts.world,
@@ -1289,11 +1297,12 @@ class SimulationSession:
         prev_obstacle_count = len(self.artifacts.world.obstacles)
         prev_planner = self.engine.planner
         self._push_undo_state()
+        checked_result: AllocationResult | None = None
 
         self.artifacts.world.add_obstacle(poly)
         self._rebuild_planner()
         try:
-            self.engine.finalize()
+            checked_result = self.engine.finalize()
         except Exception as exc:
             self.artifacts.world.obstacles = self.artifacts.world.obstacles[:prev_obstacle_count]
             self.artifacts.world.invalidate_cache()
@@ -1308,6 +1317,7 @@ class SimulationSession:
             {"points": [(float(x), float(y)) for x, y in points]},
             ctx,
         )
+        self._offline_result_cache = checked_result
         return poly
 
     def remove_obstacle(self, obstacle_idx: int) -> None:
@@ -1330,6 +1340,7 @@ class SimulationSession:
             return
 
         self._push_undo_state()
+        self._invalidate_offline_result_cache()
         self.artifacts.world.remove_obstacle(idx)
         self._rebuild_planner()
         self.engine.allocate_until_stable(phase=f"session:remove_obstacle@{self.step}")
@@ -1367,6 +1378,7 @@ class SimulationSession:
             return task
 
         self._push_undo_state()
+        self._invalidate_offline_result_cache()
         self.step += 1
         self.engine.add_dynamic_task(task=task, step=self.step)
         self.engine.allocate_until_stable(phase=f"session:add@{self.step}")
@@ -1420,6 +1432,7 @@ class SimulationSession:
             return moved
 
         self._push_undo_state()
+        self._invalidate_offline_result_cache()
         self.step += 1
 
         owner = task.assigned_vehicle
@@ -1498,6 +1511,7 @@ class SimulationSession:
             return task
 
         self._push_undo_state()
+        self._invalidate_offline_result_cache()
         self.step += 1
         self.engine.add_dynamic_task(task=task, step=self.step)
         self.engine.allocate_until_stable(phase=f"session:add_random@{self.step}")
@@ -1521,6 +1535,7 @@ class SimulationSession:
             return
 
         self._push_undo_state()
+        self._invalidate_offline_result_cache()
         self.step += 1
         self.engine.cancel_task(task_id=tid, step=self.step)
         self.engine.allocate_until_stable(phase=f"session:cancel@{self.step}")
@@ -1531,7 +1546,9 @@ class SimulationSession:
         assert self.engine is not None
 
         if not self.online_enabled:
-            return self.engine.finalize()
+            if self._offline_result_cache is None:
+                self._offline_result_cache = self.engine.finalize()
+            return self._offline_result_cache
 
         return AllocationResult(
             vehicles=self.engine.vehicles,
