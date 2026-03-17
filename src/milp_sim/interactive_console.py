@@ -15,10 +15,12 @@ def _print_help() -> None:
     print("  add_random [demand]               Add random valid task and re-auction")
     print("  cancel task_id                    Cancel task and re-auction")
     print("  reset                             Rebuild a fresh scenario from seed")
+    print("  reset_replay                      Reset and replay last recorded user actions")
     print("  undo                              Undo last mutating action")
     print("  plot [filename]                   Save current figure to outputs/")
     print("  export_logs [prefix]              Export coordination/verification logs")
     print("  logs [n]                          Show last n verification/coordination logs")
+    print("  ops [n]                           Show replayable user action history")
     print("  online_start [dt] [period]        Start online runtime")
     print("  online_pause                      Pause online runtime")
     print("  online_resume                     Resume online runtime")
@@ -66,6 +68,9 @@ class InteractiveConsole:
     def _logs(self, n: int) -> None:
         print(self.session.format_logs_text(n=n))
 
+    def _ops(self, n: int) -> None:
+        print(self.session.format_user_action_history_text(n=n))
+
     def handle_command(self, line: str) -> bool:
         tokens = shlex.split(line)
         if not tokens:
@@ -100,6 +105,9 @@ class InteractiveConsole:
             elif cmd == "reset":
                 self.session.reset()
                 print("scenario reset done")
+            elif cmd == "reset_replay":
+                self.session.reset(replay_last_actions=True)
+                print("scenario reset and replay done")
             elif cmd == "undo":
                 self.session.undo()
                 print("undo done")
@@ -110,6 +118,9 @@ class InteractiveConsole:
             elif cmd == "logs":
                 n = int(tokens[1]) if len(tokens) > 1 else 5
                 self._logs(n=n)
+            elif cmd == "ops":
+                n = int(tokens[1]) if len(tokens) > 1 else 8
+                self._ops(n=n)
             elif cmd == "online_start":
                 dt = float(tokens[1]) if len(tokens) > 1 else None
                 period = float(tokens[2]) if len(tokens) > 2 else None

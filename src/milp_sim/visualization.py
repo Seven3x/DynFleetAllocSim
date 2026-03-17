@@ -69,6 +69,12 @@ def draw_final_scene_on_axis(
     vehicle_font_size: int = 8,
     label_box: bool = False,
     curve_width: float = 2.0,
+    planned_curve_style: str = "-",
+    planned_curve_alpha: float = 0.95,
+    show_predicted_next_link: bool = True,
+    predicted_link_style: str = ":",
+    predicted_link_alpha: float = 0.9,
+    predicted_link_width: float = 1.8,
 ) -> None:
     ax.clear()
     draw_world(ax, world)
@@ -132,6 +138,8 @@ def draw_final_scene_on_axis(
             bbox=bbox,
         )
 
+    tasks_by_id = {t.id: t for t in tasks}
+
     for v in vehicles:
         color = colors[v.id]
         ax.scatter(v.start_pos[0], v.start_pos[1], s=90, color=color, edgecolor="black", zorder=4)
@@ -141,7 +149,29 @@ def draw_final_scene_on_axis(
         if len(pts) >= 2:
             xs = [p[0] for p in pts]
             ys = [p[1] for p in pts]
-            ax.plot(xs, ys, color=color, linewidth=curve_width, alpha=0.95)
+            # Planned (expected) trajectory is rendering-only and does not mutate runtime state.
+            ax.plot(
+                xs,
+                ys,
+                color=color,
+                linewidth=curve_width,
+                linestyle=planned_curve_style,
+                alpha=planned_curve_alpha,
+            )
+
+        if show_predicted_next_link and len(v.task_sequence) >= 2:
+            t_next = tasks_by_id.get(v.task_sequence[0])
+            t_next2 = tasks_by_id.get(v.task_sequence[1])
+            if t_next is not None and t_next2 is not None:
+                ax.plot(
+                    [t_next.position[0], t_next2.position[0]],
+                    [t_next.position[1], t_next2.position[1]],
+                    color=color,
+                    linewidth=predicted_link_width,
+                    linestyle=predicted_link_style,
+                    alpha=predicted_link_alpha,
+                    zorder=10,
+                )
 
         if show_vehicle_sequences and v.task_sequence:
             seq_text = "->".join(f"T{tid}" for tid in v.task_sequence)

@@ -1,14 +1,43 @@
+import math
 import unittest
+from unittest.mock import patch
+
+from shapely.geometry import Point
 
 from milp_sim.config import SimulationConfig
 from milp_sim.dynamic_events import generate_new_task
+from milp_sim.entities import Task
 from milp_sim.session import SimulationSession
 
 
 class TestOnlineRuntime(unittest.TestCase):
     def setUp(self) -> None:
-        cfg = SimulationConfig(seed=7, online_dt=0.5, online_replan_period_s=2.0)
+        cfg = SimulationConfig(
+            seed=7,
+            online_dt=0.5,
+            online_replan_period_s=2.0,
+            online_new_task_replan_batch_size=3,
+        )
         self.session = SimulationSession(cfg=cfg)
+
+    def _new_task(self):
+        assert self.session.artifacts is not None
+        return generate_new_task(
+            world=self.session.artifacts.world,
+            cfg=self.session.cfg,
+            rng=self.session.rng,
+            task_id=self.session._next_task_id(),
+        )
+
+    def _add_online_task(self):
+        task = self._new_task()
+        self.session.add_task(
+            x=task.position[0],
+            y=task.position[1],
+            demand=task.demand,
+            task_id=task.id,
+        )
+        return task
 
     def _find_square_points(self, side: float = 2.5) -> list[tuple[float, float]]:
         assert self.session.artifacts is not None
@@ -34,9 +63,27 @@ class TestOnlineRuntime(unittest.TestCase):
                     continue
         raise AssertionError("failed to find free square obstacle region for test")
 
+    def _iter_free_points(self, x_start: int = 20, y_start: int = 20, step: int = 4):
+        assert self.session.artifacts is not None
+        world = self.session.artifacts.world
+        cfg = self.session.cfg
+        clearance = cfg.vehicle_radius + cfg.safety_margin + 0.2
+        for xi in range(x_start, int(cfg.map_width) - 15, step):
+            for yi in range(y_start, int(cfg.map_height) - 20, step):
+                p = (float(xi), float(yi))
+                if not world.point_is_free(p, clearance=clearance):
+                    continue
+                if world.depot_polygon.contains(Point(p)):
+                    continue
+                yield p
+
     def test_soft_preempt_threshold_boundary(self) -> None:
         self.assertFalse(SimulationSession.soft_preempt_passes(10.0, 9.01, 0.10))
         self.assertTrue(SimulationSession.soft_preempt_passes(10.0, 9.0, 0.10))
+
+    def test_batch_replan_size_must_be_positive(self) -> None:
+        with self.assertRaises(ValueError):
+            SimulationConfig(online_new_task_replan_batch_size=0)
 
     def test_event_queue_sorted_by_time(self) -> None:
         self.session.start_online()
@@ -93,18 +140,188 @@ class TestOnlineRuntime(unittest.TestCase):
     def test_inflight_add_task_event_applies(self) -> None:
         self.session.start_online()
         assert self.session.engine is not None
-        assert self.session.artifacts is not None
 
         before = len(self.session.engine.tasks)
-        task = generate_new_task(
-            world=self.session.artifacts.world,
-            cfg=self.session.cfg,
-            rng=self.session.rng,
-            task_id=self.session._next_task_id(),
-        )
+        task = self._new_task()
         self.session.schedule_event(at_time=self.session.sim_time + 0.5, event_type="add_task", payload={"task": task})
         self.session.tick(n=2)
         self.assertGreater(len(self.session.engine.tasks), before)
+
+    def test_new_tasks_wait_for_batch_threshold_before_replan(self) -> None:
+        self.session.start_online()
+        assert self.session.engine is not None
+
+        before = len(self.session.engine.tasks)
+        self._add_online_task()
+        snap1 = self.session.runtime_snapshot()
+        self.assertEqual(len(self.session.engine.tasks), before + 1)
+        self.assertEqual(snap1.pending_new_task_replan_count, 1)
+        self.assertEqual(snap1.last_replan_reason, "startup")
+
+        self._add_online_task()
+        snap2 = self.session.runtime_snapshot()
+        self.assertEqual(len(self.session.engine.tasks), before + 2)
+        self.assertEqual(snap2.pending_new_task_replan_count, 2)
+        self.assertEqual(snap2.last_replan_reason, "startup")
+
+        self._add_online_task()
+        snap3 = self.session.runtime_snapshot()
+        self.assertEqual(len(self.session.engine.tasks), before + 3)
+        self.assertEqual(snap3.pending_new_task_replan_count, 0)
+        self.assertIn("new_task_batch", snap3.last_replan_reason)
+
+    def test_periodic_replan_flushes_partial_new_task_batch(self) -> None:
+        self.session.start_online()
+
+        self._add_online_task()
+        snap_before = self.session.runtime_snapshot()
+        self.assertEqual(snap_before.pending_new_task_replan_count, 1)
+        self.assertEqual(snap_before.last_replan_reason, "startup")
+
+        self.session.tick(n=5)
+        snap_after = self.session.runtime_snapshot()
+        self.assertEqual(snap_after.pending_new_task_replan_count, 0)
+        self.assertIn("periodic", snap_after.last_replan_reason)
+
+    def test_move_task_does_not_increment_new_task_batch_counter(self) -> None:
+        self.session.start_online()
+        assert self.session.engine is not None
+
+        self._add_online_task()
+        self.assertEqual(self.session.runtime_snapshot().pending_new_task_replan_count, 1)
+
+        moved = self._new_task()
+        original = self.session.engine.tasks[0]
+        self.session.move_task(task_id=original.id, x=moved.position[0], y=moved.position[1])
+        snap = self.session.runtime_snapshot()
+        self.assertEqual(snap.pending_new_task_replan_count, 0)
+        self.assertEqual(self.session.last_replan_reason, "event")
+
+    def test_non_batch_replan_event_clears_pending_new_task_counter(self) -> None:
+        self.session.start_online()
+        assert self.session.engine is not None
+
+        self._add_online_task()
+        self.assertEqual(self.session.runtime_snapshot().pending_new_task_replan_count, 1)
+
+        self.session.cancel_task(task_id=self.session.engine.tasks[0].id)
+        snap = self.session.runtime_snapshot()
+        self.assertEqual(snap.pending_new_task_replan_count, 0)
+        self.assertEqual(snap.last_replan_reason, "event")
+
+    def test_frame_history_restores_pending_new_task_counter(self) -> None:
+        self.session.start_online()
+
+        self._add_online_task()
+        self._add_online_task()
+        self.assertEqual(self.session.runtime_snapshot().pending_new_task_replan_count, 2)
+
+        prev_snap = self.session.frame_prev()
+        self.assertEqual(prev_snap.pending_new_task_replan_count, 1)
+
+        next_snap = self.session.frame_next()
+        self.assertEqual(next_snap.pending_new_task_replan_count, 2)
+
+    def test_initial_turn_buffer_softens_sharp_replan_turn(self) -> None:
+        self.session.start_online()
+        assert self.session.engine is not None
+
+        vehicle = self.session.engine.vehicles[0]
+        turn_radius = vehicle.speed / max(vehicle.max_omega, 1e-6)
+
+        def fake_tail_plan(*, start_pose, goal_pose, **kwargs):
+            pts = [(start_pose[0], start_pose[1]), (goal_pose[0], goal_pose[1])]
+            seg_len = math.hypot(goal_pose[0] - start_pose[0], goal_pose[1] - start_pose[1])
+            return pts, seg_len, None
+
+        found = False
+        with patch("milp_sim.session.build_dubins_hybrid_path", side_effect=fake_tail_plan):
+            for start in self._iter_free_points():
+                goal = (start[0], start[1] + 16.0)
+                try:
+                    self.session._validate_task_point(goal)
+                except Exception:
+                    continue
+
+                vehicle.current_pos = start
+                vehicle.current_heading = 0.0
+                task = Task(id=-1, position=goal, demand=1, status="unassigned")
+                raw_path = [start, goal]
+                raw_len = math.hypot(goal[0] - start[0], goal[1] - start[1])
+                raw_delta = self.session._path_initial_turn_delta(raw_path, vehicle.current_heading)
+                if raw_delta <= math.radians(75.0):
+                    continue
+
+                buffered_path, buffered_len = self.session._maybe_buffer_initial_turn_path(
+                    v=vehicle,
+                    task=task,
+                    path=raw_path,
+                    length=raw_len,
+                    goal_heading=math.pi / 2.0,
+                    turn_radius=turn_radius,
+                )
+                if len(buffered_path) <= 2:
+                    continue
+
+                buffered_delta = self.session._path_initial_turn_delta(buffered_path, vehicle.current_heading)
+                self.assertLess(buffered_delta, raw_delta)
+                self.assertLessEqual(buffered_delta, math.radians(30.0))
+                self.assertGreater(buffered_len, raw_len)
+                found = True
+                break
+
+        self.assertTrue(found, "failed to find a free-space case for initial-turn buffering")
+
+    def test_reset_replay_restores_online_task_and_obstacle_actions(self) -> None:
+        assert self.session.artifacts is not None
+        base_tasks = len(self.session.list_tasks())
+        base_obstacles = len(self.session.artifacts.world.obstacles)
+
+        self.session.start_online()
+        added = self._add_online_task()
+        self.session.tick(n=2)
+        obstacle_points = self._find_square_points(side=2.5)
+        self.session.add_obstacle_polygon(obstacle_points)
+
+        actions_before = self.session.replayable_user_actions()
+        self.assertEqual([a.action_type for a in actions_before], ["add_task", "add_obstacle"])
+        self.assertEqual([round(a.sim_time or 0.0, 6) for a in actions_before], [0.0, 1.0])
+
+        self.session.reset(replay_last_actions=True)
+        assert self.session.artifacts is not None
+
+        self.assertTrue(self.session.online_enabled)
+        self.assertFalse(self.session.online_running)
+        self.assertAlmostEqual(self.session.sim_time, 1.0, places=6)
+        self.assertEqual(len(self.session.list_tasks()), base_tasks + 1)
+        self.assertEqual(len(self.session.artifacts.world.obstacles), base_obstacles + 1)
+        replayed = self.session.engine.tasks_by_id.get(added.id)
+        self.assertIsNotNone(replayed)
+        assert replayed is not None
+        self.assertAlmostEqual(replayed.position[0], added.position[0], places=6)
+        self.assertAlmostEqual(replayed.position[1], added.position[1], places=6)
+
+        actions_after = self.session.replayable_user_actions()
+        self.assertEqual(
+            [(a.action_type, round(a.sim_time or 0.0, 6)) for a in actions_after],
+            [(a.action_type, round(a.sim_time or 0.0, 6)) for a in actions_before],
+        )
+
+    def test_reset_archives_actions_for_later_manual_replay(self) -> None:
+        self.session.start_online()
+        added = self._add_online_task()
+
+        self.session.reset()
+        self.assertFalse(self.session.online_enabled)
+        archived = self.session.replayable_user_actions()
+        self.assertEqual(len(archived), 1)
+        self.assertEqual(archived[0].action_type, "add_task")
+
+        self.session.replay_last_user_actions()
+        self.assertTrue(self.session.online_enabled)
+        self.assertFalse(self.session.online_running)
+        replayed = self.session.engine.tasks_by_id.get(added.id)
+        self.assertIsNotNone(replayed)
 
 
 if __name__ == "__main__":

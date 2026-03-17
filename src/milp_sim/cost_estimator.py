@@ -125,7 +125,7 @@ def fast_cost_estimate(
     )
 
     turn_radius = vehicle.speed / max(vehicle.max_omega, 1e-6)
-    est_length = d + cfg.lambda_psi * turn_radius * delta + cfg.lambda_rho * d * rho
+    est_length = d + cfg.lambda_psi * turn_radius * delta + cfg.lambda_rho * d * rho   #实际主要体现d
     est_time = est_length / vehicle.speed
 
     return CostDetail(

@@ -25,6 +25,7 @@ class MilpGuiApp:
         self.dragging_task_id: int | None = None
         self.drag_origin_pos: tuple[float, float] | None = None
         self.drag_preview_pos: tuple[float, float] | None = None
+        self._map_view_state: dict[str, tuple[float, float]] | None = None
 
         self.root = tk.Tk()
         self.root.title("MILP Dynamic Task Allocation GUI")
@@ -105,6 +106,7 @@ class MilpGuiApp:
         top.pack(fill="x", pady=(0, 8))
 
         ttk.Button(top, text="Initialize/Reset", command=self._on_reset).pack(fill="x", pady=3)
+        ttk.Button(top, text="Reset + Replay Last Ops", command=self._on_reset_replay).pack(fill="x", pady=3)
         ttk.Button(top, text="Undo Last Action", command=self._on_undo).pack(fill="x", pady=3)
         ttk.Button(top, text="Save Snapshot", command=self._on_save_snapshot).pack(fill="x", pady=3)
         ttk.Button(top, text="Export Logs", command=self._on_export_logs).pack(fill="x", pady=3)
@@ -251,11 +253,30 @@ class MilpGuiApp:
         plt.style.use("seaborn-v0_8-whitegrid")
         self.figure = plt.Figure(figsize=(8, 8), dpi=130)
         self.ax = self.figure.add_subplot(111)
+        self.figure.subplots_adjust(left=0.05, right=0.985, bottom=0.05, top=0.96)
         self.canvas = FigureCanvasTkAgg(self.figure, master=parent)
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
         self.canvas.mpl_connect("button_press_event", self._on_canvas_press)
         self.canvas.mpl_connect("motion_notify_event", self._on_canvas_motion)
         self.canvas.mpl_connect("button_release_event", self._on_canvas_release)
+
+    def _capture_map_view_state(self) -> dict[str, tuple[float, float]] | None:
+        if not self.ax.has_data():
+            return None
+        return {
+            "xlim": tuple(float(v) for v in self.ax.get_xlim()),
+            "ylim": tuple(float(v) for v in self.ax.get_ylim()),
+        }
+
+    def _restore_map_view_state(self, view_state: dict[str, tuple[float, float]] | None) -> None:
+        if not view_state:
+            return
+        xlim = view_state.get("xlim")
+        ylim = view_state.get("ylim")
+        if xlim is not None:
+            self.ax.set_xlim(*xlim)
+        if ylim is not None:
+            self.ax.set_ylim(*ylim)
 
     def _build_right_panels(self, parent) -> None:
         status_frame = ttk.LabelFrame(parent, text="Status", padding=6)
@@ -331,7 +352,9 @@ class MilpGuiApp:
         return int(v)
 
     def _refresh_map(self) -> None:
+        prev_view = self._capture_map_view_state()
         self.session.draw_on_axis(self.ax)
+        self._restore_map_view_state(prev_view or self._map_view_state)
         if self.dragging_task_id is not None and self.drag_preview_pos is not None:
             x, y = self.drag_preview_pos
             self.ax.scatter([x], [y], s=80, marker="x", color="#be123c", linewidth=2.0, zorder=15)
@@ -385,7 +408,7 @@ class MilpGuiApp:
                 bbox=dict(boxstyle="round,pad=0.2", facecolor="#dcfce7", alpha=0.85, edgecolor="none"),
                 zorder=20,
             )
-        self.figure.tight_layout()
+        self._map_view_state = self._capture_map_view_state()
         self.canvas.draw_idle()
 
     def _pick_task_id_near(self, x: float, y: float, ratio: float = 0.03) -> int | None:
@@ -449,6 +472,7 @@ class MilpGuiApp:
     def _on_reset(self) -> None:
         try:
             self.session.reset()
+            self._map_view_state = None
             self.obstacle_points = []
             self.obstacle_draw_mode = False
             self.task_click_mode = False
@@ -463,6 +487,25 @@ class MilpGuiApp:
             messagebox.showinfo("Reset", "Scenario initialized from seed.")
         except Exception as exc:
             messagebox.showerror("Reset Error", str(exc))
+
+    def _on_reset_replay(self) -> None:
+        try:
+            self.session.reset(replay_last_actions=True)
+            self._map_view_state = None
+            self.obstacle_points = []
+            self.obstacle_draw_mode = False
+            self.task_click_mode = False
+            self.dragging_task_id = None
+            self.drag_origin_pos = None
+            self.drag_preview_pos = None
+            self.obstacle_mode_var.set("OFF")
+            self.obstacle_point_count_var.set("0")
+            self.task_mode_var.set("OFF")
+            self.last_action_var.set("Scenario reset and replayed")
+            self._refresh_all()
+            messagebox.showinfo("Reset + Replay", "Scenario reset and replayed from last recorded actions.")
+        except Exception as exc:
+            messagebox.showerror("Reset Replay Error", str(exc))
 
     def _on_undo(self) -> None:
         try:

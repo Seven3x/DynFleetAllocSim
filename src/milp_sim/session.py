@@ -12,7 +12,7 @@ os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 import matplotlib.pyplot as plt
 import numpy as np
-from shapely.geometry import Point, Polygon
+from shapely.geometry import LineString, Point, Polygon
 
 from .auction_core import AllocationEngine, AllocationResult, EventLog
 from .config import DEFAULT_CONFIG, SimulationConfig
@@ -51,6 +51,7 @@ class RuntimeSnapshot:
     dt: float
     replan_period_s: float
     next_replan_time: float
+    pending_new_task_replan_count: int
     pending_events: list[OnlineEvent]
     last_replan_reason: str
     last_event_message: str
@@ -63,11 +64,25 @@ class OnlineFrameState:
     sim_time: float
     step: int
     next_periodic_replan: float
+    pending_new_task_replan_count: int
     pending_events: list[OnlineEvent]
     event_history: list[OnlineEvent]
     last_replan_reason: str
     last_event_message: str
     rng_state: dict[str, Any]
+
+
+@dataclass
+class UserActionRecord:
+    action_id: int
+    action_type: str
+    online: bool
+    frame_idx: int | None
+    sim_time: float | None
+    step: int
+    online_dt: float | None = None
+    replan_period_s: float | None = None
+    payload: dict[str, Any] = field(default_factory=dict)
 
 
 class SimulationSession:
@@ -79,6 +94,9 @@ class SimulationSession:
         self.artifacts: SimulationArtifacts | None = None
         self.engine: AllocationEngine | None = None
         self._undo_stack: list[tuple[SimulationArtifacts, AllocationEngine, int, dict]] = []
+        self._recorded_user_actions: list[UserActionRecord] = []
+        self._last_recorded_user_actions: list[UserActionRecord] = []
+        self._user_action_counter = 0
 
         self.rng = np.random.default_rng(cfg.seed + 2026)
         self.step = 10_000
@@ -89,6 +107,7 @@ class SimulationSession:
         self.online_dt = cfg.online_dt
         self.replan_period_s = cfg.online_replan_period_s
         self.next_periodic_replan = cfg.online_replan_period_s
+        self.pending_new_task_replan_count = 0
         self._event_id_counter = 0
         self.pending_events: list[OnlineEvent] = []
         self.event_history: list[OnlineEvent] = []
@@ -98,9 +117,9 @@ class SimulationSession:
         self._frame_cursor: int = -1
         self.max_frame_history = 800
 
-        self.reset()
+        self._reset_core()
 
-    def reset(self) -> None:
+    def _reset_core(self) -> None:
         self.artifacts = build_static_scenario(self.cfg)
         self.engine = AllocationEngine(
             vehicles=self.artifacts.vehicles,
@@ -120,12 +139,27 @@ class SimulationSession:
         self.online_dt = self.cfg.online_dt
         self.replan_period_s = self.cfg.online_replan_period_s
         self.next_periodic_replan = self.replan_period_s
+        self.pending_new_task_replan_count = 0
         self.pending_events.clear()
         self.event_history.clear()
         self.last_replan_reason = ""
         self.last_event_message = ""
         self._frame_history.clear()
         self._frame_cursor = -1
+        self._recorded_user_actions = []
+        self._user_action_counter = 0
+
+    def reset(self, replay_last_actions: bool = False) -> None:
+        source_actions = self.replayable_user_actions()
+        if self._recorded_user_actions:
+            self._last_recorded_user_actions = copy.deepcopy(self._recorded_user_actions)
+
+        self._reset_core()
+
+        if replay_last_actions:
+            if not source_actions:
+                raise ValueError("no recorded user actions to replay")
+            self._replay_user_actions(source_actions)
 
     def start_online(self, dt: float | None = None, replan_period_s: float | None = None) -> RuntimeSnapshot:
         self._assert_ready()
@@ -163,6 +197,7 @@ class SimulationSession:
             dt=self.online_dt,
             replan_period_s=self.replan_period_s,
             next_replan_time=self.next_periodic_replan,
+            pending_new_task_replan_count=self.pending_new_task_replan_count,
             pending_events=list(self.pending_events),
             last_replan_reason=self.last_replan_reason,
             last_event_message=self.last_event_message,
@@ -250,6 +285,7 @@ class SimulationSession:
 
         self.sim_time = 0.0
         self.next_periodic_replan = self.replan_period_s
+        self.pending_new_task_replan_count = 0
         self.last_replan_reason = "startup"
         self._replan_online_routes(reason="startup")
         self._frame_history.clear()
@@ -266,6 +302,7 @@ class SimulationSession:
             sim_time=float(self.sim_time),
             step=int(self.step),
             next_periodic_replan=float(self.next_periodic_replan),
+            pending_new_task_replan_count=int(self.pending_new_task_replan_count),
             pending_events=copy.deepcopy(self.pending_events),
             event_history=copy.deepcopy(self.event_history),
             last_replan_reason=str(self.last_replan_reason),
@@ -279,6 +316,7 @@ class SimulationSession:
         self.sim_time = float(frame.sim_time)
         self.step = int(frame.step)
         self.next_periodic_replan = float(frame.next_periodic_replan)
+        self.pending_new_task_replan_count = int(frame.pending_new_task_replan_count)
         self.pending_events = copy.deepcopy(frame.pending_events)
         self.event_history = copy.deepcopy(frame.event_history)
         self.last_replan_reason = str(frame.last_replan_reason)
@@ -322,19 +360,25 @@ class SimulationSession:
                 self.last_event_message = evt.result_message
             self.event_history.append(evt)
 
+        new_task_batch_trigger = (
+            self.pending_new_task_replan_count >= self.cfg.online_new_task_replan_batch_size
+        )
         periodic_trigger = self.sim_time + 1e-9 >= self.next_periodic_replan
 
-        if event_trigger or periodic_trigger:
+        if event_trigger or new_task_batch_trigger or periodic_trigger:
             did_preempt = self._try_soft_preempt()
             tags = []
             if event_trigger:
                 tags.append("event")
+            if new_task_batch_trigger:
+                tags.append("new_task_batch")
             if periodic_trigger:
                 tags.append("periodic")
             if did_preempt:
                 tags.append("preempt")
             reason = "+".join(tags) if tags else "periodic"
             self._replan_online_routes(reason=reason)
+            self.pending_new_task_replan_count = 0
 
             if periodic_trigger:
                 self.next_periodic_replan = self.sim_time + self.replan_period_s
@@ -354,7 +398,9 @@ class SimulationSession:
             if not isinstance(task, Task):
                 raise ValueError("add_task event requires payload['task']=Task")
             self.engine.add_dynamic_task(task=task, step=self.step)
-            return f"event add_task applied: T{task.id}", True, False
+            if bool(evt.payload.get("count_for_new_task_batch", True)):
+                self.pending_new_task_replan_count += 1
+            return f"event add_task applied: T{task.id}", False, False
 
         if evt.event_type == "cancel_task":
             tid = int(evt.payload.get("task_id"))
@@ -710,6 +756,15 @@ class SimulationSession:
             path = [v.current_pos, task.position]
             length = math.hypot(task.position[0] - v.current_pos[0], task.position[1] - v.current_pos[1])
 
+        path, length = self._maybe_buffer_initial_turn_path(
+            v=v,
+            task=task,
+            path=path,
+            length=length,
+            goal_heading=best_goal_heading,
+            turn_radius=turn_radius,
+        )
+
         path[0] = v.current_pos
         path[-1] = task.position
         v.route_points = path
@@ -717,6 +772,144 @@ class SimulationSession:
         v.path_cursor = 0
         v.distance_to_next_waypoint = self._distance_to_next_waypoint(v)
         v.is_moving = len(path) >= 2
+
+    @staticmethod
+    def _path_initial_turn_delta(path: list[tuple[float, float]], start_heading: float) -> float:
+        if len(path) < 2:
+            return 0.0
+        return abs(wrap_to_pi(heading_to_point(path[0], path[1]) - start_heading))
+
+    def _polyline_is_clear(self, points: list[tuple[float, float]], margin: float) -> bool:
+        self._assert_ready()
+        assert self.artifacts is not None
+
+        for p in points:
+            if not self.artifacts.world.point_in_bounds(p, margin=margin):
+                return False
+        if len(points) < 2:
+            return True
+        line = LineString(points)
+        if margin > 0.0:
+            swept = line.buffer(margin, cap_style=2, join_style=2)
+            return not swept.intersects(self.artifacts.world.obstacle_union)
+        return not line.intersects(self.artifacts.world.obstacle_union)
+
+    def _sample_turn_recovery_arc(
+        self,
+        start_pose: tuple[float, float, float],
+        turn_radius: float,
+        delta_heading: float,
+    ) -> tuple[list[tuple[float, float]], tuple[float, float, float]]:
+        x0, y0, yaw0 = start_pose
+        if turn_radius <= 1e-9 or abs(delta_heading) <= 1e-9:
+            return [(x0, y0)], (x0, y0, yaw0)
+
+        left_turn = delta_heading > 0.0
+        if left_turn:
+            cx = x0 - turn_radius * math.sin(yaw0)
+            cy = y0 + turn_radius * math.cos(yaw0)
+        else:
+            cx = x0 + turn_radius * math.sin(yaw0)
+            cy = y0 - turn_radius * math.cos(yaw0)
+
+        arc_len = turn_radius * abs(delta_heading)
+        step = max(0.1, float(getattr(self.cfg, "dubins_sample_step", 0.5)))
+        n = max(1, int(math.ceil(arc_len / step)))
+        points: list[tuple[float, float]] = [(x0, y0)]
+
+        for k in range(1, n + 1):
+            yaw = yaw0 + delta_heading * (k / n)
+            if left_turn:
+                px = cx + turn_radius * math.sin(yaw)
+                py = cy - turn_radius * math.cos(yaw)
+            else:
+                px = cx - turn_radius * math.sin(yaw)
+                py = cy + turn_radius * math.cos(yaw)
+            points.append((px, py))
+
+        end_pose = (points[-1][0], points[-1][1], wrap_to_pi(yaw0 + delta_heading))
+        return points, end_pose
+
+    def _maybe_buffer_initial_turn_path(
+        self,
+        v: Vehicle,
+        task: Task,
+        path: list[tuple[float, float]],
+        length: float,
+        goal_heading: float,
+        turn_radius: float,
+    ) -> tuple[list[tuple[float, float]], float]:
+        self._assert_ready()
+        assert self.artifacts is not None
+
+        if len(path) < 2 or not math.isfinite(length):
+            return path, length
+
+        max_initial_turn = math.radians(75.0)
+        current_delta = self._path_initial_turn_delta(path, v.current_heading)
+        if current_delta <= max_initial_turn + 1e-9:
+            return path, length
+
+        desired_heading = heading_to_point(v.current_pos, task.position)
+        desired_delta = wrap_to_pi(desired_heading - v.current_heading)
+        if abs(desired_delta) <= max_initial_turn + 1e-9:
+            return path, length
+
+        clearance = max(
+            float(getattr(self.cfg, "dubins_collision_margin", 0.0)),
+            float(getattr(self.cfg, "vehicle_radius", 0.0)) + float(getattr(self.cfg, "safety_margin", 0.0)),
+        )
+        needed_turn = max(0.0, abs(desired_delta) - max_initial_turn)
+        candidate_steps = [
+            min(abs(desired_delta), needed_turn),
+            min(abs(desired_delta), math.radians(60.0)),
+            min(abs(desired_delta), math.radians(45.0)),
+            min(abs(desired_delta), math.radians(30.0)),
+        ]
+
+        tried: set[int] = set()
+        for step in candidate_steps:
+            key = int(round(step * 1_000_000))
+            if step <= 1e-6 or key in tried:
+                continue
+            tried.add(key)
+
+            signed_step = math.copysign(step, desired_delta)
+            arc_points, arc_end_pose = self._sample_turn_recovery_arc(
+                start_pose=(v.current_pos[0], v.current_pos[1], v.current_heading),
+                turn_radius=turn_radius,
+                delta_heading=signed_step,
+            )
+            if not self.artifacts.world.point_is_free(arc_end_pose[:2], clearance=clearance):
+                continue
+            if Point(arc_end_pose[:2]).within(self.artifacts.world.depot_polygon):
+                continue
+            if not self._polyline_is_clear(arc_points, margin=clearance):
+                continue
+
+            tail_path, tail_length, _ = build_dubins_hybrid_path(
+                world=self.artifacts.world,
+                cfg=self.cfg,
+                start_pose=arc_end_pose,
+                goal_pose=(task.position[0], task.position[1], goal_heading),
+                astar_planner=self.artifacts.planner,
+                turn_radius=turn_radius,
+            )
+            if not tail_path or not math.isfinite(tail_length):
+                continue
+
+            full_path = arc_points + tail_path[1:]
+            if not self._polyline_is_clear(full_path, margin=clearance):
+                continue
+
+            join_delta = self._path_initial_turn_delta(full_path[len(arc_points) - 1 :], arc_end_pose[2])
+            if join_delta > max_initial_turn + 1e-9:
+                continue
+
+            full_length = turn_radius * abs(signed_step) + tail_length
+            return full_path, full_length
+
+        return path, length
 
     def _distance_to_next_waypoint(self, v: Vehicle) -> float:
         if len(v.route_points) < 2:
@@ -865,6 +1058,108 @@ class SimulationSession:
         if self.engine is None or self.artifacts is None:
             raise RuntimeError("Session is not initialized.")
 
+    def _current_frame_index(self) -> int | None:
+        if not self.online_enabled or not self._frame_history:
+            return None
+        if 0 <= self._frame_cursor < len(self._frame_history):
+            return self._frame_cursor
+        return len(self._frame_history) - 1
+
+    def _capture_user_action_context(self) -> dict[str, Any]:
+        return {
+            "online": bool(self.online_enabled),
+            "frame_idx": self._current_frame_index(),
+            "sim_time": float(self.sim_time) if self.online_enabled else None,
+            "step": int(self.step),
+            "online_dt": float(self.online_dt) if self.online_enabled else None,
+            "replan_period_s": float(self.replan_period_s) if self.online_enabled else None,
+        }
+
+    def _record_user_action(self, action_type: str, payload: dict[str, Any], context: dict[str, Any]) -> None:
+        self._user_action_counter += 1
+        self._recorded_user_actions.append(
+            UserActionRecord(
+                action_id=self._user_action_counter,
+                action_type=str(action_type),
+                online=bool(context["online"]),
+                frame_idx=None if context["frame_idx"] is None else int(context["frame_idx"]),
+                sim_time=None if context["sim_time"] is None else float(context["sim_time"]),
+                step=int(context["step"]),
+                online_dt=None if context["online_dt"] is None else float(context["online_dt"]),
+                replan_period_s=None
+                if context["replan_period_s"] is None
+                else float(context["replan_period_s"]),
+                payload=copy.deepcopy(payload),
+            )
+        )
+
+    def replayable_user_actions(self) -> list[UserActionRecord]:
+        source = self._recorded_user_actions if self._recorded_user_actions else self._last_recorded_user_actions
+        return copy.deepcopy(source)
+
+    def has_replayable_user_actions(self) -> bool:
+        return bool(self._recorded_user_actions or self._last_recorded_user_actions)
+
+    def _apply_user_action_record(self, action: UserActionRecord) -> None:
+        payload = action.payload
+        if action.action_type in {"add_task", "add_random_task"}:
+            self.add_task(
+                x=float(payload["x"]),
+                y=float(payload["y"]),
+                demand=int(payload["demand"]),
+                task_id=int(payload["task_id"]),
+            )
+            return
+        if action.action_type == "cancel_task":
+            self.cancel_task(task_id=int(payload["task_id"]))
+            return
+        if action.action_type == "move_task":
+            self.move_task(
+                task_id=int(payload["task_id"]),
+                x=float(payload["x"]),
+                y=float(payload["y"]),
+            )
+            return
+        if action.action_type == "add_obstacle":
+            points = [(float(x), float(y)) for x, y in payload["points"]]
+            self.add_obstacle_polygon(points=points)
+            return
+        if action.action_type == "remove_obstacle":
+            self.remove_obstacle(obstacle_idx=int(payload["obstacle_idx"]))
+            return
+        raise ValueError(f"unsupported user action type: {action.action_type}")
+
+    def _replay_user_actions(self, actions: list[UserActionRecord]) -> None:
+        any_online = any(action.online for action in actions)
+        for action in actions:
+            if action.online:
+                self.start_online(
+                    dt=action.online_dt if action.online_dt is not None else self.online_dt,
+                    replan_period_s=(
+                        action.replan_period_s if action.replan_period_s is not None else self.replan_period_s
+                    ),
+                )
+                target_time = 0.0 if action.sim_time is None else float(action.sim_time)
+                while self.sim_time + 1e-9 < target_time:
+                    self.tick(n=1)
+                if self.sim_time > target_time + 1e-9:
+                    raise ValueError(
+                        f"cannot replay action #{action.action_id} at past sim_time={target_time:.2f}s"
+                    )
+            elif self.online_enabled:
+                raise ValueError("cannot replay offline action after online runtime has started")
+
+            self._apply_user_action_record(action)
+
+        if any_online:
+            self.pause_online()
+
+    def replay_last_user_actions(self) -> None:
+        actions = self.replayable_user_actions()
+        if not actions:
+            raise ValueError("no recorded user actions to replay")
+        self.reset(replay_last_actions=True)
+
     def _next_task_id(self) -> int:
         self._assert_ready()
         assert self.engine is not None
@@ -971,6 +1266,7 @@ class SimulationSession:
 
     def add_obstacle_polygon(self, points: list[tuple[float, float]]) -> Polygon:
         self._assert_ready()
+        ctx = self._capture_user_action_context()
 
         poly = self._validate_obstacle_polygon(points)
         if self.online_enabled:
@@ -980,6 +1276,11 @@ class SimulationSession:
                 payload={"points": [(float(x), float(y)) for x, y in points]},
             )
             self.tick(0)
+            self._record_user_action(
+                "add_obstacle",
+                {"points": [(float(x), float(y)) for x, y in points]},
+                ctx,
+            )
             return poly
 
         assert self.artifacts is not None
@@ -1002,11 +1303,17 @@ class SimulationSession:
                 self._undo_stack.pop()
             raise ValueError(f"obstacle makes current routes infeasible: {exc}") from exc
 
+        self._record_user_action(
+            "add_obstacle",
+            {"points": [(float(x), float(y)) for x, y in points]},
+            ctx,
+        )
         return poly
 
     def remove_obstacle(self, obstacle_idx: int) -> None:
         self._assert_ready()
         assert self.artifacts is not None
+        ctx = self._capture_user_action_context()
 
         idx = int(obstacle_idx)
         if idx < 0 or idx >= len(self.artifacts.world.obstacles):
@@ -1019,12 +1326,14 @@ class SimulationSession:
                 payload={"obstacle_idx": idx},
             )
             self.tick(0)
+            self._record_user_action("remove_obstacle", {"obstacle_idx": idx}, ctx)
             return
 
         self._push_undo_state()
         self.artifacts.world.remove_obstacle(idx)
         self._rebuild_planner()
         self.engine.allocate_until_stable(phase=f"session:remove_obstacle@{self.step}")
+        self._record_user_action("remove_obstacle", {"obstacle_idx": idx}, ctx)
 
     def list_obstacles(self) -> list[tuple[int, float]]:
         self._assert_ready()
@@ -1037,6 +1346,7 @@ class SimulationSession:
     def add_task(self, x: float, y: float, demand: int, task_id: int | None = None) -> Task:
         self._assert_ready()
         assert self.engine is not None
+        ctx = self._capture_user_action_context()
 
         p = (x, y)
         self._validate_task_point(p)
@@ -1049,17 +1359,28 @@ class SimulationSession:
         if self.online_enabled:
             self.schedule_event(at_time=self.sim_time, event_type="add_task", payload={"task": task})
             self.tick(0)
+            self._record_user_action(
+                "add_task",
+                {"x": float(task.position[0]), "y": float(task.position[1]), "demand": int(task.demand), "task_id": int(task.id)},
+                ctx,
+            )
             return task
 
         self._push_undo_state()
         self.step += 1
         self.engine.add_dynamic_task(task=task, step=self.step)
         self.engine.allocate_until_stable(phase=f"session:add@{self.step}")
+        self._record_user_action(
+            "add_task",
+            {"x": float(task.position[0]), "y": float(task.position[1]), "demand": int(task.demand), "task_id": int(task.id)},
+            ctx,
+        )
         return task
 
     def move_task(self, task_id: int, x: float, y: float) -> Task:
         self._assert_ready()
         assert self.engine is not None
+        ctx = self._capture_user_action_context()
 
         tid = int(task_id)
         task = self.engine.tasks_by_id.get(tid)
@@ -1079,8 +1400,23 @@ class SimulationSession:
             # Treat as cancel+add with same id to keep event model compact.
             self.schedule_event(at_time=self.sim_time, event_type="cancel_task", payload={"task_id": tid})
             moved = Task(id=tid, position=p, demand=task.demand, status="unassigned")
-            self.schedule_event(at_time=self.sim_time, event_type="add_task", payload={"task": moved})
+            self.schedule_event(
+                at_time=self.sim_time,
+                event_type="add_task",
+                payload={"task": moved, "count_for_new_task_batch": False},
+            )
             self.tick(0)
+            self._record_user_action(
+                "move_task",
+                {
+                    "task_id": int(tid),
+                    "x": float(moved.position[0]),
+                    "y": float(moved.position[1]),
+                    "from_x": float(old_pos[0]),
+                    "from_y": float(old_pos[1]),
+                },
+                ctx,
+            )
             return moved
 
         self._push_undo_state()
@@ -1121,12 +1457,24 @@ class SimulationSession:
             )
         )
         self.engine.allocate_until_stable(phase=f"session:move@{self.step}")
+        self._record_user_action(
+            "move_task",
+            {
+                "task_id": int(tid),
+                "x": float(task.position[0]),
+                "y": float(task.position[1]),
+                "from_x": float(old_pos[0]),
+                "from_y": float(old_pos[1]),
+            },
+            ctx,
+        )
         return task
 
     def add_random_task(self, demand: int | None = None) -> Task:
         self._assert_ready()
         assert self.engine is not None
         assert self.artifacts is not None
+        ctx = self._capture_user_action_context()
 
         task = generate_new_task(
             world=self.artifacts.world,
@@ -1142,28 +1490,41 @@ class SimulationSession:
         if self.online_enabled:
             self.schedule_event(at_time=self.sim_time, event_type="add_task", payload={"task": task})
             self.tick(0)
+            self._record_user_action(
+                "add_random_task",
+                {"x": float(task.position[0]), "y": float(task.position[1]), "demand": int(task.demand), "task_id": int(task.id)},
+                ctx,
+            )
             return task
 
         self._push_undo_state()
         self.step += 1
         self.engine.add_dynamic_task(task=task, step=self.step)
         self.engine.allocate_until_stable(phase=f"session:add_random@{self.step}")
+        self._record_user_action(
+            "add_random_task",
+            {"x": float(task.position[0]), "y": float(task.position[1]), "demand": int(task.demand), "task_id": int(task.id)},
+            ctx,
+        )
         return task
 
     def cancel_task(self, task_id: int) -> None:
         self._assert_ready()
         assert self.engine is not None
+        ctx = self._capture_user_action_context()
 
         tid = int(task_id)
         if self.online_enabled:
             self.schedule_event(at_time=self.sim_time, event_type="cancel_task", payload={"task_id": tid})
             self.tick(0)
+            self._record_user_action("cancel_task", {"task_id": tid}, ctx)
             return
 
         self._push_undo_state()
         self.step += 1
         self.engine.cancel_task(task_id=tid, step=self.step)
         self.engine.allocate_until_stable(phase=f"session:cancel@{self.step}")
+        self._record_user_action("cancel_task", {"task_id": tid}, ctx)
 
     def result(self) -> AllocationResult:
         self._assert_ready()
@@ -1224,6 +1585,49 @@ class SimulationSession:
         n = max(0, int(n))
         return self.engine.verification_logs[-n:], self.engine.coordination_logs[-n:]
 
+    @staticmethod
+    def _format_user_action_summary(action: UserActionRecord) -> str:
+        payload = action.payload
+        if action.action_type in {"add_task", "add_random_task"}:
+            return (
+                f"{action.action_type} T{payload['task_id']} "
+                f"pos=({payload['x']:.2f},{payload['y']:.2f}) demand={payload['demand']}"
+            )
+        if action.action_type == "cancel_task":
+            return f"cancel_task T{payload['task_id']}"
+        if action.action_type == "move_task":
+            return (
+                f"move_task T{payload['task_id']} "
+                f"({payload['from_x']:.2f},{payload['from_y']:.2f})->({payload['x']:.2f},{payload['y']:.2f})"
+            )
+        if action.action_type == "add_obstacle":
+            return f"add_obstacle vertices={len(payload['points'])}"
+        if action.action_type == "remove_obstacle":
+            return f"remove_obstacle idx={payload['obstacle_idx']}"
+        return action.action_type
+
+    def format_user_action_history_text(self, n: int = 12) -> str:
+        actions = self.replayable_user_actions()
+        if not actions:
+            return "Replayable user actions:\n  (none)"
+
+        limit = max(0, int(n))
+        shown = actions if limit == 0 else actions[-limit:]
+        label = "current session" if self._recorded_user_actions else "last archived session"
+        lines = [f"Replayable user actions ({label}):"]
+        for action in shown:
+            if action.online:
+                when = (
+                    f"frame={action.frame_idx if action.frame_idx is not None else '-'} "
+                    f"t={0.0 if action.sim_time is None else action.sim_time:.2f}s"
+                )
+            else:
+                when = f"offline step={action.step}"
+            lines.append(f"  #{action.action_id} {when} {self._format_user_action_summary(action)}")
+        if limit > 0 and len(actions) > limit:
+            lines.append(f"  ... ({len(actions) - limit} earlier actions)")
+        return "\n".join(lines)
+
     def format_status_text(self) -> str:
         self._assert_ready()
         assert self.engine is not None
@@ -1258,6 +1662,7 @@ class SimulationSession:
             ),
             (
                 f"status={self.status_counts()} pending_events={len(snap.pending_events)} "
+                f"pending_new_task_batch={snap.pending_new_task_replan_count} "
                 f"last_replan={snap.last_replan_reason or '-'}"
             ),
             f"last_event={snap.last_event_message or '-'}",
@@ -1299,6 +1704,8 @@ class SimulationSession:
                 lines.append(
                     f"  id={evt.event_id} t={evt.time_s:.2f} {evt.event_type} applied={evt.applied} {evt.result_message}"
                 )
+        if self.has_replayable_user_actions():
+            lines.append(self.format_user_action_history_text(n=n))
         return "\n".join(lines)
 
     def format_tasks_text(self, status_filter: Optional[str] = None, limit: int = 60) -> str:
@@ -1334,6 +1741,9 @@ class SimulationSession:
             vehicle_font_size=9,
             label_box=True,
             curve_width=1.6,
+            planned_curve_style="-",
+            planned_curve_alpha=0.95,
+            show_predicted_next_link=True,
         )
 
         if self.online_enabled:
