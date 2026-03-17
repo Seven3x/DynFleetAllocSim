@@ -435,6 +435,8 @@ class SimulationSession:
         raise ValueError(f"unsupported event_type: {evt.event_type}")
 
     def _try_soft_preempt(self) -> bool:
+        if not bool(getattr(self.cfg, "online_allow_active_task_preempt", False)):
+            return False
         keep = self._estimate_remaining_system_time(preempt=False)
         switch = self._estimate_remaining_system_time(preempt=True)
         if not self.soft_preempt_passes(keep, switch, self.cfg.preempt_gain_threshold):
@@ -629,8 +631,9 @@ class SimulationSession:
                 if tid == v.active_task_id:
                     task.status = "in_progress"
                     task.assigned_vehicle = v.id
-                elif task.status == "in_progress":
-                    task.status = "locked"
+                else:
+                    if task.status == "in_progress":
+                        task.status = "locked"
 
             if v.active_task_id is None:
                 v.path_cursor = 0

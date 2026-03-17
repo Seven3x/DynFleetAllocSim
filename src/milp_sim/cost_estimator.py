@@ -110,12 +110,32 @@ def fast_cost_estimate(
     world: WorldMap,
     cfg: SimulationConfig,
 ) -> CostDetail:
-    src = vehicle.current_pos
+    return fast_cost_estimate_from_state(
+        speed=vehicle.speed,
+        max_omega=vehicle.max_omega,
+        current_pos=vehicle.current_pos,
+        current_heading=vehicle.current_heading,
+        task=task,
+        world=world,
+        cfg=cfg,
+    )
+
+
+def fast_cost_estimate_from_state(
+    speed: float,
+    max_omega: float,
+    current_pos: Tuple[float, float],
+    current_heading: float,
+    task: Task,
+    world: WorldMap,
+    cfg: SimulationConfig,
+) -> CostDetail:
+    src = current_pos
     dst = task.position
 
     d = math.hypot(dst[0] - src[0], dst[1] - src[1])
     tgt_heading = heading_to_point(src, dst)
-    delta = abs(wrap_to_pi(tgt_heading - vehicle.current_heading))
+    delta = abs(wrap_to_pi(tgt_heading - current_heading))
 
     rho = corridor_density(
         world=world,
@@ -124,9 +144,9 @@ def fast_cost_estimate(
         corridor_width=cfg.corridor_width,
     )
 
-    turn_radius = vehicle.speed / max(vehicle.max_omega, 1e-6)
-    est_length = d + cfg.lambda_psi * turn_radius * delta + cfg.lambda_rho * d * rho   #实际主要体现d
-    est_time = est_length / vehicle.speed
+    turn_radius = speed / max(max_omega, 1e-6)
+    est_length = d + cfg.lambda_psi * turn_radius * delta + cfg.lambda_rho * d * rho
+    est_time = est_length / max(speed, 1e-9)
 
     return CostDetail(
         distance=d,

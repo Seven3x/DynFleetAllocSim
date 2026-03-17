@@ -4,7 +4,12 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .config import SimulationConfig
-from .cost_estimator import fast_cost_estimate, goal_heading_candidates, heading_to_point, wrap_to_pi
+from .cost_estimator import (
+    fast_cost_estimate_from_state,
+    goal_heading_candidates,
+    heading_to_point,
+    wrap_to_pi,
+)
 from .dubins_path import build_dubins_hybrid_path
 from .entities import Task, Vehicle
 from .map_utils import WorldMap
@@ -213,10 +218,87 @@ class AllocationEngine:
                 return True
         return False
 
+    def _committed_prefix_task_ids(self, vehicle: Vehicle, exclude_task_id: int | None = None) -> List[int]:
+        if vehicle.active_task_id is None:
+            return []
+
+        out: List[int] = []
+        seen: set[int] = set()
+
+        active_tid = vehicle.active_task_id
+        if active_tid is not None and active_tid != exclude_task_id:
+            task = self.tasks_by_id.get(active_tid)
+            if task is not None and task.status in {"locked", "in_progress"}:
+                out.append(active_tid)
+                seen.add(active_tid)
+
+        for tid in vehicle.task_sequence:
+            if tid in seen or tid == exclude_task_id:
+                continue
+            task = self.tasks_by_id.get(tid)
+            if task is None:
+                continue
+            if task.status not in {"locked", "in_progress"}:
+                continue
+            out.append(tid)
+            seen.add(tid)
+
+        return out
+
+    def _estimate_committed_prefix_time_and_frontier(
+        self,
+        vehicle: Vehicle,
+        exclude_task_id: int | None = None,
+    ) -> Tuple[float, Tuple[float, float], float]:
+        total_time = 0.0
+        frontier_pos = vehicle.current_pos
+        frontier_heading = vehicle.current_heading
+
+        for tid in self._committed_prefix_task_ids(vehicle=vehicle, exclude_task_id=exclude_task_id):
+            task = self.tasks_by_id.get(tid)
+            if task is None:
+                continue
+            detail = fast_cost_estimate_from_state(
+                speed=vehicle.speed,
+                max_omega=vehicle.max_omega,
+                current_pos=frontier_pos,
+                current_heading=frontier_heading,
+                task=task,
+                world=self.world,
+                cfg=self.cfg,
+            )
+            if detail.estimated_time == float("inf"):
+                return float("inf"), frontier_pos, frontier_heading
+            total_time += detail.estimated_time
+            frontier_heading = heading_to_point(frontier_pos, task.position)
+            frontier_pos = task.position
+
+        return total_time, frontier_pos, frontier_heading
+
     def _estimate_task_cost(self, vehicle: Vehicle, task: Task) -> float:
-        detail = fast_cost_estimate(vehicle=vehicle, task=task, world=self.world, cfg=self.cfg)
+        prefix_time, frontier_pos, frontier_heading = self._estimate_committed_prefix_time_and_frontier(
+            vehicle=vehicle,
+            exclude_task_id=task.id,
+        )
+        if prefix_time == float("inf"):
+            return float("inf")
+
         cached = self.corrected_bid_cache.get((vehicle.id, task.id))
-        return detail.estimated_time if cached is None else cached
+        if cached is not None and prefix_time <= 1e-9:
+            return cached
+
+        suffix = fast_cost_estimate_from_state(
+            speed=vehicle.speed,
+            max_omega=vehicle.max_omega,
+            current_pos=frontier_pos,
+            current_heading=frontier_heading,
+            task=task,
+            world=self.world,
+            cfg=self.cfg,
+        )
+        if suffix.estimated_time == float("inf"):
+            return float("inf")
+        return prefix_time + suffix.estimated_time
 
     def _collect_bids(self) -> List[Bid]:
         candidate_tasks = [t for t in self.tasks if t.status in AUCTIONABLE_STATES]
@@ -338,6 +420,7 @@ class AllocationEngine:
                     c_hat=c_hat,
                     cfg=self.cfg,
                     planner=self.planner,
+                    tasks_by_id=self.tasks_by_id,
                 )
 
             self.verification_logs.append(

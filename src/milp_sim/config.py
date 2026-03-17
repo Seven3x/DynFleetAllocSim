@@ -27,10 +27,10 @@ class SimulationConfig:
     vehicle_radius: float = 1.0
     safety_margin: float = 0.8
 
-    vehicle_speed_min: float = 3.0
-    vehicle_speed_max: float = 5.0
-    vehicle_omega_min: float = 4.5
-    vehicle_omega_max: float = 7.5
+    vehicle_speed_min: float = 3.5
+    vehicle_speed_max: float = 6.0
+    vehicle_omega_min: float = 3.5
+    vehicle_omega_max: float = 6.5
     vehicle_capacity_min: int = 14
     vehicle_capacity_max: int = 20
 
@@ -83,6 +83,8 @@ class SimulationConfig:
     online_replan_period_s: float = 2.5
     online_new_task_replan_batch_size: int = 3
     preempt_gain_threshold: float = 0.20
+    # When False, in-progress tasks are never released by soft preempt.
+    online_allow_active_task_preempt: bool = False
     online_task_reach_tolerance: float = 0.25
     online_future_task_horizon: int = 2
     # Planner debug: dump heading-candidate scores into event logs.
