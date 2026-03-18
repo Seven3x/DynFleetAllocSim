@@ -275,6 +275,7 @@ class SimulationSession:
             v.current_pos = v.start_pos
             v.current_heading = v.heading
             v.active_task_id = None
+            v.active_goal_heading = None
             v.path_cursor = 0
             v.distance_to_next_waypoint = 0.0
             v.is_moving = False
@@ -306,6 +307,7 @@ class SimulationSession:
             v.task_sequence = []
             v.remaining_capacity = v.capacity
             v.active_task_id = None
+            v.active_goal_heading = None
 
         for t in self.engine.tasks:
             if t.status in {"canceled", "completed"}:
@@ -583,18 +585,23 @@ class SimulationSession:
         assert self.engine is not None
 
         # Use runtime poses as bidding inputs, but keep them intact after allocation.
-        pose_cache = {v.id: (v.current_pos, v.current_heading, v.active_task_id) for v in self.engine.vehicles}
+        pose_cache = {
+            v.id: (v.current_pos, v.current_heading, v.active_task_id, v.active_goal_heading)
+            for v in self.engine.vehicles
+        }
 
         self.engine.allocate_until_stable(phase=f"online:{reason}@{self.step}")
 
         for v in self.engine.vehicles:
-            pos, heading, active_tid = pose_cache[v.id]
+            pos, heading, active_tid, active_goal_heading = pose_cache[v.id]
             v.current_pos = pos
             v.current_heading = heading
             if active_tid is not None and active_tid not in v.task_sequence:
                 v.active_task_id = None
+                v.active_goal_heading = None
             elif active_tid is not None:
                 v.active_task_id = active_tid
+                v.active_goal_heading = active_goal_heading
 
         self._refresh_active_tasks_and_routes()
         self.last_replan_reason = reason
@@ -620,6 +627,7 @@ class SimulationSession:
 
             if v.active_task_id not in v.task_sequence:
                 v.active_task_id = None
+                v.active_goal_heading = None
 
             if v.active_task_id is None and v.task_sequence:
                 v.active_task_id = v.task_sequence[0]
@@ -663,13 +671,18 @@ class SimulationSession:
                         task.status = "locked"
 
             if v.active_task_id is None:
+                v.active_goal_heading = None
                 v.path_cursor = 0
                 v.distance_to_next_waypoint = 0.0
                 v.is_moving = False
                 v.route_points = [v.current_pos]
                 v.route_length = 0.0
             else:
-                self._build_active_segment(v)
+                if self._can_keep_active_segment(v):
+                    v.distance_to_next_waypoint = self._distance_to_next_waypoint(v)
+                    v.is_moving = len(v.route_points) >= 2 and v.path_cursor < len(v.route_points) - 1
+                else:
+                    self._build_active_segment(v)
 
     def _build_active_segment(self, v: Vehicle) -> None:
         self._assert_ready()
@@ -680,6 +693,7 @@ class SimulationSession:
         if tid is None:
             v.route_points = [v.current_pos]
             v.route_length = 0.0
+            v.active_goal_heading = None
             v.path_cursor = 0
             v.distance_to_next_waypoint = 0.0
             v.is_moving = False
@@ -688,6 +702,7 @@ class SimulationSession:
         task = self.engine.tasks_by_id.get(tid)
         if task is None:
             v.active_task_id = None
+            v.active_goal_heading = None
             v.route_points = [v.current_pos]
             v.route_length = 0.0
             v.path_cursor = 0
@@ -814,9 +829,50 @@ class SimulationSession:
         path[-1] = task.position
         v.route_points = path
         v.route_length = length
+        v.active_goal_heading = best_goal_heading
         v.path_cursor = 0
         v.distance_to_next_waypoint = self._distance_to_next_waypoint(v)
         v.is_moving = len(path) >= 2
+
+    def _remaining_route_points(self, v: Vehicle) -> list[tuple[float, float]]:
+        if len(v.route_points) < 2:
+            return [v.current_pos]
+        idx = min(max(v.path_cursor, 0), len(v.route_points) - 2)
+        out = [v.current_pos]
+        for p in v.route_points[idx + 1 :]:
+            if math.hypot(p[0] - out[-1][0], p[1] - out[-1][1]) > 1e-9:
+                out.append(p)
+        return out
+
+    def _can_keep_active_segment(self, v: Vehicle) -> bool:
+        self._assert_ready()
+        assert self.engine is not None
+        assert self.artifacts is not None
+
+        tid = v.active_task_id
+        if tid is None:
+            return False
+        task = self.engine.tasks_by_id.get(tid)
+        if task is None or task.status not in {"locked", "in_progress"}:
+            return False
+        if len(v.route_points) < 2:
+            return False
+
+        remaining_points = self._remaining_route_points(v)
+        if len(remaining_points) < 2:
+            return False
+
+        clearance = max(
+            float(getattr(self.cfg, "dubins_collision_margin", 0.0)),
+            float(getattr(self.cfg, "vehicle_radius", 0.0)) + float(getattr(self.cfg, "safety_margin", 0.0)),
+        )
+        if not self.artifacts.world.point_is_free(task.position, clearance=clearance):
+            return False
+        if not self._polyline_is_clear(remaining_points, margin=clearance):
+            return False
+        if math.hypot(remaining_points[-1][0] - task.position[0], remaining_points[-1][1] - task.position[1]) > 1e-6:
+            return False
+        return True
 
     @staticmethod
     def _path_initial_turn_delta(path: list[tuple[float, float]], start_heading: float) -> float:
@@ -1057,6 +1113,7 @@ class SimulationSession:
             return
 
         v.active_task_id = None
+        v.active_goal_heading = None
         v.route_points = [v.current_pos]
         v.route_length = 0.0
         v.path_cursor = 0
@@ -1072,8 +1129,11 @@ class SimulationSession:
             return
 
         task = self.engine.tasks_by_id.get(tid)
+        completed_goal_heading = v.active_goal_heading
         if task is not None:
             v.current_pos = task.position
+            if completed_goal_heading is not None:
+                v.current_heading = completed_goal_heading
             task.status = "completed"
             task.assigned_vehicle = v.id
 
@@ -1090,6 +1150,7 @@ class SimulationSession:
         )
 
         v.active_task_id = None
+        v.active_goal_heading = None
         v.path_cursor = 0
         v.distance_to_next_waypoint = 0.0
         v.is_moving = False

@@ -272,6 +272,78 @@ class TestOnlineRuntime(unittest.TestCase):
 
         self.assertTrue(found, "failed to find a free-space case for initial-turn buffering")
 
+    def test_complete_active_task_preserves_planned_goal_heading_into_next_activation(self) -> None:
+        self.session.start_online()
+        assert self.session.engine is not None
+
+        vehicle = self.session.engine.vehicles[0]
+        first_tid = vehicle.task_sequence[0]
+        second_tid = vehicle.task_sequence[1]
+        first_task = self.session.engine.tasks_by_id[first_tid]
+        second_task = self.session.engine.tasks_by_id[second_tid]
+
+        vehicle.active_task_id = first_tid
+        vehicle.active_goal_heading = 1.234
+        vehicle.current_heading = 0.0
+        vehicle.task_sequence = [first_tid, second_tid]
+        first_task.status = "in_progress"
+        first_task.assigned_vehicle = vehicle.id
+        second_task.status = "locked"
+        second_task.assigned_vehicle = vehicle.id
+
+        seen_headings: list[float] = []
+
+        def fake_build_active_segment(session_obj, vehicle_obj):
+            seen_headings.append(vehicle_obj.current_heading)
+            vehicle_obj.route_points = [vehicle_obj.current_pos]
+            vehicle_obj.route_length = 0.0
+            vehicle_obj.path_cursor = 0
+            vehicle_obj.distance_to_next_waypoint = 0.0
+            vehicle_obj.is_moving = False
+
+        with patch.object(SimulationSession, "_build_active_segment", autospec=True, side_effect=fake_build_active_segment):
+            self.session._complete_active_task(vehicle)
+
+        self.assertEqual(first_task.status, "completed")
+        self.assertEqual(vehicle.active_task_id, second_tid)
+        self.assertAlmostEqual(vehicle.current_heading, 1.234, places=6)
+        self.assertGreaterEqual(len(seen_headings), 1)
+        self.assertAlmostEqual(seen_headings[0], 1.234, places=6)
+
+    def test_refresh_active_tasks_keeps_clear_in_progress_route(self) -> None:
+        self.session.start_online()
+        assert self.session.engine is not None
+
+        vehicle = self.session.engine.vehicles[0]
+        self.assertIsNotNone(vehicle.active_task_id)
+        saved_route = list(vehicle.route_points)
+        saved_heading = vehicle.active_goal_heading
+
+        for other in self.session.engine.vehicles[1:]:
+            other.active_task_id = None
+            other.active_goal_heading = None
+            other.task_sequence = []
+            other.route_points = [other.current_pos]
+            other.route_length = 0.0
+            other.path_cursor = 0
+            other.distance_to_next_waypoint = 0.0
+            other.is_moving = False
+
+        target_calls: list[int] = []
+        original_build = SimulationSession._build_active_segment
+
+        def wrapped_build(session_obj, vehicle_obj):
+            if vehicle_obj.id == vehicle.id:
+                target_calls.append(vehicle_obj.id)
+            return original_build(session_obj, vehicle_obj)
+
+        with patch.object(SimulationSession, "_build_active_segment", autospec=True, side_effect=wrapped_build):
+            self.session._refresh_active_tasks_and_routes()
+
+        self.assertEqual(target_calls, [])
+        self.assertEqual(vehicle.route_points, saved_route)
+        self.assertEqual(vehicle.active_goal_heading, saved_heading)
+
     def test_reset_replay_restores_online_task_and_obstacle_actions(self) -> None:
         assert self.session.artifacts is not None
         base_tasks = len(self.session.list_tasks())

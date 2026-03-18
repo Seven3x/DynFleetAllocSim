@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 from .config import SimulationConfig
-from .cost_estimator import heading_to_point, wrap_to_pi
+from .cost_estimator import goal_heading_candidates, heading_to_point, wrap_to_pi
 from .dubins_path import DubinsHybridMeta, build_dubins_hybrid_path
 from .entities import Task, Vehicle
 from .planner_astar import AStarPlanner
@@ -57,6 +58,7 @@ def _segment_corrected_time(
     task: Task,
     start_pos: Tuple[float, float],
     start_heading: float,
+    next_task_pos: Tuple[float, float] | None,
     cfg: SimulationConfig,
     planner: AStarPlanner,
 ) -> Tuple[float, float, float, DubinsHybridMeta | None]:
@@ -66,26 +68,80 @@ def _segment_corrected_time(
 
     turn_radius = vehicle.speed / max(vehicle.max_omega, 1e-6)
     target_heading = heading_to_point(start_pos, task.position)
-    hybrid_meta = None
-    if cfg.use_dubins_hybrid:
+    if not cfg.use_dubins_hybrid:
+        delta_heading = abs(wrap_to_pi(target_heading - start_heading))
+        corrected_length = astar_len + cfg.lambda_psi * turn_radius * delta_heading
+        corrected_time = corrected_length / max(vehicle.speed, 1e-9)
+        return astar_len, corrected_time, target_heading, None
+
+    headings = goal_heading_candidates(
+        current_pos=start_pos,
+        task_pos=task.position,
+        next_task_pos=next_task_pos,
+        turn_radius=turn_radius,
+        blend_turn_radius_factor=cfg.goal_heading_blend_turn_radius_factor,
+        tolerance_rad=cfg.goal_heading_tolerance_rad,
+        num_samples=cfg.goal_heading_num_samples,
+    )
+    turn_penalty = max(0.0, float(getattr(cfg, "goal_heading_turn_penalty", 0.0)))
+    dpsi_limit = max(0.0, float(getattr(cfg, "goal_heading_max_dpsi_rad", 0.0)))
+    dpsi_slack = max(0.0, float(getattr(cfg, "goal_heading_max_dpsi_slack_rad", 0.0)))
+    dpsi_limit_eff = dpsi_limit + dpsi_slack
+
+    best_heading = target_heading
+    best_length = float("inf")
+    best_score = float("inf")
+    best_meta: DubinsHybridMeta | None = None
+
+    fallback_heading = target_heading
+    fallback_length = float("inf")
+    fallback_score = float("inf")
+    fallback_meta: DubinsHybridMeta | None = None
+
+    for goal_heading in headings:
         hybrid_path, hybrid_len, hybrid_meta = build_dubins_hybrid_path(
             world=planner.world,
             cfg=cfg,
             start_pose=(start_pos[0], start_pos[1], start_heading),
-            goal_pose=(task.position[0], task.position[1], target_heading),
+            goal_pose=(task.position[0], task.position[1], goal_heading),
             astar_planner=planner,
             turn_radius=turn_radius,
             astar_path=path,
             astar_length=astar_len,
         )
-        path_length = hybrid_len if hybrid_path and hybrid_len != float("inf") else astar_len
-    else:
-        path_length = astar_len
+        ok = bool(hybrid_path) and hybrid_len != float("inf")
+        if not ok:
+            continue
 
-    delta_heading = abs(wrap_to_pi(target_heading - start_heading))
+        dpsi = abs(wrap_to_pi(goal_heading - start_heading))
+        score = hybrid_len + turn_penalty * turn_radius * dpsi
+        if score < fallback_score:
+            fallback_heading = goal_heading
+            fallback_length = hybrid_len
+            fallback_score = score
+            fallback_meta = hybrid_meta
+        if dpsi > dpsi_limit_eff + 1e-9:
+            continue
+        if score < best_score:
+            best_heading = goal_heading
+            best_length = hybrid_len
+            best_score = score
+            best_meta = hybrid_meta
+
+    chosen_heading = best_heading
+    path_length = best_length
+    hybrid_meta = best_meta
+    if not math.isfinite(path_length):
+        chosen_heading = fallback_heading
+        path_length = fallback_length
+        hybrid_meta = fallback_meta
+    if not math.isfinite(path_length):
+        return float("inf"), float("inf"), start_heading, None
+
+    delta_heading = abs(wrap_to_pi(chosen_heading - start_heading))
     corrected_length = path_length + cfg.lambda_psi * turn_radius * delta_heading
     corrected_time = corrected_length / max(vehicle.speed, 1e-9)
-    return path_length, corrected_time, target_heading, hybrid_meta
+    return path_length, corrected_time, chosen_heading, hybrid_meta
 
 
 def verify_bid(
@@ -110,15 +166,23 @@ def verify_bid(
             tasks_by_id=tasks_by_id,
             exclude_task_id=task.id,
         )
+    task_chain: List[Task] = []
     for tid in prefix_ids:
         prefix_task = tasks_by_id.get(tid) if tasks_by_id is not None else None
-        if prefix_task is None:
-            continue
+        if prefix_task is not None:
+            task_chain.append(prefix_task)
+    task_chain.append(task)
+
+    for idx, chain_task in enumerate(task_chain):
+        next_task_pos = None
+        if idx + 1 < len(task_chain):
+            next_task_pos = task_chain[idx + 1].position
         seg_len, seg_time, next_heading, hybrid_meta = _segment_corrected_time(
             vehicle=vehicle,
-            task=prefix_task,
+            task=chain_task,
             start_pos=cur_pos,
             start_heading=cur_heading,
+            next_task_pos=next_task_pos,
             cfg=cfg,
             planner=planner,
         )
@@ -132,41 +196,18 @@ def verify_bid(
                 dubins_fallback_details=";".join(fallback_parts),
             )
         path_length_total += seg_len
-        c_tilde_total += prefix_weight * seg_time
+        if idx + 1 < len(task_chain):
+            c_tilde_total += prefix_weight * seg_time
+        else:
+            c_tilde_total += seg_time
         if hybrid_meta is not None and getattr(hybrid_meta, "used_fallback", False):
             detail = str(
                 getattr(hybrid_meta, "fallback_details", "")
                 or getattr(hybrid_meta, "fallback_reason", "fallback")
             )
-            fallback_parts.append(f"T{prefix_task.id}:{detail}")
-        cur_pos = prefix_task.position
+            fallback_parts.append(f"T{chain_task.id}:{detail}")
+        cur_pos = chain_task.position
         cur_heading = next_heading
-
-    seg_len, seg_time, next_heading, hybrid_meta = _segment_corrected_time(
-        vehicle=vehicle,
-        task=task,
-        start_pos=cur_pos,
-        start_heading=cur_heading,
-        cfg=cfg,
-        planner=planner,
-    )
-    if seg_time == float("inf"):
-        return VerificationResult(
-            passed=False,
-            path_length=float("inf"),
-            c_tilde=float("inf"),
-            e_under=1.0,
-            dubins_used_fallback=bool(fallback_parts),
-            dubins_fallback_details=";".join(fallback_parts),
-        )
-    path_length_total += seg_len
-    c_tilde_total += seg_time
-    if hybrid_meta is not None and getattr(hybrid_meta, "used_fallback", False):
-        detail = str(
-            getattr(hybrid_meta, "fallback_details", "")
-            or getattr(hybrid_meta, "fallback_reason", "fallback")
-        )
-        fallback_parts.append(f"T{task.id}:{detail}")
 
     if c_tilde_total <= 1e-12:
         return VerificationResult(

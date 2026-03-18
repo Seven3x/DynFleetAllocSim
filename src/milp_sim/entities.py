@@ -34,6 +34,7 @@ class Vehicle:
 
     # Online runtime fields
     active_task_id: Optional[int] = None
+    active_goal_heading: Optional[float] = None
     path_cursor: int = 0
     distance_to_next_waypoint: float = 0.0
     is_moving: bool = False
@@ -48,6 +49,7 @@ class Vehicle:
         self.history_points = [self.start_pos]
         self.route_length = 0.0
         self.active_task_id = None
+        self.active_goal_heading = None
         self.path_cursor = 0
         self.distance_to_next_waypoint = 0.0
         self.is_moving = False

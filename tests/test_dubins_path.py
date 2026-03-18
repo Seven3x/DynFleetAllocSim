@@ -1,15 +1,18 @@
 import math
 import unittest
 from dataclasses import replace
+from unittest.mock import patch
 
 try:
     from shapely.geometry import LineString, box
 
     from milp_sim.config import DEFAULT_CONFIG
     from milp_sim.dubins_path import DUBINS_WORDS, build_dubins_hybrid_path, solve_dubins_word
+    from milp_sim.entities import Task, Vehicle
     from milp_sim.map_utils import WorldMap
     from milp_sim.planner_astar import AStarPlanner
     from milp_sim.session import SimulationSession
+    from milp_sim.verification import verify_bid
 
     HAS_SHAPELY = True
 except ModuleNotFoundError:
@@ -211,6 +214,83 @@ class TestDubinsPath(unittest.TestCase):
         self.assertEqual(meta.fallback_segments, 1)
         self.assertEqual(meta.fallback_reason, "adjacent_overlap")
         self.assertIn("adjacent_overlap:1", meta.fallback_details)
+
+    def test_verify_bid_can_use_heading_candidates_to_avoid_direct_collision(self) -> None:
+        cfg = replace(
+            DEFAULT_CONFIG,
+            use_dubins_hybrid=True,
+            goal_heading_tolerance_rad=0.9,
+            goal_heading_num_samples=5,
+            goal_heading_max_dpsi_rad=1.05,
+            goal_heading_max_dpsi_slack_rad=0.12,
+        )
+        vehicle = Vehicle(
+            id=0,
+            start_pos=(12.0, 14.0),
+            heading=0.0,
+            speed=5.0,
+            max_omega=0.5,
+            capacity=10,
+            remaining_capacity=10,
+            current_pos=(12.0, 14.0),
+            current_heading=0.0,
+        )
+        task = Task(id=1, position=(85.0, 76.0), demand=1)
+        direct_heading = math.atan2(task.position[1] - vehicle.current_pos[1], task.position[0] - vehicle.current_pos[0])
+
+        def fake_build_dubins_hybrid_path(
+            world,
+            cfg,
+            start_pose,
+            goal_pose,
+            astar_planner,
+            turn_radius,
+            astar_path=None,
+            astar_length=None,
+        ):
+            goal_heading = goal_pose[2]
+            if abs(goal_heading - direct_heading) <= 1e-6:
+                return (
+                    [(start_pose[0], start_pose[1]), (goal_pose[0], goal_pose[1])],
+                    100.0,
+                    type(
+                        "Meta",
+                        (),
+                        {
+                            "used_fallback": True,
+                            "fallback_details": "direct_collision:1",
+                            "fallback_reason": "direct_collision",
+                        },
+                    )(),
+                )
+            return (
+                [(start_pose[0], start_pose[1]), (48.0, 46.0), (goal_pose[0], goal_pose[1])],
+                20.0,
+                type(
+                    "Meta",
+                    (),
+                    {
+                        "used_fallback": False,
+                        "fallback_details": "",
+                        "fallback_reason": "",
+                    },
+                )(),
+            )
+
+        with patch("milp_sim.verification.build_dubins_hybrid_path", side_effect=fake_build_dubins_hybrid_path):
+            result = verify_bid(
+                vehicle=vehicle,
+                task=task,
+                c_hat=25.0,
+                cfg=cfg,
+                planner=self.planner,
+                tasks_by_id={task.id: task},
+            )
+
+        self.assertTrue(result.passed)
+        self.assertFalse(result.dubins_used_fallback)
+        self.assertEqual(result.dubins_fallback_details, "")
+        self.assertLess(result.c_tilde, 25.0)
 
     def test_seeded_session_routes_do_not_cross_obstacles(self) -> None:
         cfg = replace(
