@@ -344,6 +344,17 @@ class TestOnlineRuntime(unittest.TestCase):
         self.assertEqual(vehicle.route_points, saved_route)
         self.assertEqual(vehicle.active_goal_heading, saved_heading)
 
+    def test_resample_runtime_path_limits_segment_length(self) -> None:
+        path = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)]
+
+        out = self.session._resample_runtime_path(path, max_step=0.25)
+
+        self.assertEqual(out[0], path[0])
+        self.assertEqual(out[-1], path[-1])
+        self.assertGreater(len(out), len(path))
+        max_seg = max(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(out, out[1:]))
+        self.assertLessEqual(max_seg, 0.25 + 1e-9)
+
     def test_reset_replay_restores_online_task_and_obstacle_actions(self) -> None:
         assert self.session.artifacts is not None
         base_tasks = len(self.session.list_tasks())

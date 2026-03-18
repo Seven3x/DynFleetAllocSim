@@ -825,6 +825,18 @@ class SimulationSession:
             turn_radius=turn_radius,
         )
 
+        runtime_step = max(
+            0.05,
+            float(
+                getattr(
+                    self.cfg,
+                    "online_path_sample_step",
+                    min(0.25, float(getattr(self.cfg, "dubins_sample_step", 0.5))),
+                )
+            ),
+        )
+        path = self._resample_runtime_path(path, max_step=runtime_step)
+
         path[0] = v.current_pos
         path[-1] = task.position
         v.route_points = path
@@ -842,6 +854,33 @@ class SimulationSession:
         for p in v.route_points[idx + 1 :]:
             if math.hypot(p[0] - out[-1][0], p[1] - out[-1][1]) > 1e-9:
                 out.append(p)
+        return out
+
+    def _resample_runtime_path(
+        self,
+        points: list[tuple[float, float]],
+        max_step: float,
+    ) -> list[tuple[float, float]]:
+        if len(points) < 2 or max_step <= 1e-6:
+            return list(points)
+
+        out: list[tuple[float, float]] = [points[0]]
+        for i in range(len(points) - 1):
+            start = points[i]
+            end = points[i + 1]
+            seg_len = math.hypot(end[0] - start[0], end[1] - start[1])
+            if seg_len <= 1e-9:
+                continue
+
+            n = max(1, int(math.ceil(seg_len / max_step)))
+            for k in range(1, n + 1):
+                alpha = k / n
+                p = (
+                    start[0] + (end[0] - start[0]) * alpha,
+                    start[1] + (end[1] - start[1]) * alpha,
+                )
+                if math.hypot(p[0] - out[-1][0], p[1] - out[-1][1]) > 1e-9:
+                    out.append(p)
         return out
 
     def _can_keep_active_segment(self, v: Vehicle) -> bool:
