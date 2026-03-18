@@ -18,7 +18,7 @@ def _print_help() -> None:
     print("  reset_replay                      Reset and replay last recorded user actions")
     print("  undo                              Undo last mutating action")
     print("  plot [filename]                   Save current figure to outputs/")
-    print("  export_logs [prefix]              Export coordination/verification logs")
+    print("  export_logs [prefix]              Export coordination/verification/big auction logs")
     print("  logs [n]                          Show last n verification/coordination logs")
     print("  ops [n]                           Show replayable user action history")
     print("  online_start [dt] [period]        Start online runtime")
@@ -62,8 +62,8 @@ class InteractiveConsole:
         print(f"saved plot: {path}")
 
     def _export_logs(self, prefix: str | None) -> None:
-        coord_path, verify_path = self.session.export_logs(prefix=prefix)
-        print(f"saved logs: {coord_path} , {verify_path}")
+        coord_path, verify_path, big_path = self.session.export_logs(prefix=prefix)
+        print(f"saved logs: {coord_path} , {verify_path} , {big_path}")
 
     def _logs(self, n: int) -> None:
         print(self.session.format_logs_text(n=n))

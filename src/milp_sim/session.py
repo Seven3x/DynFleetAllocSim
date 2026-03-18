@@ -20,6 +20,7 @@ from .cost_estimator import goal_heading_candidates, heading_to_point, wrap_to_p
 from .dubins_path import build_dubins_hybrid_path
 from .dynamic_events import generate_new_task
 from .entities import Task, Vehicle
+from .log_export import write_auction_big_log, write_coordination_log, write_event_log, write_verification_log
 from .neighbor_coordination import TaskRecord
 from .planner_astar import AStarPlanner
 from .simulator import SimulationArtifacts, build_static_scenario
@@ -286,9 +287,8 @@ class SimulationSession:
             if t.status in {"tentative", "verifying"}:
                 t.status = "withdrawn"
                 t.assigned_vehicle = None
-            if t.status == "completed":
-                t.status = "locked"
 
+        self._release_online_startup_assignments()
         self.sim_time = 0.0
         self.next_periodic_replan = self.replan_period_s
         self.pending_new_task_replan_count = 0
@@ -297,6 +297,33 @@ class SimulationSession:
         self._frame_history.clear()
         self._frame_cursor = -1
         self._capture_frame()
+
+    def _release_online_startup_assignments(self) -> None:
+        self._assert_ready()
+        assert self.engine is not None
+
+        for v in self.engine.vehicles:
+            v.task_sequence = []
+            v.remaining_capacity = v.capacity
+            v.active_task_id = None
+
+        for t in self.engine.tasks:
+            if t.status in {"canceled", "completed"}:
+                continue
+            t.status = "withdrawn"
+            t.assigned_vehicle = None
+            base = self.engine.records.get(t.id)
+            next_version = (base.version + 1) if base is not None else 1
+            self.engine.records[t.id] = TaskRecord(
+                task_id=t.id,
+                winner=None,
+                bid=float("inf"),
+                status="withdrawn",
+                version=next_version,
+            )
+
+        self.engine.corrected_bid_cache.clear()
+        self.engine.force_accept_pairs.clear()
 
     def _snapshot_frame(self) -> OnlineFrameState:
         self._assert_ready()
@@ -1740,7 +1767,7 @@ class SimulationSession:
             lines.append(f"... ({len(tasks) - limit} more tasks)")
         return "\n".join(lines)
 
-    def draw_on_axis(self, ax) -> None:
+    def draw_on_axis(self, ax, render_state: Optional[dict[int, dict[str, object]]] = None) -> None:
         self._assert_ready()
         assert self.artifacts is not None
         assert self.engine is not None
@@ -1770,9 +1797,21 @@ class SimulationSession:
             colors = plt.get_cmap("tab10")
             for v in self.engine.vehicles:
                 c = colors(v.id % 10)
+                draw_pos = v.current_pos
+                draw_heading = v.current_heading
+                draw_is_moving = v.is_moving
+                if render_state is not None:
+                    state = render_state.get(v.id)
+                    if state is not None:
+                        draw_pos = tuple(state.get("current_pos", v.current_pos))
+                        draw_heading = float(state.get("current_heading", v.current_heading))
+                        draw_is_moving = bool(state.get("is_moving", v.is_moving))
+
                 if len(v.history_points) >= 2:
-                    hx = [p[0] for p in v.history_points]
-                    hy = [p[1] for p in v.history_points]
+                    history_points = list(v.history_points)
+                    history_points[-1] = (float(draw_pos[0]), float(draw_pos[1]))
+                    hx = [p[0] for p in history_points]
+                    hy = [p[1] for p in history_points]
                     ax.plot(
                         hx,
                         hy,
@@ -1783,28 +1822,29 @@ class SimulationSession:
                         zorder=9,
                     )
                 ax.scatter(
-                    [v.current_pos[0]],
-                    [v.current_pos[1]],
+                    [draw_pos[0]],
+                    [draw_pos[1]],
                     s=95,
                     color=c,
                     edgecolor="black",
                     linewidth=0.8,
                     zorder=12,
                 )
-                ux = math.cos(v.current_heading)
-                uy = math.sin(v.current_heading)
-                ax.arrow(
-                    v.current_pos[0],
-                    v.current_pos[1],
-                    ux * 1.2,
-                    uy * 1.2,
-                    color=c,
-                    linewidth=1.2,
-                    head_width=0.6,
-                    head_length=0.8,
-                    length_includes_head=True,
-                    zorder=13,
-                )
+                if draw_is_moving:
+                    ux = math.cos(draw_heading)
+                    uy = math.sin(draw_heading)
+                    ax.arrow(
+                        draw_pos[0],
+                        draw_pos[1],
+                        ux * 1.2,
+                        uy * 1.2,
+                        color=c,
+                        linewidth=1.2,
+                        head_width=0.6,
+                        head_length=0.8,
+                        length_includes_head=True,
+                        zorder=13,
+                    )
 
                 if v.active_task_id is not None:
                     task = self.engine.tasks_by_id.get(v.active_task_id)
@@ -1866,7 +1906,7 @@ class SimulationSession:
         plt.close(fig)
         return path
 
-    def export_logs(self, prefix: str | None = None) -> tuple[Path, Path]:
+    def export_logs(self, prefix: str | None = None) -> tuple[Path, Path, Path]:
         self._assert_ready()
         assert self.engine is not None
 
@@ -1876,34 +1916,14 @@ class SimulationSession:
 
         coord_path = self.output_dir / f"{prefix}_coordination_log.txt"
         verify_path = self.output_dir / f"{prefix}_verification_log.txt"
+        big_path = self.output_dir / f"{prefix}_auction_big_log.txt"
         event_path = self.output_dir / f"{prefix}_event_log.txt"
         runtime_path = self.output_dir / f"{prefix}_online_runtime_log.txt"
 
-        with coord_path.open("w", encoding="utf-8") as f:
-            f.write("task_id,event,rounds,converged,final_winner,final_status,trace\n")
-            for item in self.engine.coordination_logs:
-                trace = ";".join(
-                    f"step{t.step}:d{t.distinct_records}:s{t.stable_count}" for t in item.traces
-                )
-                f.write(
-                    f"{item.task_id},{item.event},{item.rounds},{item.converged},"
-                    f"{item.final_winner},{item.final_status},{trace}\n"
-                )
-
-        with verify_path.open("w", encoding="utf-8") as f:
-            f.write("round,task_id,vehicle_id,c_hat,c_tilde,e_under,passed,forced_accept\n")
-            for item in self.engine.verification_logs:
-                f.write(
-                    f"{item.round_idx},{item.task_id},{item.vehicle_id},"
-                    f"{item.c_hat:.6f},{item.c_tilde:.6f},{item.e_under:.6f},"
-                    f"{item.passed},{item.forced_accept}\n"
-                )
-
-        with event_path.open("w", encoding="utf-8") as f:
-            f.write("step,event_type,task_id,message\n")
-            for item in self.engine.event_logs:
-                msg = str(item.message).replace("\n", "\\n")
-                f.write(f"{item.step},{item.event_type},{item.task_id},{msg}\n")
+        write_coordination_log(coord_path, self.engine.coordination_logs)
+        write_verification_log(verify_path, self.engine.verification_logs)
+        write_auction_big_log(big_path, self.engine.auction_logs)
+        write_event_log(event_path, self.engine.event_logs)
 
         with runtime_path.open("w", encoding="utf-8") as f:
             f.write(
@@ -1920,4 +1940,4 @@ class SimulationSession:
                         f"{active},{v.is_moving},{v.distance_to_next_waypoint:.6f},{seq}\n"
                     )
 
-        return coord_path, verify_path
+        return coord_path, verify_path, big_path

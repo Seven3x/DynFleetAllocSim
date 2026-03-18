@@ -34,6 +34,21 @@ class AuctionRoundLog:
     phase: str
     bids: List[Bid]
     tentative_winners: List[Bid]
+    vehicle_logs: List["VehicleAuctionLog"]
+
+
+@dataclass
+class VehicleAuctionLog:
+    vehicle_id: int
+    remaining_capacity: int
+    current_pos: Tuple[float, float]
+    current_heading: float
+    task_sequence: List[int]
+    candidate_bids: List[Bid]
+    capacity_blocked_task_ids: List[int]
+    unreachable_task_ids: List[int]
+    chosen_task_id: Optional[int]
+    chosen_cost: float
 
 
 @dataclass
@@ -177,7 +192,7 @@ class AllocationEngine:
             if guard > 3000:
                 raise RuntimeError("Auction loop exceeded safety limit.")
 
-            bids = self._collect_bids()
+            bids, vehicle_logs = self._collect_bids()
             if not bids:
                 pending = [t.id for t in self.tasks if t.status in AUCTIONABLE_STATES]
                 raise RuntimeError(f"No feasible bids for pending tasks: {pending}")
@@ -189,6 +204,7 @@ class AllocationEngine:
                     phase=phase,
                     bids=bids,
                     tentative_winners=winners,
+                    vehicle_logs=vehicle_logs,
                 )
             )
 
@@ -300,25 +316,49 @@ class AllocationEngine:
             return float("inf")
         return prefix_time + suffix.estimated_time
 
-    def _collect_bids(self) -> List[Bid]:
+    def _collect_bids(self) -> Tuple[List[Bid], List[VehicleAuctionLog]]:
         candidate_tasks = [t for t in self.tasks if t.status in AUCTIONABLE_STATES]
         bids: List[Bid] = []
+        vehicle_logs: List[VehicleAuctionLog] = []
 
         for v in self.vehicles:
             best_tid: Optional[int] = None
             best_cost = float("inf")
+            candidate_bids: List[Bid] = []
+            capacity_blocked_task_ids: List[int] = []
+            unreachable_task_ids: List[int] = []
             for t in candidate_tasks:
                 if t.demand > v.remaining_capacity:
+                    capacity_blocked_task_ids.append(t.id)
                     continue
                 c_hat = self._estimate_task_cost(v, t)
+                if c_hat == float("inf"):
+                    unreachable_task_ids.append(t.id)
+                    continue
+                candidate_bids.append(Bid(vehicle_id=v.id, task_id=t.id, value=c_hat))
                 if c_hat < best_cost:
                     best_cost = c_hat
                     best_tid = t.id
 
+            candidate_bids.sort(key=lambda x: (x.value, x.task_id))
+            vehicle_logs.append(
+                VehicleAuctionLog(
+                    vehicle_id=v.id,
+                    remaining_capacity=v.remaining_capacity,
+                    current_pos=(float(v.current_pos[0]), float(v.current_pos[1])),
+                    current_heading=float(v.current_heading),
+                    task_sequence=list(v.task_sequence),
+                    candidate_bids=candidate_bids,
+                    capacity_blocked_task_ids=capacity_blocked_task_ids,
+                    unreachable_task_ids=unreachable_task_ids,
+                    chosen_task_id=best_tid,
+                    chosen_cost=best_cost,
+                )
+            )
             if best_tid is not None:
                 bids.append(Bid(vehicle_id=v.id, task_id=best_tid, value=best_cost))
 
-        return bids
+        return bids, vehicle_logs
 
     @staticmethod
     def _choose_tentative_winners(bids: List[Bid]) -> List[Bid]:

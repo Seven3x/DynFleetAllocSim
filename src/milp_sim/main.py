@@ -4,35 +4,21 @@ import argparse
 from pathlib import Path
 
 from .config import DEFAULT_CONFIG, SimulationConfig
+from .log_export import write_auction_big_log, write_coordination_log, write_verification_log
 from .simulator import run_round2_pipeline
 from .visualization import plot_final_scene, plot_initial_scene
 
 
-def dump_logs(result, out_dir: Path) -> tuple[Path, Path]:
+def dump_logs(result, out_dir: Path) -> tuple[Path, Path, Path]:
     coord_path = out_dir / "coordination_log.txt"
     verify_path = out_dir / "verification_log.txt"
+    big_path = out_dir / "auction_big_log.txt"
 
-    with coord_path.open("w", encoding="utf-8") as f:
-        f.write("task_id,event,rounds,converged,final_winner,final_status,trace\n")
-        for item in result.allocation.coordination_logs:
-            trace = ";".join(
-                f"step{t.step}:d{t.distinct_records}:s{t.stable_count}" for t in item.traces
-            )
-            f.write(
-                f"{item.task_id},{item.event},{item.rounds},{item.converged},"
-                f"{item.final_winner},{item.final_status},{trace}\n"
-            )
+    write_coordination_log(coord_path, result.allocation.coordination_logs)
+    write_verification_log(verify_path, result.allocation.verification_logs)
+    write_auction_big_log(big_path, result.allocation.auction_logs)
 
-    with verify_path.open("w", encoding="utf-8") as f:
-        f.write("round,task_id,vehicle_id,c_hat,c_tilde,e_under,passed,forced_accept\n")
-        for item in result.allocation.verification_logs:
-            f.write(
-                f"{item.round_idx},{item.task_id},{item.vehicle_id},"
-                f"{item.c_hat:.6f},{item.c_tilde:.6f},{item.e_under:.6f},"
-                f"{item.passed},{item.forced_accept}\n"
-            )
-
-    return coord_path, verify_path
+    return coord_path, verify_path, big_path
 
 
 def print_summary(result) -> None:
@@ -97,12 +83,13 @@ def run(cfg: SimulationConfig = DEFAULT_CONFIG) -> None:
         save_path=final_fig,
         dpi=cfg.figure_dpi,
         fig_size=cfg.figure_size,
+        predicted_future_links=max(0, int(cfg.online_future_task_horizon)),
     )
 
-    coord_log, verify_log = dump_logs(result, out_dir)
+    coord_log, verify_log, big_log = dump_logs(result, out_dir)
     print_summary(result)
     print(f"Saved figures: {initial_fig} , {final_fig}")
-    print(f"Saved logs: {coord_log} , {verify_log}")
+    print(f"Saved logs: {coord_log} , {verify_log} , {big_log}")
 
 
 def main() -> None:

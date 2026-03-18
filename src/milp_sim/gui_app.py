@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import time
 import tkinter as tk
@@ -30,10 +31,11 @@ class MilpGuiApp:
 
         self.root = tk.Tk()
         self.root.title("MILP Dynamic Task Allocation GUI")
-        self.root.geometry("1600x920")
         self._configure_ui_style()
+        self._configure_window_geometry()
 
         self.refresh_interval_ms = 500
+        self.render_refresh_interval_ms = 40
         self.log_count_var = tk.StringVar(value="8")
         self.obstacle_point_count_var = tk.StringVar(value="0")
         self.obstacle_mode_var = tk.StringVar(value="OFF")
@@ -50,6 +52,13 @@ class MilpGuiApp:
         self._last_tasks_text = ""
         self._last_drag_refresh_ts = 0.0
         self.drag_refresh_interval_s = 1.0 / 30.0
+        self._last_online_tick_wall_ts: float | None = None
+        self._last_text_refresh_wall_ts = 0.0
+        self._prev_online_render_state: dict[int, dict[str, object]] = {}
+        self._curr_online_render_state: dict[int, dict[str, object]] = {}
+        self.left_canvas: tk.Canvas | None = None
+        self.left_canvas_window: int | None = None
+        self.left_controls_frame: ttk.Frame | None = None
 
         self._build_layout()
         self._refresh_all()
@@ -58,7 +67,17 @@ class MilpGuiApp:
     def _configure_ui_style(self) -> None:
         self.root.configure(bg="#e9edf2")
         # Improve readability on HiDPI/WSLg displays.
-        self.root.tk.call("tk", "scaling", 1.25)
+        screen_height = self.root.winfo_screenheight()
+        ui_scale = 1.25
+        base_font_size = 10
+        mono_font_size = 10
+        if screen_height <= 900:
+            ui_scale = 1.1
+        if screen_height <= 800:
+            ui_scale = 1.0
+            base_font_size = 9
+            mono_font_size = 9
+        self.root.tk.call("tk", "scaling", ui_scale)
 
         style = ttk.Style(self.root)
         available_themes = set(style.theme_names())
@@ -66,20 +85,32 @@ class MilpGuiApp:
         style.theme_use(preferred_theme)
 
         default_font = tkfont.nametofont("TkDefaultFont")
-        default_font.configure(family="Segoe UI", size=10)
+        default_font.configure(family="Segoe UI", size=base_font_size)
         text_font = tkfont.nametofont("TkTextFont")
-        text_font.configure(family="Segoe UI", size=10)
+        text_font.configure(family="Segoe UI", size=base_font_size)
         fixed_font = tkfont.nametofont("TkFixedFont")
-        fixed_font.configure(family="Cascadia Mono", size=10)
+        fixed_font.configure(family="Cascadia Mono", size=mono_font_size)
 
         self.root.option_add("*Font", default_font)
 
         style.configure("TFrame", background="#e9edf2")
         style.configure("TLabelframe", background="#e9edf2")
-        style.configure("TLabelframe.Label", font=("Segoe UI Semibold", 10), foreground="#1f2937")
+        style.configure("TLabelframe.Label", font=("Segoe UI Semibold", base_font_size), foreground="#1f2937")
         style.configure("TLabel", background="#e9edf2", foreground="#111827")
-        style.configure("TButton", padding=(10, 4), font=("Segoe UI", 10))
+        style.configure("TButton", padding=(10, 4), font=("Segoe UI", base_font_size))
         style.configure("TEntry", fieldbackground="#ffffff")
+
+    def _configure_window_geometry(self) -> None:
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        width_limit = max(screen_width - 32, 640)
+        height_limit = max(screen_height - 72, 520)
+        width = min(1600, width_limit)
+        height = min(920, height_limit)
+        pos_x = max((screen_width - width) // 2, 0)
+        pos_y = max((screen_height - height) // 2, 0)
+        self.root.geometry(f"{width}x{height}+{pos_x}+{pos_y}")
+        self.root.minsize(min(width, 1120), min(height, 700))
 
     def _build_layout(self) -> None:
         self.root.columnconfigure(0, weight=0)
@@ -87,7 +118,7 @@ class MilpGuiApp:
         self.root.columnconfigure(2, weight=2)
         self.root.rowconfigure(0, weight=1)
 
-        left = ttk.Frame(self.root, padding=10)
+        left = ttk.Frame(self.root, padding=(10, 10, 4, 10))
         center = ttk.Frame(self.root, padding=8)
         right = ttk.Frame(self.root, padding=10)
 
@@ -95,6 +126,8 @@ class MilpGuiApp:
         center.grid(row=0, column=1, sticky="nsew")
         right.grid(row=0, column=2, sticky="nsew")
 
+        left.rowconfigure(0, weight=1)
+        left.columnconfigure(0, weight=1)
         center.rowconfigure(0, weight=1)
         center.columnconfigure(0, weight=1)
 
@@ -103,9 +136,70 @@ class MilpGuiApp:
         right.rowconfigure(2, weight=1)
         right.columnconfigure(0, weight=1)
 
-        self._build_left_controls(left)
+        left_canvas = tk.Canvas(
+            left,
+            background="#e9edf2",
+            borderwidth=0,
+            highlightthickness=0,
+            width=320,
+        )
+        left_scrollbar = ttk.Scrollbar(left, orient="vertical", command=left_canvas.yview)
+        left_controls = ttk.Frame(left_canvas)
+
+        left_canvas.grid(row=0, column=0, sticky="nsew")
+        left_scrollbar.grid(row=0, column=1, sticky="ns")
+        left_canvas.configure(yscrollcommand=left_scrollbar.set)
+
+        self.left_canvas = left_canvas
+        self.left_controls_frame = left_controls
+        self.left_canvas_window = left_canvas.create_window((0, 0), window=left_controls, anchor="nw")
+
+        left_controls.bind("<Configure>", self._on_left_controls_configure)
+        left_canvas.bind("<Configure>", self._on_left_canvas_configure)
+        self.root.bind_all("<MouseWheel>", self._on_left_panel_mousewheel, add="+")
+        self.root.bind_all("<Button-4>", self._on_left_panel_mousewheel, add="+")
+        self.root.bind_all("<Button-5>", self._on_left_panel_mousewheel, add="+")
+
+        self._build_left_controls(left_controls)
         self._build_center_plot(center)
         self._build_right_panels(right)
+
+    def _on_left_controls_configure(self, _event) -> None:
+        if self.left_canvas is None:
+            return
+        self.left_canvas.configure(scrollregion=self.left_canvas.bbox("all"))
+
+    def _on_left_canvas_configure(self, event) -> None:
+        if self.left_canvas is None or self.left_canvas_window is None:
+            return
+        self.left_canvas.itemconfigure(self.left_canvas_window, width=event.width)
+
+    def _is_left_panel_widget(self, widget: tk.Misc | None) -> bool:
+        if widget is None:
+            return False
+        current = widget
+        while current is not None:
+            if current == self.left_canvas or current == self.left_controls_frame:
+                return True
+            parent_name = current.winfo_parent()
+            if not parent_name:
+                break
+            current = current.nametowidget(parent_name)
+        return False
+
+    def _on_left_panel_mousewheel(self, event) -> None:
+        if self.left_canvas is None or not self._is_left_panel_widget(event.widget):
+            return
+        if getattr(event, "delta", 0):
+            step = -int(event.delta / 120)
+        elif getattr(event, "num", None) == 4:
+            step = -1
+        elif getattr(event, "num", None) == 5:
+            step = 1
+        else:
+            step = 0
+        if step:
+            self.left_canvas.yview_scroll(step, "units")
 
     def _build_left_controls(self, parent) -> None:
         top = ttk.LabelFrame(parent, text="Top Controls", padding=8)
@@ -359,7 +453,7 @@ class MilpGuiApp:
 
     def _refresh_map(self) -> None:
         prev_view = self._capture_map_view_state()
-        self.session.draw_on_axis(self.ax)
+        self.session.draw_on_axis(self.ax, render_state=self._interpolated_online_render_state())
         self._restore_map_view_state(prev_view or self._map_view_state)
         if self.dragging_task_id is not None and self.drag_preview_pos is not None:
             x, y = self.drag_preview_pos
@@ -478,14 +572,102 @@ class MilpGuiApp:
         except Exception as exc:
             messagebox.showerror("Refresh Error", str(exc))
 
+    def _capture_online_render_state(self) -> dict[int, dict[str, object]]:
+        if self.session.engine is None:
+            return {}
+        return {
+            v.id: {
+                "current_pos": (float(v.current_pos[0]), float(v.current_pos[1])),
+                "current_heading": float(v.current_heading),
+                "is_moving": bool(v.is_moving),
+            }
+            for v in self.session.engine.vehicles
+        }
+
+    @staticmethod
+    def _wrap_angle(angle: float) -> float:
+        while angle <= -math.pi:
+            angle += 2.0 * math.pi
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+        return angle
+
+    def _interpolated_online_render_state(self) -> dict[int, dict[str, object]] | None:
+        if not (self.session.online_enabled and self.session.online_running):
+            return None
+        if not self._prev_online_render_state or not self._curr_online_render_state:
+            return None
+        if self._last_online_tick_wall_ts is None:
+            return self._curr_online_render_state
+
+        step_s = max(float(self.session.online_dt), 1e-6)
+        alpha = min(max((time.perf_counter() - self._last_online_tick_wall_ts) / step_s, 0.0), 1.0)
+        render_state: dict[int, dict[str, object]] = {}
+        for vid, curr in self._curr_online_render_state.items():
+            prev = self._prev_online_render_state.get(vid, curr)
+            prev_pos = prev["current_pos"]
+            curr_pos = curr["current_pos"]
+            prev_heading = float(prev["current_heading"])
+            curr_heading = float(curr["current_heading"])
+            d_heading = self._wrap_angle(curr_heading - prev_heading)
+            render_state[vid] = {
+                "current_pos": (
+                    float(prev_pos[0]) + (float(curr_pos[0]) - float(prev_pos[0])) * alpha,
+                    float(prev_pos[1]) + (float(curr_pos[1]) - float(prev_pos[1])) * alpha,
+                ),
+                "current_heading": prev_heading + d_heading * alpha,
+                "is_moving": bool(curr["is_moving"] or prev["is_moving"]),
+            }
+        return render_state
+
+    def _reset_online_render_clock(self) -> None:
+        self._last_online_tick_wall_ts = None
+        self._prev_online_render_state = {}
+        self._curr_online_render_state = {}
+
+    def _advance_online_clock(self, now: float) -> None:
+        step_s = max(float(self.session.online_dt), 1e-6)
+        if self._last_online_tick_wall_ts is None:
+            state = self._capture_online_render_state()
+            self._prev_online_render_state = state
+            self._curr_online_render_state = state
+            self._last_online_tick_wall_ts = now
+            return
+
+        while now - self._last_online_tick_wall_ts >= step_s - 1e-9:
+            prev_state = self._capture_online_render_state()
+            self.session.tick(n=1)
+            curr_state = self._capture_online_render_state()
+            self._prev_online_render_state = prev_state
+            self._curr_online_render_state = curr_state
+            self._last_online_tick_wall_ts += step_s
+
     def _schedule_refresh(self) -> None:
+        now = time.perf_counter()
         try:
             if self.session.online_enabled and self.session.online_running:
-                self.session.tick(n=1)
+                self._advance_online_clock(now)
+            elif not self.session.online_running:
+                self._reset_online_render_clock()
         except Exception as exc:
             self.last_action_var.set(f"tick error: {exc}")
-        self._refresh_all()
-        self.root.after(self.refresh_interval_ms, self._schedule_refresh)
+        try:
+            self._refresh_map()
+            if (
+                not self.session.online_enabled
+                or not self.session.online_running
+                or now - self._last_text_refresh_wall_ts >= 0.2
+            ):
+                self._refresh_text_panels()
+                self._last_text_refresh_wall_ts = now
+        except Exception as exc:
+            messagebox.showerror("Refresh Error", str(exc))
+        next_delay = (
+            self.render_refresh_interval_ms
+            if self.session.online_enabled and self.session.online_running
+            else self.refresh_interval_ms
+        )
+        self.root.after(next_delay, self._schedule_refresh)
 
     def _on_reset(self) -> None:
         try:
@@ -549,16 +731,20 @@ class MilpGuiApp:
 
     def _on_export_logs(self) -> None:
         try:
-            coord, verify = self.session.export_logs()
+            coord, verify, big = self.session.export_logs()
             self._refresh_all()
             self.last_action_var.set("Logs exported")
-            messagebox.showinfo("Logs Exported", f"Coordination:\n{coord}\n\nVerification:\n{verify}")
+            messagebox.showinfo(
+                "Logs Exported",
+                f"Coordination:\n{coord}\n\nVerification:\n{verify}\n\nAuction Big Log:\n{big}",
+            )
         except Exception as exc:
             messagebox.showerror("Export Error", str(exc))
 
     def _on_start_online(self) -> None:
         try:
             self.session.start_online()
+            self._reset_online_render_clock()
             self.last_action_var.set("Online runtime started")
             self._refresh_all()
         except Exception as exc:
@@ -568,12 +754,15 @@ class MilpGuiApp:
         try:
             if not self.session.online_enabled:
                 self.session.start_online()
+                self._reset_online_render_clock()
                 self.last_action_var.set("Online runtime started")
             elif self.session.online_running:
                 self.session.pause_online()
+                self._reset_online_render_clock()
                 self.last_action_var.set("Online runtime paused")
             else:
                 self.session.resume_online()
+                self._reset_online_render_clock()
                 self.last_action_var.set("Online runtime resumed")
             self._refresh_all()
         except Exception as exc:
@@ -583,6 +772,7 @@ class MilpGuiApp:
         try:
             if not self.session.online_enabled:
                 self.session.start_online()
+            self._reset_online_render_clock()
             self.session.tick(n=int(n))
             self.last_action_var.set(f"Online stepped x{n}")
             self._refresh_all()
@@ -594,6 +784,7 @@ class MilpGuiApp:
             if not self.session.online_enabled:
                 self.session.start_online()
             self.session.pause_online()
+            self._reset_online_render_clock()
             self.session.frame_prev()
             self.last_action_var.set("Moved to previous frame")
             self._refresh_all()
@@ -605,6 +796,7 @@ class MilpGuiApp:
             if not self.session.online_enabled:
                 self.session.start_online()
             self.session.pause_online()
+            self._reset_online_render_clock()
             self.session.frame_next()
             self.last_action_var.set("Moved to next frame")
             self._refresh_all()

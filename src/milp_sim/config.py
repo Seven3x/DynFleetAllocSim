@@ -86,7 +86,8 @@ class SimulationConfig:
     # When False, in-progress tasks are never released by soft preempt.
     online_allow_active_task_preempt: bool = False
     online_task_reach_tolerance: float = 0.25
-    online_future_task_horizon: int = 2
+    # Number of future tasks kept/visualized beyond the current in-progress task.
+    online_future_task_horizon: int = 3
     # Planner debug: dump heading-candidate scores into event logs.
     plan_debug_enabled: bool = True
     plan_debug_vehicle_id: int = 2
