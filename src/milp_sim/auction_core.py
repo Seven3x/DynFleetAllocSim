@@ -61,6 +61,8 @@ class VerificationLog:
     e_under: float
     passed: bool
     forced_accept: bool
+    dubins_used_fallback: bool = False
+    dubins_fallback_details: str = ""
 
 
 @dataclass
@@ -292,12 +294,18 @@ class AllocationEngine:
         return total_time, frontier_pos, frontier_heading
 
     def _estimate_task_cost(self, vehicle: Vehicle, task: Task) -> float:
-        prefix_time, frontier_pos, frontier_heading = self._estimate_committed_prefix_time_and_frontier(
-            vehicle=vehicle,
-            exclude_task_id=task.id,
-        )
-        if prefix_time == float("inf"):
-            return float("inf")
+        prefix_weight = max(0.0, float(getattr(self.cfg, "committed_prefix_time_weight", 1.0)))
+        if prefix_weight <= 1e-12:
+            prefix_time = 0.0
+            frontier_pos = vehicle.current_pos
+            frontier_heading = vehicle.current_heading
+        else:
+            prefix_time, frontier_pos, frontier_heading = self._estimate_committed_prefix_time_and_frontier(
+                vehicle=vehicle,
+                exclude_task_id=task.id,
+            )
+            if prefix_time == float("inf"):
+                return float("inf")
 
         cached = self.corrected_bid_cache.get((vehicle.id, task.id))
         if cached is not None and prefix_time <= 1e-9:
@@ -314,7 +322,7 @@ class AllocationEngine:
         )
         if suffix.estimated_time == float("inf"):
             return float("inf")
-        return prefix_time + suffix.estimated_time
+        return prefix_weight * prefix_time + suffix.estimated_time
 
     def _collect_bids(self) -> Tuple[List[Bid], List[VehicleAuctionLog]]:
         candidate_tasks = [t for t in self.tasks if t.status in AUCTIONABLE_STATES]
@@ -473,6 +481,8 @@ class AllocationEngine:
                     e_under=verify_res.e_under,
                     passed=verify_res.passed,
                     forced_accept=forced_accept,
+                    dubins_used_fallback=verify_res.dubins_used_fallback,
+                    dubins_fallback_details=verify_res.dubins_fallback_details,
                 )
             )
 

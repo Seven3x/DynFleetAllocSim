@@ -714,7 +714,7 @@ class SimulationSession:
         best_length = float("inf")
         best_score = float("inf")
         best_goal_heading = heading_to_point(v.current_pos, task.position)
-        cand_meta: list[tuple[float, float, bool, float, float]] = []
+        cand_meta: list[tuple[float, float, bool, float, float, bool, str]] = []
         turn_penalty = max(0.0, float(getattr(self.cfg, "goal_heading_turn_penalty", 0.0)))
         dpsi_limit = max(0.0, float(getattr(self.cfg, "goal_heading_max_dpsi_rad", 0.0)))
         dpsi_slack = max(0.0, float(getattr(self.cfg, "goal_heading_max_dpsi_slack_rad", 0.0)))
@@ -724,7 +724,7 @@ class SimulationSession:
         fallback_score = float("inf")
         fallback_goal_heading = best_goal_heading
         for goal_heading in headings:
-            cand_path, cand_length, _ = build_dubins_hybrid_path(
+            cand_path, cand_length, cand_hybrid_meta = build_dubins_hybrid_path(
                 world=self.artifacts.world,
                 cfg=self.cfg,
                 start_pose=(v.current_pos[0], v.current_pos[1], v.current_heading),
@@ -737,7 +737,12 @@ class SimulationSession:
             score = float("inf")
             if ok:
                 score = cand_length + turn_penalty * turn_radius * dpsi
-            cand_meta.append((goal_heading, cand_length, ok, score, dpsi))
+            fallback_used = bool(getattr(cand_hybrid_meta, "used_fallback", False))
+            fallback_detail = str(
+                getattr(cand_hybrid_meta, "fallback_details", "")
+                or getattr(cand_hybrid_meta, "fallback_reason", "")
+            )
+            cand_meta.append((goal_heading, cand_length, ok, score, dpsi, fallback_used, fallback_detail))
             if ok and score < fallback_score:
                 fallback_path = cand_path
                 fallback_length = cand_length
@@ -767,11 +772,15 @@ class SimulationSession:
                     key=lambda x: (0 if x[2] else 1, x[3] if x[2] else float("inf")),
                 )[:top_k]
                 parts: list[str] = []
-                for h, l, ok, score, dpsi in ranked:
+                for h, l, ok, score, dpsi, fallback_used, fallback_detail in ranked:
                     dpsi_deg = math.degrees(dpsi)
                     ls = f"{l:.3f}" if ok else "inf"
                     ss = f"{score:.3f}" if ok else "inf"
-                    parts.append(f"h={math.degrees(h):.1f}deg dpsi={dpsi_deg:.1f} len={ls} score={ss} ok={ok}")
+                    fb = fallback_detail if fallback_detail else "-"
+                    parts.append(
+                        f"h={math.degrees(h):.1f}deg dpsi={dpsi_deg:.1f} "
+                        f"len={ls} score={ss} ok={ok} fallback={fallback_used} reason={fb}"
+                    )
                 chosen_dpsi = math.degrees(abs(wrap_to_pi(best_goal_heading - v.current_heading)))
                 msg = (
                     f"V{v.id} T{tid} choose_h={math.degrees(best_goal_heading):.1f}deg "
@@ -1733,9 +1742,11 @@ class SimulationSession:
         ver, coord = self.recent_logs(n=n)
         lines = ["Verification logs:"]
         for item in ver:
+            fallback = item.dubins_fallback_details if item.dubins_used_fallback else "-"
             lines.append(
                 f"  round={item.round_idx} T{item.task_id} V{item.vehicle_id} "
-                f"passed={item.passed} e_under={item.e_under:.3f} forced={item.forced_accept}"
+                f"passed={item.passed} e_under={item.e_under:.3f} forced={item.forced_accept} "
+                f"dubins_fallback={item.dubins_used_fallback} detail={fallback}"
             )
 
         lines.append("Coordination logs:")

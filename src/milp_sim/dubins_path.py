@@ -24,6 +24,8 @@ class DubinsHybridMeta:
     dubins_segments: int
     sample_count: int
     dubins_ratio: float
+    fallback_reason: str = ""
+    fallback_details: str = ""
 
 
 def _mod2pi(angle: float) -> float:
@@ -238,6 +240,24 @@ def _polyline_collision_free(points: List[Point2D], world: WorldMap, margin: flo
     return not line.intersects(world.obstacle_union)
 
 
+def _format_reason_counts(reason_counts: Dict[str, int]) -> str:
+    if not reason_counts:
+        return ""
+    return "|".join(f"{reason}:{reason_counts[reason]}" for reason in sorted(reason_counts))
+
+
+def _primary_reason(reason_counts: Dict[str, int]) -> str:
+    if not reason_counts:
+        return ""
+    return sorted(reason_counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
+
+
+def _bump_reason(reason_counts: Dict[str, int], reason: str) -> None:
+    if not reason:
+        return
+    reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+
 def _shortcut_smooth_path(path: List[Point2D], world: WorldMap, margin: float) -> List[Point2D]:
     if len(path) <= 2:
         return path
@@ -333,32 +353,34 @@ def _build_corner_fillet(
     world: WorldMap,
     margin: float,
     force_mode: bool,
-) -> Optional[_CornerFillet]:
+) -> Tuple[Optional[_CornerFillet], str]:
     vin_raw = _sub(corner_pt, prev_pt)
     vout_raw = _sub(next_pt, corner_pt)
     len_in = _norm(vin_raw)
     len_out = _norm(vout_raw)
     if len_in <= 1e-9 or len_out <= 1e-9:
-        return None
+        return None, "degenerate_segment"
 
     vin = _unit(vin_raw)
     vout = _unit(vout_raw)
     if vin is None or vout is None:
-        return None
+        return None, "degenerate_segment"
 
     dot = max(-1.0, min(1.0, vin[0] * vout[0] + vin[1] * vout[1]))
     phi = math.acos(dot)
-    if phi <= 1e-3 or abs(math.pi - phi) <= 1e-3:
-        return None
+    if phi <= 1e-3:
+        return None, "straight_corner"
+    if abs(math.pi - phi) <= 1e-3:
+        return None, "uturn_corner"
 
     tan_half = math.tan(phi / 2.0)
     if abs(tan_half) <= 1e-9:
-        return None
+        return None, "uturn_corner"
 
     r_max = max(0.0, min(len_in, len_out) * tan_half * 0.98)
     r_eff = min(radius, r_max)
     if r_eff <= 1e-4:
-        return None
+        return None, "radius_too_small"
 
     t = r_eff / tan_half
     t_in = _sub(corner_pt, _scale(vin, t))
@@ -366,15 +388,15 @@ def _build_corner_fillet(
 
     cross = vin[0] * vout[1] - vin[1] * vout[0]
     if abs(cross) <= 1e-9:
-        return None
+        return None, "straight_corner"
     left_turn = cross > 0.0
     n_in = _left_normal(vin) if left_turn else _right_normal(vin)
     center = _add(t_in, _scale(n_in, r_eff))
 
     arc = _sample_arc(center=center, radius=r_eff, start=t_in, end=t_out, left_turn=left_turn, step=step)
     if not force_mode and not _collision_free(arc, world=world, margin=margin):
-        return None
-    return _CornerFillet(t_in=t_in, t_out=t_out, arc_points=arc)
+        return None, "corner_collision"
+    return _CornerFillet(t_in=t_in, t_out=t_out, arc_points=arc), ""
 
 
 def _build_fillet_polyline(
@@ -384,13 +406,14 @@ def _build_fillet_polyline(
     world: WorldMap,
     margin: float,
     force_mode: bool,
-) -> Tuple[List[Point2D], int, int]:
+) -> Tuple[List[Point2D], int, int, Dict[str, int]]:
     if len(path) < 3:
-        return path, 0, 0
+        return path, 0, 0, {}
 
     corners: Dict[int, _CornerFillet] = {}
+    rejected_reasons: Dict[int, str] = {}
     for i in range(1, len(path) - 1):
-        fillet = _build_corner_fillet(
+        fillet, reject_reason = _build_corner_fillet(
             prev_pt=path[i - 1],
             corner_pt=path[i],
             next_pt=path[i + 1],
@@ -402,6 +425,8 @@ def _build_fillet_polyline(
         )
         if fillet is not None:
             corners[i] = fillet
+        elif reject_reason:
+            rejected_reasons[i] = reject_reason
 
     # Resolve overlap between adjacent corner fillets on short middle segments.
     # If both sides cut too much on one segment, keep only one corner to avoid
@@ -418,8 +443,10 @@ def _build_fillet_polyline(
             if seg_len <= 1e-9:
                 if start_corner is not None:
                     del corners[seg_idx]
+                    rejected_reasons[seg_idx] = "adjacent_overlap"
                 if end_corner is not None:
                     del corners[seg_idx + 1]
+                    rejected_reasons[seg_idx + 1] = "adjacent_overlap"
                 changed = True
                 break
 
@@ -438,12 +465,16 @@ def _build_fillet_polyline(
                 if start_corner is not None and end_corner is not None:
                     if start_cut >= end_cut:
                         del corners[seg_idx]
+                        rejected_reasons[seg_idx] = "adjacent_overlap"
                     else:
                         del corners[seg_idx + 1]
+                        rejected_reasons[seg_idx + 1] = "adjacent_overlap"
                 elif start_corner is not None:
                     del corners[seg_idx]
+                    rejected_reasons[seg_idx] = "adjacent_overlap"
                 else:
                     del corners[seg_idx + 1]
+                    rejected_reasons[seg_idx + 1] = "adjacent_overlap"
                 changed = True
                 break
         if not changed:
@@ -466,7 +497,25 @@ def _build_fillet_polyline(
                 if _norm(_sub(p, out[-1])) > 1e-8:
                     out.append(p)
 
-    return out, len(corners), (len(path) - 2 - len(corners))
+    fallback_reason_counts: Dict[str, int] = {}
+    fallback_count = 0
+    fallback_reasons = {
+        "adjacent_overlap",
+        "corner_collision",
+        "radius_too_small",
+        "uturn_corner",
+        "missing_corner_status",
+    }
+    for i in range(1, len(path) - 1):
+        if i in corners:
+            continue
+        reason = rejected_reasons.get(i, "missing_corner_status")
+        if reason not in fallback_reasons:
+            continue
+        fallback_count += 1
+        _bump_reason(fallback_reason_counts, reason)
+
+    return out, len(corners), fallback_count, fallback_reason_counts
 
 
 def _dir8(a: Point2D, b: Point2D) -> Tuple[int, int]:
@@ -525,6 +574,8 @@ def build_dubins_hybrid_path(
                 dubins_segments=0,
                 sample_count=0,
                 dubins_ratio=0.0,
+                fallback_reason="astar_unreachable",
+                fallback_details="astar_unreachable:1",
             ),
         )
 
@@ -568,6 +619,7 @@ def build_dubins_hybrid_path(
         )
 
     if len(sparse_path) == 2:
+        direct_reason = "direct_no_solution"
         dubins_sol = _build_shortest_dubins_local(start_pose=start_pose, goal_pose=goal_pose, turn_radius=turn_radius)
         if dubins_sol is not None:
             word, params = dubins_sol
@@ -585,7 +637,7 @@ def build_dubins_hybrid_path(
                 dubins_points,
                 world=world,
                 margin=cfg.dubins_collision_margin,
-            ):
+                ):
                 dubins_len = _polyline_length(dubins_points)
                 straight_len = math.hypot(goal_pose[0] - start_pose[0], goal_pose[1] - start_pose[1])
                 added_curve = max(0.0, dubins_len - straight_len)
@@ -601,6 +653,7 @@ def build_dubins_hybrid_path(
                         dubins_ratio=ratio,
                     ),
                 )
+            direct_reason = "direct_collision"
 
         if cfg.dubins_fallback_to_astar:
             return (
@@ -612,6 +665,8 @@ def build_dubins_hybrid_path(
                     dubins_segments=0,
                     sample_count=len(base_path),
                     dubins_ratio=0.0,
+                    fallback_reason=direct_reason,
+                    fallback_details=f"{direct_reason}:1",
                 ),
             )
         return (
@@ -623,10 +678,12 @@ def build_dubins_hybrid_path(
                 dubins_segments=0,
                 sample_count=0,
                 dubins_ratio=0.0,
+                fallback_reason=direct_reason,
+                fallback_details=f"{direct_reason}:1",
             ),
         )
 
-    fillet_points, fillet_count, fallback_count = _build_fillet_polyline(
+    fillet_points, fillet_count, fallback_count, fallback_reason_counts = _build_fillet_polyline(
         path=sparse_path,
         turn_radius=turn_radius,
         sample_step=cfg.dubins_sample_step,
@@ -644,6 +701,8 @@ def build_dubins_hybrid_path(
                 dubins_segments=fillet_count,
                 sample_count=0,
                 dubins_ratio=0.0,
+                fallback_reason=_primary_reason(fallback_reason_counts),
+                fallback_details=_format_reason_counts(fallback_reason_counts),
             ),
         )
     out_points = fillet_points
@@ -655,6 +714,8 @@ def build_dubins_hybrid_path(
         world=world,
         margin=cfg.dubins_collision_margin,
     ):
+        final_reason_counts = dict(fallback_reason_counts)
+        _bump_reason(final_reason_counts, "final_collision")
         rejected_segments = max(1, fallback_count)
         if cfg.dubins_fallback_to_astar:
             return (
@@ -666,6 +727,8 @@ def build_dubins_hybrid_path(
                     dubins_segments=fillet_count,
                     sample_count=len(base_path),
                     dubins_ratio=0.0,
+                    fallback_reason="final_collision",
+                    fallback_details=_format_reason_counts(final_reason_counts),
                 ),
             )
         return (
@@ -677,6 +740,8 @@ def build_dubins_hybrid_path(
                 dubins_segments=fillet_count,
                 sample_count=0,
                 dubins_ratio=0.0,
+                fallback_reason="final_collision",
+                fallback_details=_format_reason_counts(final_reason_counts),
             ),
         )
 
@@ -700,5 +765,7 @@ def build_dubins_hybrid_path(
         dubins_segments=fillet_count,
         sample_count=len(out_points),
         dubins_ratio=ratio,
+        fallback_reason=_primary_reason(fallback_reason_counts),
+        fallback_details=_format_reason_counts(fallback_reason_counts),
     )
     return out_points, total_len, meta

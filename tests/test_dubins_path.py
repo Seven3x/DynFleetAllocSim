@@ -104,6 +104,8 @@ class TestDubinsPath(unittest.TestCase):
         self.assertTrue(math.isfinite(length))
         self.assertTrue(meta.used_fallback)
         self.assertGreater(meta.fallback_segments, 0)
+        self.assertEqual(meta.fallback_reason, "direct_collision")
+        self.assertIn("direct_collision:1", meta.fallback_details)
 
     def test_hybrid_returns_inf_when_fallback_disabled_and_collision_strict(self) -> None:
         cfg = replace(
@@ -176,6 +178,39 @@ class TestDubinsPath(unittest.TestCase):
         self.assertTrue(math.isfinite(length))
         self.assertGreater(length, line_len)
         self.assertGreater(meta.dubins_segments, 0)
+
+    def test_overlap_rejection_reports_adjacent_overlap_reason(self) -> None:
+        cfg = replace(
+            DEFAULT_CONFIG,
+            use_dubins_hybrid=True,
+            astar_smooth_before_dubins=False,
+            dubins_fallback_to_astar=True,
+            dubins_collision_margin=1.8,
+        )
+        start = (10.0, 10.0, 0.0)
+        goal = (21.0, 30.0, math.pi / 2.0)
+        path = [(10.0, 10.0), (20.0, 10.0), (21.0, 11.0), (21.0, 30.0)]
+        path_len = 0.0
+        for i in range(len(path) - 1):
+            path_len += math.hypot(path[i + 1][0] - path[i][0], path[i + 1][1] - path[i][1])
+
+        points, length, meta = build_dubins_hybrid_path(
+            world=self.world,
+            cfg=cfg,
+            start_pose=start,
+            goal_pose=goal,
+            astar_planner=self.planner,
+            turn_radius=10.0,
+            astar_path=path,
+            astar_length=path_len,
+        )
+
+        self.assertGreater(len(points), 1)
+        self.assertTrue(math.isfinite(length))
+        self.assertTrue(meta.used_fallback)
+        self.assertEqual(meta.fallback_segments, 1)
+        self.assertEqual(meta.fallback_reason, "adjacent_overlap")
+        self.assertIn("adjacent_overlap:1", meta.fallback_details)
 
     def test_seeded_session_routes_do_not_cross_obstacles(self) -> None:
         cfg = replace(

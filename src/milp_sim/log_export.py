@@ -19,12 +19,16 @@ def write_coordination_log(path: Path, coordination_logs: Iterable[CoordinationL
 
 def write_verification_log(path: Path, verification_logs: Iterable[VerificationLog]) -> None:
     with path.open("w", encoding="utf-8") as f:
-        f.write("round,task_id,vehicle_id,c_hat,c_tilde,e_under,passed,forced_accept\n")
+        f.write(
+            "round,task_id,vehicle_id,c_hat,c_tilde,e_under,passed,forced_accept,"
+            "dubins_used_fallback,dubins_fallback_details\n"
+        )
         for item in verification_logs:
+            details = str(item.dubins_fallback_details).replace("\n", "\\n").replace(",", ";")
             f.write(
                 f"{item.round_idx},{item.task_id},{item.vehicle_id},"
                 f"{item.c_hat:.6f},{item.c_tilde:.6f},{item.e_under:.6f},"
-                f"{item.passed},{item.forced_accept}\n"
+                f"{item.passed},{item.forced_accept},{item.dubins_used_fallback},{details}\n"
             )
 
 

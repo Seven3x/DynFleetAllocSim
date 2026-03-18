@@ -85,6 +85,9 @@ class SimulationConfig:
     preempt_gain_threshold: float = 0.20
     # When False, in-progress tasks are never released by soft preempt.
     online_allow_active_task_preempt: bool = False
+    # Weight applied to already-committed prefix execution time during bidding/verification.
+    # Set to 0 to ignore prefix cost entirely and skip prefix estimation calls.
+    committed_prefix_time_weight: float = 0.0
     online_task_reach_tolerance: float = 0.25
     # Number of future tasks kept/visualized beyond the current in-progress task.
     online_future_task_horizon: int = 3
@@ -100,6 +103,8 @@ class SimulationConfig:
     def __post_init__(self) -> None:
         if int(self.online_new_task_replan_batch_size) < 1:
             raise ValueError("online_new_task_replan_batch_size must be >= 1")
+        if float(self.committed_prefix_time_weight) < 0.0:
+            raise ValueError("committed_prefix_time_weight must be >= 0")
 
 
 DEFAULT_CONFIG = SimulationConfig()
