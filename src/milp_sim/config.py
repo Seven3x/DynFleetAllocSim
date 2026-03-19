@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import math
 from dataclasses import dataclass
 
@@ -5,6 +7,7 @@ from dataclasses import dataclass
 @dataclass
 class SimulationConfig:
     seed: int = 7
+    scenario_file: str | None = None
 
     map_width: float = 100.0
     map_height: float = 100.0
@@ -107,6 +110,8 @@ class SimulationConfig:
     figure_size: tuple = (11, 10)
 
     def __post_init__(self) -> None:
+        if self.scenario_file is not None and not str(self.scenario_file).strip():
+            raise ValueError("scenario_file must be a non-empty path when provided")
         if int(self.online_new_task_replan_batch_size) < 1:
             raise ValueError("online_new_task_replan_batch_size must be >= 1")
         if float(self.committed_prefix_time_weight) < 0.0:

@@ -10,6 +10,7 @@ from .cost_estimator import (
     heading_to_point,
     wrap_to_pi,
 )
+from .debug import debug_log
 from .dubins_path import build_dubins_hybrid_path
 from .entities import Task, Vehicle
 from .map_utils import WorldMap
@@ -189,9 +190,19 @@ class AllocationEngine:
         self._apply_canceled_record(task_id=task_id, step=step, message="canceled and removed from vehicle sequence")
 
     def allocate_until_stable(self, phase: str) -> None:
+        debug_log(
+            f"allocate_until_stable start phase={phase} "
+            f"pending={sum(1 for t in self.tasks if t.status in AUCTIONABLE_STATES)}"
+        )
         guard = 0
         while self._has_pending_auction_tasks():
             guard += 1
+            if guard == 1 or guard % 25 == 0:
+                debug_log(
+                    f"allocate_until_stable phase={phase} iter={guard} "
+                    f"pending={sum(1 for t in self.tasks if t.status in AUCTIONABLE_STATES)} "
+                    f"locked={sum(1 for t in self.tasks if t.status == 'locked')}"
+                )
             if guard > 3000:
                 raise RuntimeError("Auction loop exceeded safety limit.")
 
@@ -214,6 +225,11 @@ class AllocationEngine:
             self._run_neighbor_sync_for_winners(bids=bids, winners=winners, event=f"{phase}:auction")
             self._verify_tentatives(phase=phase)
             self._round_idx += 1
+        debug_log(
+            f"allocate_until_stable done phase={phase} iters={guard} "
+            f"locked={sum(1 for t in self.tasks if t.status == 'locked')} "
+            f"withdrawn={sum(1 for t in self.tasks if t.status == 'withdrawn')}"
+        )
 
     def finalize(self) -> AllocationResult:
         self._build_routes_and_time()

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from pathlib import Path
 
 from .config import DEFAULT_CONFIG, SimulationConfig
+from .debug import debug_log
 from .log_export import write_auction_big_log, write_coordination_log, write_verification_log
 from .simulator import run_round2_pipeline
 from .visualization import plot_final_scene, plot_initial_scene
@@ -110,22 +112,32 @@ def main() -> None:
         action="store_true",
         help="start online Tkinter GUI for runtime replanning",
     )
+    parser.add_argument(
+        "--scenario-file",
+        default=None,
+        help="load scenario from .json/.yaml/.yml (world + vehicles + tasks) instead of random generation",
+    )
     args = parser.parse_args()
+    cfg = DEFAULT_CONFIG if args.scenario_file is None else replace(DEFAULT_CONFIG, scenario_file=args.scenario_file)
+    debug_log(
+        f"main entry mode=interactive:{args.interactive} gui:{args.gui} gui_online:{args.gui_online} "
+        f"scenario_file={cfg.scenario_file!r}"
+    )
 
     if args.interactive:
         from .interactive_console import run_interactive
 
-        run_interactive(DEFAULT_CONFIG)
+        run_interactive(cfg)
     elif args.gui:
         from .gui_app import run_offline_gui
 
-        run_offline_gui(DEFAULT_CONFIG)
+        run_offline_gui(cfg)
     elif args.gui_online:
         from .gui_app import run_online_gui
 
-        run_online_gui(DEFAULT_CONFIG)
+        run_online_gui(cfg)
     else:
-        run(DEFAULT_CONFIG)
+        run(cfg)
 
 
 if __name__ == "__main__":

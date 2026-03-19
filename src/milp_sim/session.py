@@ -17,6 +17,7 @@ from shapely.geometry import LineString, Point, Polygon
 from .auction_core import AllocationEngine, AllocationResult, EventLog
 from .config import DEFAULT_CONFIG, SimulationConfig
 from .cost_estimator import goal_heading_candidates, heading_to_point, wrap_to_pi
+from .debug import debug_log
 from .dubins_path import build_dubins_hybrid_path
 from .dynamic_events import generate_new_task
 from .entities import Task, Vehicle
@@ -142,8 +143,14 @@ class SimulationSession:
         self._offline_result_cache = None
 
     def _reset_core(self) -> None:
+        debug_log("SimulationSession._reset_core start")
         self._invalidate_offline_result_cache()
         self.artifacts = build_static_scenario(self.cfg)
+        debug_log(
+            "SimulationSession._reset_core scenario ready "
+            f"vehicles={len(self.artifacts.vehicles)} tasks={len(self.artifacts.tasks)} "
+            f"obstacles={len(self.artifacts.world.obstacles)}"
+        )
         self.engine = AllocationEngine(
             vehicles=self.artifacts.vehicles,
             tasks=self.artifacts.tasks,
@@ -152,7 +159,12 @@ class SimulationSession:
             planner=self.artifacts.planner,
         )
         self.engine.reset()
+        debug_log("SimulationSession._reset_core initial allocation begin")
         self.engine.allocate_until_stable("initial")
+        debug_log(
+            "SimulationSession._reset_core initial allocation done "
+            f"rounds={len(self.engine.auction_logs)} verifications={len(self.engine.verification_logs)}"
+        )
         self.step = 10_000
         self._undo_stack.clear()
 
@@ -171,6 +183,7 @@ class SimulationSession:
         self._frame_cursor = -1
         self._recorded_user_actions = []
         self._user_action_counter = 0
+        debug_log("SimulationSession._reset_core complete")
 
     def reset(self, replay_last_actions: bool = False) -> None:
         source_actions = self.replayable_user_actions()

@@ -3,8 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from dataclasses import replace
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, List, Literal, Tuple
 
@@ -22,6 +21,7 @@ from .entities import Point2D, Task, Vehicle
 from .map_utils import WorldMap
 from .obstacle_generator import generate_tasks, generate_vehicles, generate_world_map
 from .planner_astar import AStarPlanner
+from .scenario_loader import load_scenario_file
 
 
 ModeName = Literal["incremental_only", "prefix_aware"]
@@ -48,6 +48,7 @@ class ComparisonOutputs:
     image_path: Path
     summary_path: Path
     seed: int | None = None
+    scenario_file: str | None = None
 
 
 @dataclass
@@ -182,6 +183,20 @@ def _build_seeded_scenario(seed: int) -> _Scenario:
             return _Scenario(world=world, planner=planner, vehicles=vehicles, tasks=tasks)
 
     raise RuntimeError(f"failed to build a connected seeded scenario for seed={seed}")
+
+
+def _build_file_scenario(path: str | Path) -> _Scenario:
+    loaded = load_scenario_file(path)
+    planner = AStarPlanner(
+        world=loaded.world,
+        resolution=1.0,
+        inflation_radius=0.0,
+        connect_diagonal=True,
+    )
+    all_points = [vehicle.start_pos for vehicle in loaded.vehicles] + [task.position for task in loaded.tasks]
+    if not _points_fully_connected(planner, all_points):
+        raise RuntimeError(f"scenario file is not fully connected for A*: {path}")
+    return _Scenario(world=loaded.world, planner=planner, vehicles=loaded.vehicles, tasks=loaded.tasks)
 
 
 def _points_fully_connected(planner: AStarPlanner, points: List[Point2D]) -> bool:
@@ -440,12 +455,15 @@ def _write_summary(outputs: ComparisonOutputs) -> None:
         "image_path": str(outputs.image_path),
         "summary_path": str(outputs.summary_path),
         "seed": outputs.seed,
+        "scenario_file": outputs.scenario_file,
     }
     outputs.summary_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def _print_summary(outputs: ComparisonOutputs) -> None:
-    if outputs.seed is None:
+    if outputs.scenario_file is not None:
+        print(f"[scenario] file={outputs.scenario_file}")
+    elif outputs.seed is None:
         print("[scenario] fixed_complex")
     else:
         print(f"[scenario] seeded_random seed={outputs.seed}")
@@ -472,13 +490,27 @@ def _print_summary(outputs: ComparisonOutputs) -> None:
 def run_assignment_cost_experiment(
     output_dir: str | Path = "outputs",
     seed: int | None = None,
+    scenario_file: str | Path | None = None,
 ) -> ComparisonOutputs:
-    scenario = _build_fixed_scenario() if seed is None else _build_seeded_scenario(seed)
+    if seed is not None and scenario_file is not None:
+        raise ValueError("seed and scenario_file are mutually exclusive")
+
+    if scenario_file is not None:
+        scenario = _build_file_scenario(scenario_file)
+    else:
+        scenario = _build_fixed_scenario() if seed is None else _build_seeded_scenario(seed)
     baseline = _run_mode(scenario, mode="incremental_only")
     prefix_aware = _run_mode(scenario, mode="prefix_aware")
 
     output_root = Path(output_dir)
-    suffix = "" if seed is None else f"_seed_{seed}"
+    if scenario_file is not None:
+        stem = Path(scenario_file).stem
+        safe = "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in stem)
+        suffix = f"_file_{safe}" if safe else "_file"
+    elif seed is None:
+        suffix = ""
+    else:
+        suffix = f"_seed_{seed}"
     image_path = output_root / f"assignment_cost_comparison{suffix}.png"
     summary_path = output_root / f"assignment_cost_comparison_summary{suffix}.json"
 
@@ -488,6 +520,7 @@ def run_assignment_cost_experiment(
         image_path=image_path,
         summary_path=summary_path,
         seed=seed,
+        scenario_file=None if scenario_file is None else str(scenario_file),
     )
     _write_comparison_plot(
         scenario=scenario,
@@ -501,14 +534,24 @@ def run_assignment_cost_experiment(
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Compare auction costs with and without committed prefix path cost.")
-    parser.add_argument("--seed", type=int, default=None, help="Generate a seeded random complex scenario.")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--seed", type=int, default=None, help="Generate a seeded random complex scenario.")
+    source.add_argument(
+        "--scenario-file",
+        default=None,
+        help="Load scenario from .json/.yaml/.yml (world + vehicles + tasks).",
+    )
     parser.add_argument("--output-dir", default="outputs", help="Directory for PNG and JSON outputs.")
     return parser
 
 
 def main() -> None:
     args = _build_arg_parser().parse_args()
-    outputs = run_assignment_cost_experiment(output_dir=args.output_dir, seed=args.seed)
+    outputs = run_assignment_cost_experiment(
+        output_dir=args.output_dir,
+        seed=args.seed,
+        scenario_file=args.scenario_file,
+    )
     _print_summary(outputs)
 
 
