@@ -14,6 +14,7 @@ from .dubins_path import build_dubins_hybrid_path
 from .entities import Task, Vehicle
 from .map_utils import WorldMap
 from .neighbor_coordination import CoordinationLog, TaskRecord, build_neighbors, run_coordination
+from .path_postprocess import maybe_buffer_initial_turn_path, resample_path
 from .planner_astar import AStarPlanner
 from .verification import VerificationResult, verify_bid
 
@@ -493,6 +494,15 @@ class AllocationEngine:
                     dubins_fallback_details=verify_res.dubins_fallback_details,
                 )
             )
+            if verify_res.debug_message:
+                self.event_logs.append(
+                    EventLog(
+                        step=self._round_idx,
+                        event_type="verify_plan_debug",
+                        task_id=task.id,
+                        message=verify_res.debug_message,
+                    )
+                )
 
             if verify_res.passed:
                 self._lock_task(task=task, vehicle=vehicle, bid=c_hat)
@@ -676,6 +686,32 @@ class AllocationEngine:
                     raise RuntimeError(
                         f"Hybrid planning failed for vehicle={v.id}, task={tid}, from={cur} to={task.position}."
                     )
+
+                path, length = maybe_buffer_initial_turn_path(
+                    world=self.world,
+                    cfg=self.cfg,
+                    planner=self.planner,
+                    start_pos=cur,
+                    start_heading=cur_heading,
+                    task_pos=task.position,
+                    path=path,
+                    length=length,
+                    goal_heading=best_goal_heading,
+                    turn_radius=turn_radius,
+                )
+                runtime_step = max(
+                    0.05,
+                    float(
+                        getattr(
+                            self.cfg,
+                            "online_path_sample_step",
+                            min(0.25, float(getattr(self.cfg, "dubins_sample_step", 0.5))),
+                        )
+                    ),
+                )
+                path = resample_path(path, max_step=runtime_step)
+                path[0] = cur
+                path[-1] = task.position
 
                 if len(path) > 1:
                     v.route_points.extend(path[1:])

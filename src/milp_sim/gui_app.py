@@ -47,6 +47,10 @@ class _BaseGuiApp:
         self.refresh_interval_ms = 500
         self.render_refresh_interval_ms = 40
         self.log_count_var = tk.StringVar(value="8")
+        self.add_demand_var = tk.StringVar(value="2")
+        self.add_task_id_var = tk.StringVar(value="")
+        self.random_demand_var = tk.StringVar(value="")
+        self.cancel_task_id_var = tk.StringVar(value="")
         self.obstacle_point_count_var = tk.StringVar(value="0")
         self.obstacle_mode_var = tk.StringVar(value="OFF")
         self.task_mode_var = tk.StringVar(value="OFF")
@@ -69,6 +73,15 @@ class _BaseGuiApp:
         self.left_canvas: tk.Canvas | None = None
         self.left_canvas_window: int | None = None
         self.left_controls_frame: ttk.Frame | None = None
+        self.obstacle_remove_combo = None
+        self.status_text: ScrolledText | None = None
+        self.tasks_text: ScrolledText | None = None
+        self.logs_text: ScrolledText | None = None
+        self.comparison_figure = None
+        self.comparison_canvas = None
+        self.compare_ax_with = None
+        self.compare_ax_without = None
+        self.secondary_ax = None
 
         self._build_layout()
         self._refresh_all()
@@ -123,28 +136,73 @@ class _BaseGuiApp:
         self.root.minsize(min(width, 1120), min(height, 700))
 
     def _build_layout(self) -> None:
+        if self.enable_online_runtime:
+            self.root.columnconfigure(0, weight=0)
+            self.root.columnconfigure(1, weight=3)
+            self.root.columnconfigure(2, weight=2)
+            self.root.rowconfigure(0, weight=1)
+
+            left = ttk.Frame(self.root, padding=(10, 10, 4, 10))
+            center = ttk.Frame(self.root, padding=8)
+            right = ttk.Frame(self.root, padding=10)
+
+            left.grid(row=0, column=0, sticky="ns")
+            center.grid(row=0, column=1, sticky="nsew")
+            right.grid(row=0, column=2, sticky="nsew")
+
+            left.rowconfigure(0, weight=1)
+            left.columnconfigure(0, weight=1)
+            center.rowconfigure(0, weight=1)
+            center.columnconfigure(0, weight=1)
+
+            right.rowconfigure(0, weight=1)
+            right.rowconfigure(1, weight=1)
+            right.rowconfigure(2, weight=1)
+            right.columnconfigure(0, weight=1)
+
+            left_canvas = tk.Canvas(
+                left,
+                background="#e9edf2",
+                borderwidth=0,
+                highlightthickness=0,
+                width=320,
+            )
+            left_scrollbar = ttk.Scrollbar(left, orient="vertical", command=left_canvas.yview)
+            left_controls = ttk.Frame(left_canvas)
+
+            left_canvas.grid(row=0, column=0, sticky="nsew")
+            left_scrollbar.grid(row=0, column=1, sticky="ns")
+            left_canvas.configure(yscrollcommand=left_scrollbar.set)
+
+            self.left_canvas = left_canvas
+            self.left_controls_frame = left_controls
+            self.left_canvas_window = left_canvas.create_window((0, 0), window=left_controls, anchor="nw")
+
+            left_controls.bind("<Configure>", self._on_left_controls_configure)
+            left_canvas.bind("<Configure>", self._on_left_canvas_configure)
+            self.root.bind_all("<MouseWheel>", self._on_left_panel_mousewheel, add="+")
+            self.root.bind_all("<Button-4>", self._on_left_panel_mousewheel, add="+")
+            self.root.bind_all("<Button-5>", self._on_left_panel_mousewheel, add="+")
+
+            self._build_left_controls(left_controls)
+            self._build_center_plot(center)
+            self._build_right_panels(right)
+            return
+
         self.root.columnconfigure(0, weight=0)
-        self.root.columnconfigure(1, weight=3)
-        self.root.columnconfigure(2, weight=2)
+        self.root.columnconfigure(1, weight=1)
         self.root.rowconfigure(0, weight=1)
 
         left = ttk.Frame(self.root, padding=(10, 10, 4, 10))
         center = ttk.Frame(self.root, padding=8)
-        right = ttk.Frame(self.root, padding=10)
 
         left.grid(row=0, column=0, sticky="ns")
         center.grid(row=0, column=1, sticky="nsew")
-        right.grid(row=0, column=2, sticky="nsew")
 
         left.rowconfigure(0, weight=1)
         left.columnconfigure(0, weight=1)
         center.rowconfigure(0, weight=1)
         center.columnconfigure(0, weight=1)
-
-        right.rowconfigure(0, weight=1)
-        right.rowconfigure(1, weight=1)
-        right.rowconfigure(2, weight=1)
-        right.columnconfigure(0, weight=1)
 
         left_canvas = tk.Canvas(
             left,
@@ -172,7 +230,6 @@ class _BaseGuiApp:
 
         self._build_left_controls(left_controls)
         self._build_center_plot(center)
-        self._build_right_panels(right)
 
     def _on_left_controls_configure(self, _event) -> None:
         if self.left_canvas is None:
@@ -303,9 +360,6 @@ class _BaseGuiApp:
         add_frame = ttk.LabelFrame(parent, text="Add Task", padding=8)
         add_frame.pack(fill="x", pady=8)
 
-        self.add_demand_var = tk.StringVar(value="2")
-        self.add_task_id_var = tk.StringVar(value="")
-
         ttk.Label(add_frame, text="click mode").grid(row=0, column=0, sticky="w")
         ttk.Label(add_frame, textvariable=self.task_mode_var).grid(row=0, column=1, sticky="w")
 
@@ -324,7 +378,6 @@ class _BaseGuiApp:
         random_frame = ttk.LabelFrame(parent, text="Add Random Task", padding=8)
         random_frame.pack(fill="x", pady=8)
 
-        self.random_demand_var = tk.StringVar(value="")
         ttk.Label(random_frame, text="demand(opt)").grid(row=0, column=0, sticky="w")
         ttk.Entry(random_frame, textvariable=self.random_demand_var, width=12).grid(
             row=0, column=1, sticky="ew"
@@ -339,7 +392,6 @@ class _BaseGuiApp:
         cancel_frame = ttk.LabelFrame(parent, text="Cancel Task", padding=8)
         cancel_frame.pack(fill="x", pady=8)
 
-        self.cancel_task_id_var = tk.StringVar(value="")
         ttk.Label(cancel_frame, text="task_id").grid(row=0, column=0, sticky="w")
         ttk.Entry(cancel_frame, textvariable=self.cancel_task_id_var, width=12).grid(
             row=0, column=1, sticky="ew"
@@ -367,9 +419,16 @@ class _BaseGuiApp:
 
     def _build_center_plot(self, parent) -> None:
         plt.style.use("seaborn-v0_8-whitegrid")
-        self.figure = plt.Figure(figsize=(8, 8), dpi=130)
-        self.ax = self.figure.add_subplot(111)
-        self.figure.subplots_adjust(left=0.05, right=0.985, bottom=0.05, top=0.96)
+        if self.enable_online_runtime:
+            self.figure = plt.Figure(figsize=(8, 8), dpi=130)
+            self.ax = self.figure.add_subplot(111)
+            self.secondary_ax = None
+            self.figure.subplots_adjust(left=0.05, right=0.985, bottom=0.05, top=0.96)
+        else:
+            self.figure = plt.Figure(figsize=(12, 6.4), dpi=130)
+            self.ax = self.figure.add_subplot(121)
+            self.secondary_ax = self.figure.add_subplot(122)
+            self.figure.subplots_adjust(left=0.04, right=0.985, bottom=0.05, top=0.94, wspace=0.08)
         self.canvas = FigureCanvasTkAgg(self.figure, master=parent)
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
         self.canvas.mpl_connect("button_press_event", self._on_canvas_press)
@@ -394,20 +453,27 @@ class _BaseGuiApp:
         if ylim is not None:
             self.ax.set_ylim(*ylim)
 
+    def _plot_axes(self) -> list:
+        axes = [self.ax]
+        if self.secondary_ax is not None:
+            axes.append(self.secondary_ax)
+        return axes
+
+    def _event_axis(self, event):
+        for axis in self._plot_axes():
+            if event.inaxes == axis:
+                return axis
+        return None
+
     def _build_right_panels(self, parent) -> None:
-        status_title = "Online Status" if self.enable_online_runtime else "Status & Comparison"
+        status_title = "Online Status" if self.enable_online_runtime else "Status"
         status_frame = ttk.LabelFrame(parent, text=status_title, padding=6)
         status_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
         status_frame.rowconfigure(0, weight=1)
         status_frame.columnconfigure(0, weight=1)
 
-        logs_frame = ttk.LabelFrame(parent, text="Recent Logs", padding=6)
-        logs_frame.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
-        logs_frame.rowconfigure(0, weight=1)
-        logs_frame.columnconfigure(0, weight=1)
-
         tasks_frame = ttk.LabelFrame(parent, text="Tasks", padding=6)
-        tasks_frame.grid(row=2, column=0, sticky="nsew")
+        tasks_frame.grid(row=1 if not self.enable_online_runtime else 2, column=0, sticky="nsew")
         tasks_frame.rowconfigure(0, weight=1)
         tasks_frame.columnconfigure(0, weight=1)
 
@@ -423,17 +489,22 @@ class _BaseGuiApp:
         )
         self.status_text.grid(row=0, column=0, sticky="nsew")
 
-        self.logs_text = ScrolledText(
-            logs_frame,
-            wrap="word",
-            font=("Cascadia Mono", 10),
-            bg="#f8fafc",
-            fg="#0f172a",
-            insertbackground="#0f172a",
-            relief="flat",
-            borderwidth=0,
-        )
-        self.logs_text.grid(row=0, column=0, sticky="nsew")
+        if self.enable_online_runtime:
+            middle_frame = ttk.LabelFrame(parent, text="Recent Logs", padding=6)
+            middle_frame.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
+            middle_frame.rowconfigure(0, weight=1)
+            middle_frame.columnconfigure(0, weight=1)
+            self.logs_text = ScrolledText(
+                middle_frame,
+                wrap="word",
+                font=("Cascadia Mono", 10),
+                bg="#f8fafc",
+                fg="#0f172a",
+                insertbackground="#0f172a",
+                relief="flat",
+                borderwidth=0,
+            )
+            self.logs_text.grid(row=0, column=0, sticky="nsew")
 
         self.tasks_text = ScrolledText(
             tasks_frame,
@@ -469,6 +540,70 @@ class _BaseGuiApp:
         return int(v)
 
     def _refresh_map(self) -> None:
+        if not self.enable_online_runtime:
+            assert self.secondary_ax is not None
+            self.session.draw_comparison_on_axes(self.ax, self.secondary_ax)
+            axes = self._plot_axes()
+            if self.dragging_task_id is not None and self.drag_preview_pos is not None:
+                x, y = self.drag_preview_pos
+                for axis in axes:
+                    axis.scatter([x], [y], s=80, marker="x", color="#be123c", linewidth=2.0, zorder=15)
+                    axis.text(
+                        x,
+                        y,
+                        f"  T{self.dragging_task_id}",
+                        fontsize=9,
+                        color="#9f1239",
+                        ha="left",
+                        va="bottom",
+                        zorder=16,
+                    )
+            if self.obstacle_points:
+                xs = [p[0] for p in self.obstacle_points]
+                ys = [p[1] for p in self.obstacle_points]
+                for axis in axes:
+                    axis.scatter(xs, ys, s=35, color="#0ea5e9", edgecolor="white", linewidth=0.5, zorder=8)
+                    axis.plot(xs, ys, color="#0ea5e9", linewidth=1.5, linestyle="--", zorder=7)
+                    if len(self.obstacle_points) >= 3:
+                        axis.plot(
+                            [self.obstacle_points[-1][0], self.obstacle_points[0][0]],
+                            [self.obstacle_points[-1][1], self.obstacle_points[0][1]],
+                            color="#0ea5e9",
+                            linewidth=1.5,
+                            linestyle="--",
+                            zorder=7,
+                        )
+            if self.obstacle_draw_mode:
+                for axis in axes:
+                    axis.text(
+                        0.01,
+                        0.98,
+                        "Obstacle Draw Mode: ON (click map to add points)",
+                        transform=axis.transAxes,
+                        ha="left",
+                        va="top",
+                        fontsize=9,
+                        color="#0f172a",
+                        bbox=dict(boxstyle="round,pad=0.2", facecolor="#dbeafe", alpha=0.8, edgecolor="none"),
+                        zorder=20,
+                    )
+            if self.task_click_mode:
+                for axis in axes:
+                    axis.text(
+                        0.01,
+                        0.92,
+                        "Task Click Mode: ON (click map to add task)",
+                        transform=axis.transAxes,
+                        ha="left",
+                        va="top",
+                        fontsize=9,
+                        color="#0f172a",
+                        bbox=dict(boxstyle="round,pad=0.2", facecolor="#dcfce7", alpha=0.85, edgecolor="none"),
+                        zorder=20,
+                    )
+            self.canvas.draw_idle()
+            return
+
         prev_view = self._capture_map_view_state()
         render_state = self._interpolated_online_render_state() if self.enable_online_runtime else None
         self.session.draw_on_axis(self.ax, render_state=render_state)
@@ -529,9 +664,10 @@ class _BaseGuiApp:
         self._map_view_state = self._capture_map_view_state()
         self.canvas.draw_idle()
 
-    def _pick_task_id_near(self, x: float, y: float, ratio: float = 0.03) -> int | None:
-        x_min, x_max = self.ax.get_xlim()
-        y_min, y_max = self.ax.get_ylim()
+    def _pick_task_id_near(self, x: float, y: float, axis=None, ratio: float = 0.03) -> int | None:
+        plot_axis = axis or self.ax
+        x_min, x_max = plot_axis.get_xlim()
+        y_min, y_max = plot_axis.get_ylim()
         tol = ratio * max(abs(x_max - x_min), abs(y_max - y_min))
         tol2 = tol * tol
 
@@ -552,17 +688,18 @@ class _BaseGuiApp:
     def _refresh_text_panels(self) -> None:
         log_n = self._parse_optional_int(self.log_count_var.get()) or 8
         status_text = self.session.format_status_text()
-        if status_text != self._last_status_text:
+        if self.status_text is not None and status_text != self._last_status_text:
             self._set_text(self.status_text, status_text)
             self._last_status_text = status_text
 
-        logs_text = self.session.format_logs_text(n=log_n)
-        if logs_text != self._last_logs_text:
-            self._set_text(self.logs_text, logs_text)
-            self._last_logs_text = logs_text
+        if self.enable_online_runtime and self.logs_text is not None:
+            logs_text = self.session.format_logs_text(n=log_n)
+            if logs_text != self._last_logs_text:
+                self._set_text(self.logs_text, logs_text)
+                self._last_logs_text = logs_text
 
         tasks_text = self.session.format_tasks_text(limit=80)
-        if tasks_text != self._last_tasks_text:
+        if self.tasks_text is not None and tasks_text != self._last_tasks_text:
             self._set_text(self.tasks_text, tasks_text)
             self._last_tasks_text = tasks_text
 
@@ -578,16 +715,51 @@ class _BaseGuiApp:
             self.replan_reason_var.set(snap.last_replan_reason or "-")
         obstacles = self.session.list_obstacles()
         values = [str(idx) for idx, _ in obstacles]
-        self.obstacle_remove_combo.configure(values=values)
-        if values and self.obstacle_remove_var.get() not in values:
-            self.obstacle_remove_var.set(values[0])
-        if not values:
-            self.obstacle_remove_var.set("")
+        if self.obstacle_remove_combo is not None:
+            self.obstacle_remove_combo.configure(values=values)
+            if values and self.obstacle_remove_var.get() not in values:
+                self.obstacle_remove_var.set(values[0])
+            if not values:
+                self.obstacle_remove_var.set("")
+
+    def _refresh_offline_comparison(self) -> None:
+        if self.enable_online_runtime or self.comparison_canvas is None:
+            return
+        try:
+            self.session.draw_comparison_on_axes(self.compare_ax_with, self.compare_ax_without)
+            self.comparison_canvas.draw_idle()
+        except Exception:
+            self.compare_ax_with.clear()
+            self.compare_ax_without.clear()
+            self.compare_ax_with.set_axis_off()
+            self.compare_ax_without.set_axis_off()
+            self.compare_ax_with.text(
+                0.5,
+                0.5,
+                "Comparison unavailable",
+                ha="center",
+                va="center",
+                fontsize=11,
+                color="#991b1b",
+                transform=self.compare_ax_with.transAxes,
+            )
+            self.compare_ax_without.text(
+                0.5,
+                0.5,
+                "Check status panel for details",
+                ha="center",
+                va="center",
+                fontsize=10,
+                color="#374151",
+                transform=self.compare_ax_without.transAxes,
+            )
+            self.comparison_canvas.draw_idle()
 
     def _refresh_all(self) -> None:
         try:
             self._refresh_map()
             self._refresh_text_panels()
+            self._refresh_offline_comparison()
         except Exception as exc:
             messagebox.showerror("Refresh Error", str(exc))
 
@@ -680,6 +852,7 @@ class _BaseGuiApp:
                 or now - self._last_text_refresh_wall_ts >= 0.2
             ):
                 self._refresh_text_panels()
+                self._refresh_offline_comparison()
                 self._last_text_refresh_wall_ts = now
         except Exception as exc:
             messagebox.showerror("Refresh Error", str(exc))
@@ -848,7 +1021,8 @@ class _BaseGuiApp:
             messagebox.showerror("Cancel Error", str(exc))
 
     def _on_canvas_click(self, event) -> None:
-        if event.inaxes != self.ax:
+        axis = self._event_axis(event)
+        if axis is None:
             return
         if event.xdata is None or event.ydata is None:
             return
@@ -878,7 +1052,8 @@ class _BaseGuiApp:
                 messagebox.showerror("Task Click Add Error", str(exc))
 
     def _on_canvas_press(self, event) -> None:
-        if event.inaxes != self.ax:
+        axis = self._event_axis(event)
+        if axis is None:
             return
         if event.xdata is None or event.ydata is None:
             return
@@ -890,7 +1065,7 @@ class _BaseGuiApp:
         if button == 3:
             if self.obstacle_draw_mode or self.task_click_mode:
                 return
-            task_id = self._pick_task_id_near(x, y)
+            task_id = self._pick_task_id_near(x, y, axis=axis)
             if task_id is None:
                 return
             try:
@@ -908,7 +1083,7 @@ class _BaseGuiApp:
             self._on_canvas_click(event)
             return
 
-        task_id = self._pick_task_id_near(x, y)
+        task_id = self._pick_task_id_near(x, y, axis=axis)
         if task_id is None:
             return
 
@@ -926,7 +1101,7 @@ class _BaseGuiApp:
     def _on_canvas_motion(self, event) -> None:
         if self.dragging_task_id is None:
             return
-        if event.inaxes != self.ax:
+        if self._event_axis(event) is None:
             return
         if event.xdata is None or event.ydata is None:
             return

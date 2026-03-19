@@ -26,6 +26,7 @@ class DubinsHybridMeta:
     dubins_ratio: float
     fallback_reason: str = ""
     fallback_details: str = ""
+    debug_trace: str = ""
 
 
 def _mod2pi(angle: float) -> float:
@@ -256,6 +257,111 @@ def _bump_reason(reason_counts: Dict[str, int], reason: str) -> None:
     if not reason:
         return
     reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+
+def _sample_recovery_arc(
+    start_pose: Pose2D,
+    turn_radius: float,
+    delta_heading: float,
+    sample_step: float,
+) -> Tuple[List[Point2D], Pose2D]:
+    x0, y0, yaw0 = start_pose
+    if turn_radius <= 1e-9 or abs(delta_heading) <= 1e-9:
+        return [(x0, y0)], (x0, y0, yaw0)
+
+    left_turn = delta_heading > 0.0
+    if left_turn:
+        cx = x0 - turn_radius * math.sin(yaw0)
+        cy = y0 + turn_radius * math.cos(yaw0)
+    else:
+        cx = x0 + turn_radius * math.sin(yaw0)
+        cy = y0 - turn_radius * math.cos(yaw0)
+
+    arc_len = turn_radius * abs(delta_heading)
+    n = max(1, int(math.ceil(arc_len / max(sample_step, 1e-6))))
+    points: List[Point2D] = [(x0, y0)]
+    for k in range(1, n + 1):
+        yaw = yaw0 + delta_heading * (k / n)
+        if left_turn:
+            px = cx + turn_radius * math.sin(yaw)
+            py = cy - turn_radius * math.cos(yaw)
+        else:
+            px = cx - turn_radius * math.sin(yaw)
+            py = cy + turn_radius * math.cos(yaw)
+        points.append((px, py))
+
+    end_pose = (points[-1][0], points[-1][1], wrap_to_pi(yaw0 + delta_heading))
+    return points, end_pose
+
+
+def _try_direct_recovery_path(
+    start_pose: Pose2D,
+    goal_pose: Pose2D,
+    turn_radius: float,
+    sample_step: float,
+    world: WorldMap,
+    margin: float,
+) -> Tuple[List[Point2D], float, str]:
+    desired_heading = heading_to_point((start_pose[0], start_pose[1]), (goal_pose[0], goal_pose[1]))
+    preferred_sign = 1.0 if wrap_to_pi(desired_heading - start_pose[2]) >= 0.0 else -1.0
+    sign_order = (preferred_sign, -preferred_sign)
+    step_candidates = (
+        math.radians(10.0),
+        math.radians(15.0),
+        math.radians(20.0),
+        math.radians(30.0),
+        math.radians(45.0),
+        math.radians(60.0),
+        math.radians(75.0),
+    )
+
+    best_path: List[Point2D] = []
+    best_len = float("inf")
+    trace_parts: List[str] = []
+    for step in step_candidates:
+        for sign in sign_order:
+            label = f"{'L' if sign > 0 else 'R'}{math.degrees(step):.0f}"
+            arc_points, arc_end_pose = _sample_recovery_arc(
+                start_pose=start_pose,
+                turn_radius=turn_radius,
+                delta_heading=sign * step,
+                sample_step=sample_step,
+            )
+            if not _polyline_collision_free(arc_points, world=world, margin=margin):
+                trace_parts.append(f"{label}:arc_collision")
+                continue
+
+            dubins_sol = _build_shortest_dubins_local(
+                start_pose=arc_end_pose,
+                goal_pose=goal_pose,
+                turn_radius=turn_radius,
+            )
+            if dubins_sol is None:
+                trace_parts.append(f"{label}:no_solution")
+                continue
+
+            word, params = dubins_sol
+            tail_points = _sample_dubins_segment(
+                start_pose=arc_end_pose,
+                word=word,
+                params=params,
+                turn_radius=turn_radius,
+                sample_step=sample_step,
+            )
+            tail_points[0] = (arc_end_pose[0], arc_end_pose[1])
+            tail_points[-1] = (goal_pose[0], goal_pose[1])
+            full_points = arc_points + tail_points[1:]
+            if not _polyline_collision_free(full_points, world=world, margin=margin):
+                trace_parts.append(f"{label}:{word}:tail_collision")
+                continue
+
+            full_len = _polyline_length(full_points)
+            if full_len < best_len:
+                best_path = full_points
+                best_len = full_len
+            trace_parts.append(f"{label}:{word}:ok:{full_len:.3f}")
+
+    return best_path, best_len, ";".join(trace_parts)
 
 
 def _shortcut_smooth_path(path: List[Point2D], world: WorldMap, margin: float) -> List[Point2D]:
@@ -550,6 +656,110 @@ def _compress_astar_path(path: List[Point2D]) -> List[Point2D]:
     return out
 
 
+def _build_fillet_result(
+    sparse_path: List[Point2D],
+    fallback_path: List[Point2D],
+    fallback_len: float,
+    start_pose: Pose2D,
+    goal_pose: Pose2D,
+    world: WorldMap,
+    cfg,
+    turn_radius: float,
+    force_mode: bool,
+    debug_trace: str = "",
+) -> Tuple[List[Point2D], float, DubinsHybridMeta]:
+    fillet_points, fillet_count, fallback_count, fallback_reason_counts = _build_fillet_polyline(
+        path=sparse_path,
+        turn_radius=turn_radius,
+        sample_step=cfg.dubins_sample_step,
+        world=world,
+        margin=cfg.dubins_collision_margin,
+        force_mode=force_mode,
+    )
+    if fallback_count > 0 and not force_mode and not cfg.dubins_fallback_to_astar:
+        return (
+            [],
+            float("inf"),
+            DubinsHybridMeta(
+                used_fallback=True,
+                fallback_segments=fallback_count,
+                dubins_segments=fillet_count,
+                sample_count=0,
+                dubins_ratio=0.0,
+                fallback_reason=_primary_reason(fallback_reason_counts),
+                fallback_details=_format_reason_counts(fallback_reason_counts),
+                debug_trace=debug_trace,
+            ),
+        )
+    out_points = fillet_points
+    out_points[0] = (start_pose[0], start_pose[1])
+    out_points[-1] = (goal_pose[0], goal_pose[1])
+
+    if not force_mode and not _polyline_collision_free(
+        out_points,
+        world=world,
+        margin=cfg.dubins_collision_margin,
+    ):
+        final_reason_counts = dict(fallback_reason_counts)
+        _bump_reason(final_reason_counts, "final_collision")
+        rejected_segments = max(1, fallback_count)
+        if cfg.dubins_fallback_to_astar:
+            return (
+                fallback_path,
+                fallback_len,
+                DubinsHybridMeta(
+                    used_fallback=True,
+                    fallback_segments=rejected_segments,
+                    dubins_segments=fillet_count,
+                    sample_count=len(fallback_path),
+                    dubins_ratio=0.0,
+                    fallback_reason="final_collision",
+                    fallback_details=_format_reason_counts(final_reason_counts),
+                    debug_trace=debug_trace,
+                ),
+            )
+        return (
+            [],
+            float("inf"),
+            DubinsHybridMeta(
+                used_fallback=True,
+                fallback_segments=rejected_segments,
+                dubins_segments=fillet_count,
+                sample_count=0,
+                dubins_ratio=0.0,
+                fallback_reason="final_collision",
+                fallback_details=_format_reason_counts(final_reason_counts),
+                debug_trace=debug_trace,
+            ),
+        )
+
+    total_len = 0.0
+    for i in range(len(out_points) - 1):
+        total_len += math.hypot(out_points[i + 1][0] - out_points[i][0], out_points[i + 1][1] - out_points[i][1])
+
+    straight_len = 0.0
+    for i in range(len(sparse_path) - 1):
+        straight_len += math.hypot(
+            sparse_path[i + 1][0] - sparse_path[i][0],
+            sparse_path[i + 1][1] - sparse_path[i][1],
+        )
+    added_curve = max(0.0, total_len - straight_len)
+    ratio = 0.0 if total_len <= 1e-9 else max(0.0, min(1.0, added_curve / total_len))
+
+    used_fallback = fallback_count > 0
+    meta = DubinsHybridMeta(
+        used_fallback=used_fallback,
+        fallback_segments=fallback_count,
+        dubins_segments=fillet_count,
+        sample_count=len(out_points),
+        dubins_ratio=ratio,
+        fallback_reason=_primary_reason(fallback_reason_counts),
+        fallback_details=_format_reason_counts(fallback_reason_counts),
+        debug_trace=debug_trace,
+    )
+    return out_points, total_len, meta
+
+
 def build_dubins_hybrid_path(
     world: WorldMap,
     cfg,
@@ -620,6 +830,7 @@ def build_dubins_hybrid_path(
 
     if len(sparse_path) == 2:
         direct_reason = "direct_no_solution"
+        debug_trace = "direct:start"
         dubins_sol = _build_shortest_dubins_local(start_pose=start_pose, goal_pose=goal_pose, turn_radius=turn_radius)
         if dubins_sol is not None:
             word, params = dubins_sol
@@ -638,6 +849,7 @@ def build_dubins_hybrid_path(
                 world=world,
                 margin=cfg.dubins_collision_margin,
                 ):
+                debug_trace = f"direct:{word}:ok"
                 dubins_len = _polyline_length(dubins_points)
                 straight_len = math.hypot(goal_pose[0] - start_pose[0], goal_pose[1] - start_pose[1])
                 added_curve = max(0.0, dubins_len - straight_len)
@@ -651,9 +863,36 @@ def build_dubins_hybrid_path(
                         dubins_segments=1,
                         sample_count=len(dubins_points),
                         dubins_ratio=ratio,
+                        debug_trace=debug_trace,
                     ),
                 )
             direct_reason = "direct_collision"
+            debug_trace = f"direct:{word}:collision"
+
+        recovered_points, recovered_len, recovery_trace = _try_direct_recovery_path(
+            start_pose=start_pose,
+            goal_pose=goal_pose,
+            turn_radius=turn_radius,
+            sample_step=cfg.dubins_sample_step,
+            world=world,
+            margin=cfg.dubins_collision_margin,
+        )
+        if recovered_points and math.isfinite(recovered_len):
+            straight_len = math.hypot(goal_pose[0] - start_pose[0], goal_pose[1] - start_pose[1])
+            added_curve = max(0.0, recovered_len - straight_len)
+            ratio = 0.0 if recovered_len <= 1e-9 else max(0.0, min(1.0, added_curve / recovered_len))
+            return (
+                recovered_points,
+                recovered_len,
+                DubinsHybridMeta(
+                    used_fallback=False,
+                    fallback_segments=0,
+                    dubins_segments=2,
+                    sample_count=len(recovered_points),
+                    dubins_ratio=ratio,
+                    debug_trace=f"{debug_trace};recovery:{recovery_trace}",
+                ),
+            )
 
         if cfg.dubins_fallback_to_astar:
             return (
@@ -667,6 +906,7 @@ def build_dubins_hybrid_path(
                     dubins_ratio=0.0,
                     fallback_reason=direct_reason,
                     fallback_details=f"{direct_reason}:1",
+                    debug_trace=f"{debug_trace};recovery:{recovery_trace}",
                 ),
             )
         return (
@@ -680,92 +920,18 @@ def build_dubins_hybrid_path(
                 dubins_ratio=0.0,
                 fallback_reason=direct_reason,
                 fallback_details=f"{direct_reason}:1",
+                debug_trace=f"{debug_trace};recovery:{recovery_trace}",
             ),
         )
 
-    fillet_points, fillet_count, fallback_count, fallback_reason_counts = _build_fillet_polyline(
-        path=sparse_path,
-        turn_radius=turn_radius,
-        sample_step=cfg.dubins_sample_step,
+    return _build_fillet_result(
+        sparse_path=sparse_path,
+        fallback_path=base_path,
+        fallback_len=base_len,
+        start_pose=start_pose,
+        goal_pose=goal_pose,
         world=world,
-        margin=cfg.dubins_collision_margin,
+        cfg=cfg,
+        turn_radius=turn_radius,
         force_mode=force_mode,
     )
-    if fallback_count > 0 and not force_mode and not cfg.dubins_fallback_to_astar:
-        return (
-            [],
-            float("inf"),
-            DubinsHybridMeta(
-                used_fallback=True,
-                fallback_segments=fallback_count,
-                dubins_segments=fillet_count,
-                sample_count=0,
-                dubins_ratio=0.0,
-                fallback_reason=_primary_reason(fallback_reason_counts),
-                fallback_details=_format_reason_counts(fallback_reason_counts),
-            ),
-        )
-    out_points = fillet_points
-    out_points[0] = (start_pose[0], start_pose[1])
-    out_points[-1] = (goal_pose[0], goal_pose[1])
-
-    if not force_mode and not _polyline_collision_free(
-        out_points,
-        world=world,
-        margin=cfg.dubins_collision_margin,
-    ):
-        final_reason_counts = dict(fallback_reason_counts)
-        _bump_reason(final_reason_counts, "final_collision")
-        rejected_segments = max(1, fallback_count)
-        if cfg.dubins_fallback_to_astar:
-            return (
-                base_path,
-                base_len,
-                DubinsHybridMeta(
-                    used_fallback=True,
-                    fallback_segments=rejected_segments,
-                    dubins_segments=fillet_count,
-                    sample_count=len(base_path),
-                    dubins_ratio=0.0,
-                    fallback_reason="final_collision",
-                    fallback_details=_format_reason_counts(final_reason_counts),
-                ),
-            )
-        return (
-            [],
-            float("inf"),
-            DubinsHybridMeta(
-                used_fallback=True,
-                fallback_segments=rejected_segments,
-                dubins_segments=fillet_count,
-                sample_count=0,
-                dubins_ratio=0.0,
-                fallback_reason="final_collision",
-                fallback_details=_format_reason_counts(final_reason_counts),
-            ),
-        )
-
-    total_len = 0.0
-    for i in range(len(out_points) - 1):
-        total_len += math.hypot(out_points[i + 1][0] - out_points[i][0], out_points[i + 1][1] - out_points[i][1])
-
-    straight_len = 0.0
-    for i in range(len(sparse_path) - 1):
-        straight_len += math.hypot(
-            sparse_path[i + 1][0] - sparse_path[i][0],
-            sparse_path[i + 1][1] - sparse_path[i][1],
-        )
-    added_curve = max(0.0, total_len - straight_len)
-    ratio = 0.0 if total_len <= 1e-9 else max(0.0, min(1.0, added_curve / total_len))
-
-    used_fallback = fallback_count > 0
-    meta = DubinsHybridMeta(
-        used_fallback=used_fallback,
-        fallback_segments=fallback_count,
-        dubins_segments=fillet_count,
-        sample_count=len(out_points),
-        dubins_ratio=ratio,
-        fallback_reason=_primary_reason(fallback_reason_counts),
-        fallback_details=_format_reason_counts(fallback_reason_counts),
-    )
-    return out_points, total_len, meta

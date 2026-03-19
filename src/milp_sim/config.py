@@ -61,7 +61,7 @@ class SimulationConfig:
     # Smaller value reduces local looping near close targets.
     goal_heading_blend_turn_radius_factor: float = 4.0
     # Soft terminal-heading window around blended heading (radians).
-    goal_heading_tolerance_rad: float = 0.9
+    goal_heading_tolerance_rad: float = 1.2
     # Number of heading samples in the soft window (>=1).
     goal_heading_num_samples: int = 5
     # Candidate score penalty on initial heading change (rad-weighted by turn radius).

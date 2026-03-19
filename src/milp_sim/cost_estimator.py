@@ -78,6 +78,21 @@ def goal_heading_candidates(
         for a in alphas:
             out.append(wrap_to_pi(blended + a * tol))
 
+    # For terminal legs, narrow heading windows can miss collision-free Dubins
+    # solutions that approach the task from a safer angle. Add a wider fallback
+    # sweep around the direct heading so planners can escape local dead-ends.
+    if next_task_pos is None:
+        wide_tol = max(tol, math.pi / 2.0)
+        for offset in (
+            -wide_tol,
+            -0.75 * wide_tol,
+            -0.5 * wide_tol,
+            0.5 * wide_tol,
+            0.75 * wide_tol,
+            wide_tol,
+        ):
+            out.append(wrap_to_pi(direct + offset))
+
     uniq: List[float] = []
     for h in out:
         if all(abs(wrap_to_pi(h - u)) > 1e-4 for u in uniq):

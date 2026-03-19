@@ -1921,7 +1921,8 @@ class SimulationSession:
             curve_width=1.6,
             planned_curve_style="-",
             planned_curve_alpha=0.95,
-            show_predicted_next_link=True,
+            show_predicted_next_link=self.online_enabled,
+            predicted_future_links=max(0, int(self.cfg.online_future_task_horizon)) if self.online_enabled else 0,
         )
 
         if self.online_enabled:
@@ -2027,6 +2028,8 @@ class SimulationSession:
                 save_path=path,
                 dpi=self.cfg.figure_dpi,
                 fig_size=self.cfg.figure_size,
+                show_predicted_next_link=False,
+                predicted_future_links=0,
             )
             return path
 
@@ -2079,6 +2082,7 @@ class OfflineSession:
         self.cfg = cfg
         self._session = SimulationSession(cfg)
         self._comparison_cache: OfflineComparisonSummary | None = None
+        self._comparison_results_cache: tuple[AllocationResult, AllocationResult] | None = None
 
     @property
     def artifacts(self) -> SimulationArtifacts | None:
@@ -2106,6 +2110,7 @@ class OfflineSession:
 
     def _invalidate_comparison_cache(self) -> None:
         self._comparison_cache = None
+        self._comparison_results_cache = None
 
     def _current_offline_actions(self) -> list[UserActionRecord]:
         return copy.deepcopy(self._session._recorded_user_actions)
@@ -2141,6 +2146,7 @@ class OfflineSession:
 
         with_result = with_verify.result()
         without_result = without_verify.result()
+        self._comparison_results_cache = (with_result, without_result)
         with_variant = self._build_variant("With Verification", with_result)
         without_variant = self._build_variant("Without Verification", without_result)
 
@@ -2167,6 +2173,47 @@ class OfflineSession:
         if self._comparison_cache is None:
             self._comparison_cache = self._build_comparison_summary()
         return self._comparison_cache
+
+    def comparison_results(self) -> tuple[AllocationResult, AllocationResult]:
+        if self._comparison_results_cache is None:
+            self._comparison_cache = self._build_comparison_summary()
+        assert self._comparison_results_cache is not None
+        return self._comparison_results_cache
+
+    def draw_comparison_on_axes(self, ax_with, ax_without) -> None:
+        with_result, without_result = self.comparison_results()
+        summary = self.comparison_summary()
+
+        draw_final_scene_on_axis(
+            ax=ax_with,
+            world=self.artifacts.world,
+            vehicles=with_result.vehicles,
+            tasks=with_result.tasks,
+            title=f"With Verification | total={summary.with_verification.system_total_time:.3f}",
+            show_task_meta=False,
+            show_vehicle_sequences=False,
+            task_font_size=7,
+            vehicle_font_size=8,
+            label_box=True,
+            curve_width=1.5,
+            show_predicted_next_link=False,
+            predicted_future_links=0,
+        )
+        draw_final_scene_on_axis(
+            ax=ax_without,
+            world=self.artifacts.world,
+            vehicles=without_result.vehicles,
+            tasks=without_result.tasks,
+            title=f"Without Verification | total={summary.without_verification.system_total_time:.3f}",
+            show_task_meta=False,
+            show_vehicle_sequences=False,
+            task_font_size=7,
+            vehicle_font_size=8,
+            label_box=True,
+            curve_width=1.5,
+            show_predicted_next_link=False,
+            predicted_future_links=0,
+        )
 
     def format_comparison_text(self) -> str:
         summary = self.comparison_summary()
@@ -2265,11 +2312,7 @@ class OfflineSession:
         return self._session.format_user_action_history_text(n=n)
 
     def format_status_text(self) -> str:
-        text = self._session.format_status_text()
-        try:
-            return f"{text}\n\n{self.format_comparison_text()}"
-        except Exception as exc:
-            return f"{text}\n\nOffline Comparison:\n  unavailable: {exc}"
+        return self._session.format_status_text()
 
     def format_logs_text(self, n: int = 8) -> str:
         return self._session.format_logs_text(n=n)

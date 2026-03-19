@@ -215,6 +215,8 @@ def plot_final_scene(
     save_path: Path,
     dpi: int,
     fig_size: tuple,
+    show_predicted_next_link: bool = True,
+    predicted_future_links: int = 2,
 ) -> None:
     fig, ax = plt.subplots(figsize=fig_size, dpi=dpi)
     draw_final_scene_on_axis(
@@ -223,6 +225,8 @@ def plot_final_scene(
         vehicles=vehicles,
         tasks=tasks,
         title="Final Allocation and Planned Trajectories",
+        show_predicted_next_link=show_predicted_next_link,
+        predicted_future_links=predicted_future_links,
     )
     save_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
