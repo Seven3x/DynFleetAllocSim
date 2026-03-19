@@ -249,7 +249,7 @@ class TestOnlineRuntime(unittest.TestCase):
                 raw_path = [start, goal]
                 raw_len = math.hypot(goal[0] - start[0], goal[1] - start[1])
                 raw_delta = self.session._path_initial_turn_delta(raw_path, vehicle.current_heading)
-                if raw_delta <= math.radians(75.0):
+                if raw_delta <= self.session.cfg.online_max_initial_turn_rad:
                     continue
 
                 buffered_path, buffered_len = self.session._maybe_buffer_initial_turn_path(

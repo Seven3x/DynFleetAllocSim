@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 
 
@@ -81,6 +82,8 @@ class SimulationConfig:
     # Online runtime simulation
     online_dt: float = 0.5
     online_replan_period_s: float = 2.5
+    # Buffer task-switching turns when the first heading change is too abrupt.
+    online_max_initial_turn_rad: float = math.pi / 4.0
     # Runtime-only resampling step for following planned polylines more smoothly.
     online_path_sample_step: float = 0.25
     online_new_task_replan_batch_size: int = 3

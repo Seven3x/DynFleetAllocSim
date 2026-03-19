@@ -17,6 +17,7 @@
 - `src/milp_sim/interactive_console.py`：实时命令行控制台（基于 `SimulationSession`）
 - `src/milp_sim/gui_app.py`：Tkinter + Matplotlib GUI
 - `src/milp_sim/main.py`：程序入口（批处理 + CLI + GUI）
+- `src/milp_sim/assignment_cost_experiment.py`：前缀路程代价对比分配实验（纯 A*，输出 PNG + JSON）
 
 ## 2. 主流程说明
 ### 2.1 快速竞拍
@@ -67,6 +68,57 @@ PYTHONPATH=src python -m milp_sim.main --interactive
 # 或
 PYTHONPATH=src python -m milp_sim.main --gui
 ```
+
+### 3.4 前缀路程代价对比分配实验
+该实验固定一个手工场景，对比两种拍卖代价：
+- `incremental_only`：只看当前末端到候选任务的 A* 路径代价
+- `prefix_aware`：看已分配前缀累计路程 + 当前末端到候选任务的 A* 路径代价
+
+当前固定场景包含：
+- 3 台智能体
+- 9 个任务点
+- 4 个矩形障碍物
+- 纯 A* 路径规划，不使用 Dubins，不依赖在线重分配
+
+运行方式：
+
+```bash
+PYTHONPATH=src python -m milp_sim.assignment_cost_experiment
+```
+
+Windows PowerShell 示例：
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m milp_sim.assignment_cost_experiment
+```
+
+随机种子模式：
+- 使用 `--seed N` 后，会生成基于该种子的随机复杂场景
+- 随机场景默认包含 4 台智能体、12 个任务点、6 个随机障碍物
+- 输出文件名会自动带上 `_seed_N` 后缀，便于保留多组结果
+
+```bash
+PYTHONPATH=src python -m milp_sim.assignment_cost_experiment --seed 7
+PYTHONPATH=src python -m milp_sim.assignment_cost_experiment --seed 11
+```
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m milp_sim.assignment_cost_experiment --seed 7
+```
+
+运行后会：
+- 在终端打印两种模式下的任务分配、每车路程、系统总路程
+- 在终端和 JSON 中额外输出执行时间指标（按最晚完成 agent 的完成时间统计，同时给出该 agent 的路径长度）
+- 生成 `outputs/assignment_cost_comparison.png`
+- 生成 `outputs/assignment_cost_comparison_summary.json`
+- 带种子运行时生成 `outputs/assignment_cost_comparison_seed_<seed>.png`
+- 带种子运行时生成 `outputs/assignment_cost_comparison_summary_seed_<seed>.json`
+
+当前固定场景的实验结果应表现为：
+- `incremental_only`：`V0 -> [T1, T3, T8, T7]`，`V1 -> [T5]`，`V2 -> [T0, T2, T4, T6]`
+- `prefix_aware`：`V0 -> [T1, T3, T8, T7]`，`V1 -> [T2, T6]`，`V2 -> [T0, T4, T5]`
 
 ## 4. 交互式控制台命令
 启动后输入 `help` 可查看命令。
@@ -122,6 +174,10 @@ PYTHONPATH=src python -m milp_sim.main --gui
 - `outputs/03_round2_final_result.png`：Round 2 批处理最终图
 - `outputs/coordination_log.txt`：批处理协商日志
 - `outputs/verification_log.txt`：批处理校对日志
+- `outputs/assignment_cost_comparison.png`：前缀路程代价对比分配实验结果图
+- `outputs/assignment_cost_comparison_summary.json`：前缀路程代价对比实验摘要
+- `outputs/assignment_cost_comparison_seed_*.png`：带随机种子的对比实验结果图
+- `outputs/assignment_cost_comparison_summary_seed_*.json`：带随机种子的对比实验摘要
 - `outputs/snapshot_*.png`：Session/GUI/CLI 快照
 - `outputs/session_*_coordination_log.txt`：Session/GUI/CLI 协商日志导出
 - `outputs/session_*_verification_log.txt`：Session/GUI/CLI 校对日志导出

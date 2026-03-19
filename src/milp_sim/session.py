@@ -985,7 +985,10 @@ class SimulationSession:
         if len(path) < 2 or not math.isfinite(length):
             return path, length
 
-        max_initial_turn = math.radians(75.0)
+        max_initial_turn = max(
+            0.0,
+            float(getattr(self.cfg, "online_max_initial_turn_rad", math.pi / 4.0)),
+        )
         current_delta = self._path_initial_turn_delta(path, v.current_heading)
         if current_delta <= max_initial_turn + 1e-9:
             return path, length
