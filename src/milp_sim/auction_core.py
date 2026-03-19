@@ -138,6 +138,21 @@ class AllocationEngine:
         self.event_logs.clear()
         self._round_idx = 0
 
+    def _invalidate_vehicle_bid_memory(self, vehicle_id: int, reason: str) -> None:
+        before_cache = len(self.corrected_bid_cache)
+        before_force = len(self.force_accept_pairs)
+        self.corrected_bid_cache = {
+            pair: value for pair, value in self.corrected_bid_cache.items() if pair[0] != vehicle_id
+        }
+        self.force_accept_pairs = {pair for pair in self.force_accept_pairs if pair[0] != vehicle_id}
+        dropped_cache = before_cache - len(self.corrected_bid_cache)
+        dropped_force = before_force - len(self.force_accept_pairs)
+        if dropped_cache > 0 or dropped_force > 0:
+            debug_log(
+                f"invalidate bid memory vehicle=V{vehicle_id} reason={reason} "
+                f"dropped_cache={dropped_cache} dropped_force_accept={dropped_force}"
+            )
+
     def add_dynamic_task(self, task: Task, step: int) -> None:
         if task.id in self.tasks_by_id:
             raise ValueError(f"Task id {task.id} already exists.")
@@ -570,6 +585,9 @@ class AllocationEngine:
             status="locked",
             version=rec.version + 1,
         )
+        # Corrected bids/force-accept flags are tied to a vehicle's frontier state.
+        # Once a new task is locked, the vehicle state changed and old entries are stale.
+        self._invalidate_vehicle_bid_memory(vehicle.id, reason=f"lock T{task.id}")
 
     def _recompute_vehicle_state(self, vehicle: Vehicle) -> None:
         filtered: List[int] = []
@@ -592,6 +610,7 @@ class AllocationEngine:
         vehicle.remaining_capacity = remaining
         vehicle.current_pos = pos
         vehicle.current_heading = heading
+        self._invalidate_vehicle_bid_memory(vehicle.id, reason="recompute_state")
 
     def _apply_canceled_record(self, task_id: int, step: int, message: str) -> None:
         base = self.records[task_id]

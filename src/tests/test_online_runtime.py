@@ -310,6 +310,31 @@ class TestOnlineRuntime(unittest.TestCase):
         self.assertGreaterEqual(len(seen_headings), 1)
         self.assertAlmostEqual(seen_headings[0], 1.234, places=6)
 
+    def test_lock_task_invalidates_vehicle_bid_memory_cache(self) -> None:
+        assert self.session.engine is not None
+        engine = self.session.engine
+
+        v = engine.vehicles[0]
+        t = engine.tasks[0]
+        t.status = "tentative"
+        t.assigned_vehicle = v.id
+
+        engine.corrected_bid_cache[(v.id, t.id)] = 12.345
+        engine.corrected_bid_cache[(v.id, 999)] = 88.0
+        engine.corrected_bid_cache[(1, t.id)] = 77.0
+        engine.force_accept_pairs.add((v.id, t.id))
+        engine.force_accept_pairs.add((v.id, 999))
+        engine.force_accept_pairs.add((1, t.id))
+
+        engine._lock_task(task=t, vehicle=v, bid=1.0)
+
+        self.assertNotIn((v.id, t.id), engine.corrected_bid_cache)
+        self.assertNotIn((v.id, 999), engine.corrected_bid_cache)
+        self.assertIn((1, t.id), engine.corrected_bid_cache)
+        self.assertNotIn((v.id, t.id), engine.force_accept_pairs)
+        self.assertNotIn((v.id, 999), engine.force_accept_pairs)
+        self.assertIn((1, t.id), engine.force_accept_pairs)
+
     def test_refresh_active_tasks_keeps_clear_in_progress_route(self) -> None:
         self.session.start_online()
         assert self.session.engine is not None
