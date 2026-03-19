@@ -437,6 +437,14 @@ class AllocationEngine:
     def _verify_tentatives(self, phase: str) -> None:
         tentative = [t for t in self.tasks if t.status == "tentative" and t.assigned_vehicle is not None]
 
+        if not bool(getattr(self.cfg, "enable_bid_verification", True)):
+            for task in tentative:
+                vid = int(task.assigned_vehicle)
+                vehicle = self.vehicles[vid]
+                rec = self.records[task.id]
+                self._lock_task(task=task, vehicle=vehicle, bid=rec.bid)
+            return
+
         for task in tentative:
             vid = int(task.assigned_vehicle)
             vehicle = self.vehicles[vid]

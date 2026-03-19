@@ -14,13 +14,23 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from .config import DEFAULT_CONFIG, SimulationConfig
-from .session import SimulationSession
+from .session import OfflineSession, OnlineSession
 
 
-class MilpGuiApp:
-    def __init__(self, cfg: SimulationConfig = DEFAULT_CONFIG) -> None:
+class _BaseGuiApp:
+    def __init__(
+        self,
+        session,
+        cfg: SimulationConfig = DEFAULT_CONFIG,
+        *,
+        window_title: str,
+        enable_online_runtime: bool,
+        enable_offline_tools: bool,
+    ) -> None:
         self.cfg = cfg
-        self.session = SimulationSession(cfg)
+        self.session = session
+        self.enable_online_runtime = enable_online_runtime
+        self.enable_offline_tools = enable_offline_tools
         self.obstacle_draw_mode = False
         self.obstacle_points: list[tuple[float, float]] = []
         self.task_click_mode = False
@@ -30,7 +40,7 @@ class MilpGuiApp:
         self._map_view_state: dict[str, tuple[float, float]] | None = None
 
         self.root = tk.Tk()
-        self.root.title("MILP Dynamic Task Allocation GUI")
+        self.root.title(window_title)
         self._configure_ui_style()
         self._configure_window_geometry()
 
@@ -206,49 +216,51 @@ class MilpGuiApp:
         top.pack(fill="x", pady=(0, 8))
 
         ttk.Button(top, text="Initialize/Reset", command=self._on_reset).pack(fill="x", pady=3)
-        ttk.Button(top, text="Reset + Replay Last Ops", command=self._on_reset_replay).pack(fill="x", pady=3)
-        ttk.Button(top, text="Undo Last Action", command=self._on_undo).pack(fill="x", pady=3)
+        if self.enable_offline_tools:
+            ttk.Button(top, text="Reset + Replay Last Ops", command=self._on_reset_replay).pack(fill="x", pady=3)
+            ttk.Button(top, text="Undo Last Action", command=self._on_undo).pack(fill="x", pady=3)
         ttk.Button(top, text="Save Snapshot", command=self._on_save_snapshot).pack(fill="x", pady=3)
         ttk.Button(top, text="Export Logs", command=self._on_export_logs).pack(fill="x", pady=3)
 
-        online_frame = ttk.LabelFrame(parent, text="Online Runtime", padding=8)
-        online_frame.pack(fill="x", pady=8)
-        ttk.Label(online_frame, text="state").grid(row=0, column=0, sticky="w")
-        ttk.Label(online_frame, textvariable=self.online_state_var).grid(row=0, column=1, sticky="w")
-        ttk.Label(online_frame, text="sim time").grid(row=1, column=0, sticky="w")
-        ttk.Label(online_frame, textvariable=self.sim_time_var).grid(row=1, column=1, sticky="w")
-        ttk.Label(online_frame, text="next event").grid(row=2, column=0, sticky="w")
-        ttk.Label(online_frame, textvariable=self.next_event_var).grid(row=2, column=1, sticky="w")
-        ttk.Label(online_frame, text="replan").grid(row=3, column=0, sticky="w")
-        ttk.Label(online_frame, textvariable=self.replan_reason_var, wraplength=190).grid(
-            row=3, column=1, sticky="w"
-        )
-        ttk.Button(online_frame, text="Start Online", command=self._on_start_online).grid(
-            row=4, column=0, columnspan=2, sticky="ew", pady=(6, 0)
-        )
-        ttk.Button(online_frame, text="Pause/Resume", command=self._on_toggle_online_pause).grid(
-            row=5, column=0, columnspan=2, sticky="ew", pady=(5, 0)
-        )
-        ttk.Button(online_frame, text="Step x1", command=lambda: self._on_online_step(1)).grid(
-            row=6, column=0, sticky="ew", pady=(5, 0)
-        )
-        ttk.Button(online_frame, text="Next Frame", command=self._on_frame_next).grid(
-            row=6, column=1, sticky="ew", pady=(5, 0)
-        )
-        ttk.Button(online_frame, text="Prev Frame", command=self._on_frame_prev).grid(
-            row=7, column=0, sticky="ew", pady=(5, 0)
-        )
-        ttk.Label(online_frame, text="speed").grid(row=8, column=0, sticky="w", pady=(6, 0))
-        speed_box = ttk.Combobox(
-            online_frame,
-            textvariable=self.sim_speed_var,
-            values=("1x",),
-            state="readonly",
-            width=8,
-        )
-        speed_box.grid(row=8, column=1, sticky="ew", pady=(6, 0))
-        online_frame.columnconfigure(0, weight=1)
-        online_frame.columnconfigure(1, weight=1)
+        if self.enable_online_runtime:
+            online_frame = ttk.LabelFrame(parent, text="Online Runtime", padding=8)
+            online_frame.pack(fill="x", pady=8)
+            ttk.Label(online_frame, text="state").grid(row=0, column=0, sticky="w")
+            ttk.Label(online_frame, textvariable=self.online_state_var).grid(row=0, column=1, sticky="w")
+            ttk.Label(online_frame, text="sim time").grid(row=1, column=0, sticky="w")
+            ttk.Label(online_frame, textvariable=self.sim_time_var).grid(row=1, column=1, sticky="w")
+            ttk.Label(online_frame, text="next event").grid(row=2, column=0, sticky="w")
+            ttk.Label(online_frame, textvariable=self.next_event_var).grid(row=2, column=1, sticky="w")
+            ttk.Label(online_frame, text="replan").grid(row=3, column=0, sticky="w")
+            ttk.Label(online_frame, textvariable=self.replan_reason_var, wraplength=190).grid(
+                row=3, column=1, sticky="w"
+            )
+            ttk.Button(online_frame, text="Start Online", command=self._on_start_online).grid(
+                row=4, column=0, columnspan=2, sticky="ew", pady=(6, 0)
+            )
+            ttk.Button(online_frame, text="Pause/Resume", command=self._on_toggle_online_pause).grid(
+                row=5, column=0, columnspan=2, sticky="ew", pady=(5, 0)
+            )
+            ttk.Button(online_frame, text="Step x1", command=lambda: self._on_online_step(1)).grid(
+                row=6, column=0, sticky="ew", pady=(5, 0)
+            )
+            ttk.Button(online_frame, text="Next Frame", command=self._on_frame_next).grid(
+                row=6, column=1, sticky="ew", pady=(5, 0)
+            )
+            ttk.Button(online_frame, text="Prev Frame", command=self._on_frame_prev).grid(
+                row=7, column=0, sticky="ew", pady=(5, 0)
+            )
+            ttk.Label(online_frame, text="speed").grid(row=8, column=0, sticky="w", pady=(6, 0))
+            speed_box = ttk.Combobox(
+                online_frame,
+                textvariable=self.sim_speed_var,
+                values=("1x",),
+                state="readonly",
+                width=8,
+            )
+            speed_box.grid(row=8, column=1, sticky="ew", pady=(6, 0))
+            online_frame.columnconfigure(0, weight=1)
+            online_frame.columnconfigure(1, weight=1)
 
         obstacle_frame = ttk.LabelFrame(parent, text="Draw Obstacle Polygon", padding=8)
         obstacle_frame.pack(fill="x", pady=8)
@@ -319,7 +331,7 @@ class MilpGuiApp:
         )
         ttk.Button(
             random_frame,
-            text="Add Random + Re-auction",
+            text="Add Random + Replan" if self.enable_online_runtime else "Add Random + Re-auction",
             command=self._on_add_random,
         ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         random_frame.columnconfigure(1, weight=1)
@@ -332,7 +344,11 @@ class MilpGuiApp:
         ttk.Entry(cancel_frame, textvariable=self.cancel_task_id_var, width=12).grid(
             row=0, column=1, sticky="ew"
         )
-        ttk.Button(cancel_frame, text="Cancel + Re-auction", command=self._on_cancel_task).grid(
+        ttk.Button(
+            cancel_frame,
+            text="Cancel + Replan" if self.enable_online_runtime else "Cancel + Re-auction",
+            command=self._on_cancel_task,
+        ).grid(
             row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0)
         )
         cancel_frame.columnconfigure(1, weight=1)
@@ -379,7 +395,8 @@ class MilpGuiApp:
             self.ax.set_ylim(*ylim)
 
     def _build_right_panels(self, parent) -> None:
-        status_frame = ttk.LabelFrame(parent, text="Status", padding=6)
+        status_title = "Online Status" if self.enable_online_runtime else "Status & Comparison"
+        status_frame = ttk.LabelFrame(parent, text=status_title, padding=6)
         status_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
         status_frame.rowconfigure(0, weight=1)
         status_frame.columnconfigure(0, weight=1)
@@ -453,7 +470,8 @@ class MilpGuiApp:
 
     def _refresh_map(self) -> None:
         prev_view = self._capture_map_view_state()
-        self.session.draw_on_axis(self.ax, render_state=self._interpolated_online_render_state())
+        render_state = self._interpolated_online_render_state() if self.enable_online_runtime else None
+        self.session.draw_on_axis(self.ax, render_state=render_state)
         self._restore_map_view_state(prev_view or self._map_view_state)
         if self.dragging_task_id is not None and self.drag_preview_pos is not None:
             x, y = self.drag_preview_pos
@@ -548,15 +566,16 @@ class MilpGuiApp:
             self._set_text(self.tasks_text, tasks_text)
             self._last_tasks_text = tasks_text
 
-        snap = self.session.runtime_snapshot()
-        self.online_state_var.set("RUN" if snap.online_running else ("IDLE" if self.session.online_enabled else "OFF"))
-        self.sim_time_var.set(f"{snap.sim_time:.2f}s")
-        if snap.pending_events:
-            nxt = snap.pending_events[0]
-            self.next_event_var.set(f"{nxt.time_s:.2f}s:{nxt.event_type}")
-        else:
-            self.next_event_var.set("-")
-        self.replan_reason_var.set(snap.last_replan_reason or "-")
+        if self.enable_online_runtime:
+            snap = self.session.runtime_snapshot()
+            self.online_state_var.set("RUN" if snap.online_running else ("IDLE" if self.session.online_enabled else "OFF"))
+            self.sim_time_var.set(f"{snap.sim_time:.2f}s")
+            if snap.pending_events:
+                nxt = snap.pending_events[0]
+                self.next_event_var.set(f"{nxt.time_s:.2f}s:{nxt.event_type}")
+            else:
+                self.next_event_var.set("-")
+            self.replan_reason_var.set(snap.last_replan_reason or "-")
         obstacles = self.session.list_obstacles()
         values = [str(idx) for idx, _ in obstacles]
         self.obstacle_remove_combo.configure(values=values)
@@ -644,17 +663,19 @@ class MilpGuiApp:
 
     def _schedule_refresh(self) -> None:
         now = time.perf_counter()
-        try:
-            if self.session.online_enabled and self.session.online_running:
-                self._advance_online_clock(now)
-            elif not self.session.online_running:
-                self._reset_online_render_clock()
-        except Exception as exc:
-            self.last_action_var.set(f"tick error: {exc}")
+        if self.enable_online_runtime:
+            try:
+                if self.session.online_enabled and self.session.online_running:
+                    self._advance_online_clock(now)
+                elif not self.session.online_running:
+                    self._reset_online_render_clock()
+            except Exception as exc:
+                self.last_action_var.set(f"tick error: {exc}")
         try:
             self._refresh_map()
             if (
-                not self.session.online_enabled
+                not self.enable_online_runtime
+                or not self.session.online_enabled
                 or not self.session.online_running
                 or now - self._last_text_refresh_wall_ts >= 0.2
             ):
@@ -664,7 +685,7 @@ class MilpGuiApp:
             messagebox.showerror("Refresh Error", str(exc))
         next_delay = (
             self.render_refresh_interval_ms
-            if self.session.online_enabled and self.session.online_running
+            if self.enable_online_runtime and self.session.online_enabled and self.session.online_running
             else self.refresh_interval_ms
         )
         self.root.after(next_delay, self._schedule_refresh)
@@ -1011,11 +1032,50 @@ class MilpGuiApp:
         self.root.mainloop()
 
 
-def run_gui(cfg: SimulationConfig = DEFAULT_CONFIG) -> None:
+class OfflineGuiApp(_BaseGuiApp):
+    def __init__(self, cfg: SimulationConfig = DEFAULT_CONFIG) -> None:
+        super().__init__(
+            session=OfflineSession(cfg),
+            cfg=cfg,
+            window_title="MILP Static Allocation GUI",
+            enable_online_runtime=False,
+            enable_offline_tools=True,
+        )
+
+
+class OnlineGuiApp(_BaseGuiApp):
+    def __init__(self, cfg: SimulationConfig = DEFAULT_CONFIG) -> None:
+        super().__init__(
+            session=OnlineSession(cfg),
+            cfg=cfg,
+            window_title="MILP Online Allocation GUI",
+            enable_online_runtime=True,
+            enable_offline_tools=False,
+        )
+
+
+MilpGuiApp = OfflineGuiApp
+
+
+def run_offline_gui(cfg: SimulationConfig = DEFAULT_CONFIG) -> None:
     try:
-        app = MilpGuiApp(cfg=cfg)
+        app = OfflineGuiApp(cfg=cfg)
     except tk.TclError as exc:
         raise RuntimeError(
             "Failed to start GUI. A graphical display is required (X11/Wayland/macOS window server)."
         ) from exc
     app.run()
+
+
+def run_online_gui(cfg: SimulationConfig = DEFAULT_CONFIG) -> None:
+    try:
+        app = OnlineGuiApp(cfg=cfg)
+    except tk.TclError as exc:
+        raise RuntimeError(
+            "Failed to start GUI. A graphical display is required (X11/Wayland/macOS window server)."
+        ) from exc
+    app.run()
+
+
+def run_gui(cfg: SimulationConfig = DEFAULT_CONFIG) -> None:
+    run_offline_gui(cfg)

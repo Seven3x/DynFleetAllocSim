@@ -42,6 +42,7 @@ class SimulationConfig:
     lambda_rho: float = 0.20
     corridor_width: float = 8.0
     verify_epsilon: float = 0.25
+    enable_bid_verification: bool = True
 
     astar_resolution: float = 1.0
     astar_connect_diagonal: bool = True

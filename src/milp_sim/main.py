@@ -103,7 +103,12 @@ def main() -> None:
     mode.add_argument(
         "--gui",
         action="store_true",
-        help="start Tkinter GUI for realtime add/cancel operations",
+        help="start offline Tkinter GUI for static allocation and analysis",
+    )
+    mode.add_argument(
+        "--gui-online",
+        action="store_true",
+        help="start online Tkinter GUI for runtime replanning",
     )
     args = parser.parse_args()
 
@@ -112,9 +117,13 @@ def main() -> None:
 
         run_interactive(DEFAULT_CONFIG)
     elif args.gui:
-        from .gui_app import run_gui
+        from .gui_app import run_offline_gui
 
-        run_gui(DEFAULT_CONFIG)
+        run_offline_gui(DEFAULT_CONFIG)
+    elif args.gui_online:
+        from .gui_app import run_online_gui
+
+        run_online_gui(DEFAULT_CONFIG)
     else:
         run(DEFAULT_CONFIG)
 

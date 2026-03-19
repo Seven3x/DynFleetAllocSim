@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -84,6 +84,23 @@ class UserActionRecord:
     online_dt: float | None = None
     replan_period_s: float | None = None
     payload: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class OfflineComparisonVariant:
+    label: str
+    system_total_time: float
+    auction_rounds: int
+    verification_checks: int
+    verification_failures: int
+    vehicle_summaries: list[str]
+
+
+@dataclass
+class OfflineComparisonSummary:
+    with_verification: OfflineComparisonVariant
+    without_verification: OfflineComparisonVariant
+    delta_summary: str
 
 
 class SimulationSession:
@@ -2055,3 +2072,380 @@ class SimulationSession:
                     )
 
         return coord_path, verify_path, big_path
+
+
+class OfflineSession:
+    def __init__(self, cfg: SimulationConfig = DEFAULT_CONFIG) -> None:
+        self.cfg = cfg
+        self._session = SimulationSession(cfg)
+        self._comparison_cache: OfflineComparisonSummary | None = None
+
+    @property
+    def artifacts(self) -> SimulationArtifacts | None:
+        return self._session.artifacts
+
+    @property
+    def engine(self) -> AllocationEngine | None:
+        return self._session.engine
+
+    @property
+    def step(self) -> int:
+        return self._session.step
+
+    @property
+    def online_enabled(self) -> bool:
+        return False
+
+    @property
+    def online_running(self) -> bool:
+        return False
+
+    @property
+    def online_dt(self) -> float:
+        return self.cfg.online_dt
+
+    def _invalidate_comparison_cache(self) -> None:
+        self._comparison_cache = None
+
+    def _current_offline_actions(self) -> list[UserActionRecord]:
+        return copy.deepcopy(self._session._recorded_user_actions)
+
+    @staticmethod
+    def _build_variant(label: str, result: AllocationResult) -> OfflineComparisonVariant:
+        vehicle_summaries: list[str] = []
+        for v in result.vehicles:
+            seq = ",".join(f"T{tid}" for tid in v.task_sequence) if v.task_sequence else "(none)"
+            vehicle_summaries.append(f"V{v.id}: remain={v.remaining_capacity}/{v.capacity} tasks=[{seq}]")
+        failures = sum(1 for item in result.verification_logs if not item.passed)
+        return OfflineComparisonVariant(
+            label=label,
+            system_total_time=float(result.system_total_time),
+            auction_rounds=len(result.auction_logs),
+            verification_checks=len(result.verification_logs),
+            verification_failures=failures,
+            vehicle_summaries=vehicle_summaries,
+        )
+
+    @staticmethod
+    def _apply_actions_to_session(session: SimulationSession, actions: list[UserActionRecord]) -> None:
+        for action in actions:
+            session._apply_user_action_record(copy.deepcopy(action))
+
+    def _build_comparison_summary(self) -> OfflineComparisonSummary:
+        actions = self._current_offline_actions()
+        with_verify = SimulationSession(replace(self.cfg, enable_bid_verification=True))
+        without_verify = SimulationSession(replace(self.cfg, enable_bid_verification=False))
+
+        self._apply_actions_to_session(with_verify, actions)
+        self._apply_actions_to_session(without_verify, actions)
+
+        with_result = with_verify.result()
+        without_result = without_verify.result()
+        with_variant = self._build_variant("With Verification", with_result)
+        without_variant = self._build_variant("Without Verification", without_result)
+
+        changed: list[str] = []
+        for v_with, v_without in zip(with_result.vehicles, without_result.vehicles):
+            if list(v_with.task_sequence) != list(v_without.task_sequence):
+                changed.append(f"V{v_with.id}")
+
+        delta_time = without_variant.system_total_time - with_variant.system_total_time
+        if changed:
+            delta_summary = (
+                f"delta_total_time={delta_time:+.3f}; changed_sequences={','.join(changed)}"
+            )
+        else:
+            delta_summary = f"delta_total_time={delta_time:+.3f}; changed_sequences=(none)"
+
+        return OfflineComparisonSummary(
+            with_verification=with_variant,
+            without_verification=without_variant,
+            delta_summary=delta_summary,
+        )
+
+    def comparison_summary(self) -> OfflineComparisonSummary:
+        if self._comparison_cache is None:
+            self._comparison_cache = self._build_comparison_summary()
+        return self._comparison_cache
+
+    def format_comparison_text(self) -> str:
+        summary = self.comparison_summary()
+        lines = ["Offline Comparison:"]
+        for variant in (summary.with_verification, summary.without_verification):
+            lines.append(f"  {variant.label}")
+            lines.append(
+                "    "
+                f"system_total_time={variant.system_total_time:.3f} "
+                f"auction_rounds={variant.auction_rounds} "
+                f"verification_checks={variant.verification_checks} "
+                f"verification_failures={variant.verification_failures}"
+            )
+            for vehicle_line in variant.vehicle_summaries:
+                lines.append(f"    {vehicle_line}")
+        lines.append(f"  Delta: {summary.delta_summary}")
+        return "\n".join(lines)
+
+    def reset(self, replay_last_actions: bool = False) -> None:
+        self._session.reset(replay_last_actions=replay_last_actions)
+        self._invalidate_comparison_cache()
+
+    def replay_last_user_actions(self) -> None:
+        self._session.replay_last_user_actions()
+        self._invalidate_comparison_cache()
+
+    def can_undo(self) -> bool:
+        return self._session.can_undo()
+
+    def undo(self) -> None:
+        self._session.undo()
+        if self._session._recorded_user_actions:
+            self._session._recorded_user_actions.pop()
+        self._invalidate_comparison_cache()
+
+    def add_obstacle_polygon(self, points: list[tuple[float, float]]) -> Polygon:
+        poly = self._session.add_obstacle_polygon(points)
+        self._invalidate_comparison_cache()
+        return poly
+
+    def remove_obstacle(self, obstacle_idx: int) -> None:
+        self._session.remove_obstacle(obstacle_idx=obstacle_idx)
+        self._invalidate_comparison_cache()
+
+    def list_obstacles(self) -> list[tuple[int, float]]:
+        return self._session.list_obstacles()
+
+    def add_task(self, x: float, y: float, demand: int, task_id: int | None = None) -> Task:
+        task = self._session.add_task(x=x, y=y, demand=demand, task_id=task_id)
+        self._invalidate_comparison_cache()
+        return task
+
+    def move_task(self, task_id: int, x: float, y: float) -> Task:
+        task = self._session.move_task(task_id=task_id, x=x, y=y)
+        self._invalidate_comparison_cache()
+        return task
+
+    def add_random_task(self, demand: int | None = None) -> Task:
+        task = self._session.add_random_task(demand=demand)
+        self._invalidate_comparison_cache()
+        return task
+
+    def cancel_task(self, task_id: int) -> None:
+        self._session.cancel_task(task_id=task_id)
+        self._invalidate_comparison_cache()
+
+    def result(self) -> AllocationResult:
+        return self._session.result()
+
+    def status_snapshot(self) -> SessionSnapshot:
+        return self._session.status_snapshot()
+
+    def runtime_snapshot(self) -> RuntimeSnapshot:
+        return RuntimeSnapshot(
+            sim_time=0.0,
+            online_running=False,
+            dt=self.cfg.online_dt,
+            replan_period_s=self.cfg.online_replan_period_s,
+            next_replan_time=self.cfg.online_replan_period_s,
+            pending_new_task_replan_count=0,
+            pending_events=[],
+            last_replan_reason="",
+            last_event_message="",
+        )
+
+    def status_counts(self) -> dict[str, int]:
+        return self._session.status_counts()
+
+    def list_tasks(self, status_filter: str | None = None) -> list[Task]:
+        return self._session.list_tasks(status_filter=status_filter)
+
+    def recent_logs(self, n: int = 5):
+        return self._session.recent_logs(n=n)
+
+    def format_user_action_history_text(self, n: int = 12) -> str:
+        return self._session.format_user_action_history_text(n=n)
+
+    def format_status_text(self) -> str:
+        text = self._session.format_status_text()
+        try:
+            return f"{text}\n\n{self.format_comparison_text()}"
+        except Exception as exc:
+            return f"{text}\n\nOffline Comparison:\n  unavailable: {exc}"
+
+    def format_logs_text(self, n: int = 8) -> str:
+        return self._session.format_logs_text(n=n)
+
+    def format_tasks_text(self, status_filter: Optional[str] = None, limit: int = 60) -> str:
+        return self._session.format_tasks_text(status_filter=status_filter, limit=limit)
+
+    def draw_on_axis(self, ax, render_state: Optional[dict[int, dict[str, object]]] = None) -> None:
+        self._session.draw_on_axis(ax, render_state=None)
+
+    def save_snapshot(self, filename: str | None = None) -> Path:
+        return self._session.save_snapshot(filename=filename)
+
+    def export_logs(self, prefix: str | None = None) -> tuple[Path, Path, Path]:
+        return self._session.export_logs(prefix=prefix)
+
+
+class OnlineSession:
+    def __init__(self, cfg: SimulationConfig = DEFAULT_CONFIG) -> None:
+        self.cfg = cfg
+        self._session = SimulationSession(cfg)
+
+    @property
+    def artifacts(self) -> SimulationArtifacts | None:
+        return self._session.artifacts
+
+    @property
+    def engine(self) -> AllocationEngine | None:
+        return self._session.engine
+
+    @property
+    def step(self) -> int:
+        return self._session.step
+
+    @property
+    def online_enabled(self) -> bool:
+        return self._session.online_enabled
+
+    @property
+    def online_running(self) -> bool:
+        return self._session.online_running
+
+    @property
+    def online_dt(self) -> float:
+        return self._session.online_dt
+
+    def _ensure_runtime_ready(self) -> None:
+        if not self._session.online_enabled:
+            self._session.start_online()
+            self._session.pause_online()
+
+    def reset(self) -> None:
+        self._session.reset()
+
+    def runtime_snapshot(self) -> RuntimeSnapshot:
+        return self._session.runtime_snapshot()
+
+    def start_online(self, dt: float | None = None, replan_period_s: float | None = None) -> RuntimeSnapshot:
+        return self._session.start_online(dt=dt, replan_period_s=replan_period_s)
+
+    def pause_online(self) -> None:
+        self._session.pause_online()
+
+    def resume_online(self) -> None:
+        if not self._session.online_enabled:
+            self._session.start_online()
+            self._session.pause_online()
+        self._session.resume_online()
+
+    def tick(self, n: int = 1) -> RuntimeSnapshot:
+        self._ensure_runtime_ready()
+        if not self._session.online_running:
+            self._session.pause_online()
+        return self._session.tick(n=n)
+
+    def frame_prev(self) -> RuntimeSnapshot:
+        self._ensure_runtime_ready()
+        self._session.pause_online()
+        return self._session.frame_prev()
+
+    def frame_next(self) -> RuntimeSnapshot:
+        self._ensure_runtime_ready()
+        self._session.pause_online()
+        return self._session.frame_next()
+
+    def add_obstacle_polygon(self, points: list[tuple[float, float]]) -> Polygon:
+        self._ensure_runtime_ready()
+        return self._session.add_obstacle_polygon(points)
+
+    def remove_obstacle(self, obstacle_idx: int) -> None:
+        self._ensure_runtime_ready()
+        self._session.remove_obstacle(obstacle_idx=obstacle_idx)
+
+    def list_obstacles(self) -> list[tuple[int, float]]:
+        return self._session.list_obstacles()
+
+    def add_task(self, x: float, y: float, demand: int, task_id: int | None = None) -> Task:
+        self._ensure_runtime_ready()
+        return self._session.add_task(x=x, y=y, demand=demand, task_id=task_id)
+
+    def move_task(self, task_id: int, x: float, y: float) -> Task:
+        self._ensure_runtime_ready()
+        return self._session.move_task(task_id=task_id, x=x, y=y)
+
+    def add_random_task(self, demand: int | None = None) -> Task:
+        self._ensure_runtime_ready()
+        return self._session.add_random_task(demand=demand)
+
+    def cancel_task(self, task_id: int) -> None:
+        self._ensure_runtime_ready()
+        self._session.cancel_task(task_id=task_id)
+
+    def status_snapshot(self) -> SessionSnapshot:
+        if self._session.online_enabled:
+            return self._session.status_snapshot()
+        result = self._session.result()
+        return SessionSnapshot(
+            step=self._session.step,
+            total_tasks=len(result.tasks),
+            status_counts=self._session.status_counts(),
+            system_total_time=result.system_total_time,
+        )
+
+    def status_counts(self) -> dict[str, int]:
+        return self._session.status_counts()
+
+    def list_tasks(self, status_filter: str | None = None) -> list[Task]:
+        return self._session.list_tasks(status_filter=status_filter)
+
+    def recent_logs(self, n: int = 5):
+        if not self._session.online_enabled:
+            return [], []
+        return self._session.recent_logs(n=n)
+
+    def format_user_action_history_text(self, n: int = 12) -> str:
+        return self._session.format_user_action_history_text(n=n)
+
+    def format_status_text(self) -> str:
+        if self._session.online_enabled:
+            return self._session.format_status_text()
+
+        assert self._session.engine is not None
+        snap = self.status_snapshot()
+        lines = [
+            "-" * 88,
+            "Online runtime ready. Click Start Online to initialize runtime.",
+            f"step={snap.step} total_tasks={snap.total_tasks} status={snap.status_counts}",
+        ]
+        for v in self._session.engine.vehicles:
+            seq = ",".join(f"T{tid}" for tid in v.task_sequence) if v.task_sequence else "(none)"
+            lines.append(
+                f"V{v.id}: start=({v.start_pos[0]:.2f},{v.start_pos[1]:.2f}) "
+                f"remain={v.remaining_capacity}/{v.capacity} tasks=[{seq}]"
+            )
+        lines.append("-" * 88)
+        return "\n".join(lines)
+
+    def format_logs_text(self, n: int = 8) -> str:
+        if not self._session.online_enabled:
+            lines = [
+                "Online runtime not started yet.",
+                "Use Start Online to initialize runtime, event handling, and frame history.",
+            ]
+            if self._session._recorded_user_actions:
+                lines.append(self._session.format_user_action_history_text(n=n))
+            return "\n".join(lines)
+        return self._session.format_logs_text(n=n)
+
+    def format_tasks_text(self, status_filter: Optional[str] = None, limit: int = 60) -> str:
+        return self._session.format_tasks_text(status_filter=status_filter, limit=limit)
+
+    def draw_on_axis(self, ax, render_state: Optional[dict[int, dict[str, object]]] = None) -> None:
+        self._session.draw_on_axis(ax, render_state=render_state)
+
+    def save_snapshot(self, filename: str | None = None) -> Path:
+        return self._session.save_snapshot(filename=filename)
+
+    def export_logs(self, prefix: str | None = None) -> tuple[Path, Path, Path]:
+        return self._session.export_logs(prefix=prefix)
