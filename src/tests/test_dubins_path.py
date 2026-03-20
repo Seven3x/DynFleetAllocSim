@@ -7,6 +7,7 @@ try:
     from shapely.geometry import LineString, box
 
     from milp_sim.config import DEFAULT_CONFIG
+    from milp_sim.cost_estimator import heading_to_point
     from milp_sim.dubins_path import DUBINS_WORDS, build_dubins_hybrid_path, solve_dubins_word
     from milp_sim.entities import Task, Vehicle
     from milp_sim.map_utils import WorldMap
@@ -93,6 +94,7 @@ class TestDubinsPath(unittest.TestCase):
             DEFAULT_CONFIG,
             use_dubins_hybrid=True,
             use_hybrid_astar=True,
+            enable_connector_first_planner=False,
             hybrid_astar_fallback_to_legacy=False,
             hybrid_astar_step_size=1.0,
             hybrid_astar_max_expansions=30000,
@@ -137,6 +139,7 @@ class TestDubinsPath(unittest.TestCase):
             DEFAULT_CONFIG,
             use_dubins_hybrid=True,
             use_hybrid_astar=True,
+            enable_connector_first_planner=False,
             hybrid_astar_fallback_to_legacy=False,
             hybrid_astar_allow_reverse=False,
             hybrid_astar_retry_on_fail=False,
@@ -238,6 +241,7 @@ class TestDubinsPath(unittest.TestCase):
             DEFAULT_CONFIG,
             use_dubins_hybrid=True,
             use_hybrid_astar=True,
+            enable_connector_first_planner=False,
             hybrid_astar_fallback_to_legacy=True,
             hybrid_astar_direct_astar_fallback=True,
         )
@@ -272,6 +276,7 @@ class TestDubinsPath(unittest.TestCase):
             DEFAULT_CONFIG,
             use_dubins_hybrid=True,
             use_hybrid_astar=False,
+            enable_connector_first_planner=False,
             astar_smooth_before_dubins=False,
             dubins_sample_step=0.8,
             dubins_collision_margin=40.0,
@@ -298,11 +303,85 @@ class TestDubinsPath(unittest.TestCase):
         self.assertIn(meta.fallback_reason, {"direct_collision", "corner_collision", "final_collision"})
         self.assertIn("collision", meta.fallback_details)
 
+    def test_connector_first_prefers_straight_in_open_space(self) -> None:
+        cfg = replace(
+            DEFAULT_CONFIG,
+            use_dubins_hybrid=True,
+            use_hybrid_astar=True,
+            enable_connector_first_planner=True,
+            hybrid_astar_fallback_to_legacy=False,
+        )
+        start = (12.0, 14.0, heading_to_point((12.0, 14.0), (85.0, 76.0)))
+        goal = (85.0, 76.0, heading_to_point((12.0, 14.0), (85.0, 76.0)))
+
+        points, length, meta = build_dubins_hybrid_path(
+            world=self.world,
+            cfg=cfg,
+            start_pose=start,
+            goal_pose=goal,
+            astar_planner=self.planner,
+            turn_radius=10.0,
+        )
+
+        self.assertEqual(points, [(start[0], start[1]), (goal[0], goal[1])])
+        self.assertTrue(math.isfinite(length))
+        self.assertFalse(meta.used_fallback)
+        self.assertEqual(meta.connector_type, "straight")
+        self.assertIn("connector_straight_success", meta.debug_trace)
+
+    def test_connector_first_rejects_large_rs_detour_and_uses_hybrid_local(self) -> None:
+        cfg = replace(
+            DEFAULT_CONFIG,
+            use_dubins_hybrid=True,
+            use_hybrid_astar=True,
+            enable_connector_first_planner=True,
+            connector_use_straight_first=False,
+            connector_use_dubins=False,
+            connector_use_reeds_shepp=True,
+            hybrid_astar_allow_reverse=True,
+            connector_max_detour_ratio_vs_reference=1.05,
+            connector_max_detour_abs_vs_reference=1.0,
+            hybrid_astar_fallback_to_legacy=False,
+        )
+        start = (12.0, 14.0, 0.0)
+        goal = (28.0, 18.0, 0.2)
+        long_rs = [(12.0, 14.0), (12.0, 40.0), (28.0, 18.0)]
+        hybrid_path = [(12.0, 14.0), (20.0, 16.0), (28.0, 18.0)]
+
+        with patch.object(
+            self.planner,
+            "plan_local_connector",
+            return_value=(
+                long_rs,
+                120.0,
+                HybridPlanDiagnostics(debug_trace="connector:reeds_shepp_like:ok", used_connector=True, connector_mode="reeds_shepp_like"),
+            ),
+        ), patch.object(
+            self.planner,
+            "plan_hybrid_detailed",
+            return_value=(hybrid_path, 16.5, HybridPlanDiagnostics(debug_trace="hybrid_astar:ok")),
+        ):
+            points, length, meta = build_dubins_hybrid_path(
+                world=self.world,
+                cfg=cfg,
+                start_pose=start,
+                goal_pose=goal,
+                astar_planner=self.planner,
+                turn_radius=8.0,
+            )
+
+        self.assertEqual(points, hybrid_path)
+        self.assertAlmostEqual(length, 16.5, places=6)
+        self.assertEqual(meta.connector_type, "hybrid_local")
+        self.assertIn("connector_rs_detour_reject", meta.debug_trace)
+        self.assertIn("connector_hybrid_local_success", meta.debug_trace)
+
     def test_hybrid_returns_inf_when_fallback_disabled_and_collision_strict(self) -> None:
         cfg = replace(
             DEFAULT_CONFIG,
             use_dubins_hybrid=True,
             use_hybrid_astar=False,
+            enable_connector_first_planner=False,
             astar_smooth_before_dubins=False,
             dubins_sample_step=0.8,
             dubins_collision_margin=40.0,
@@ -386,6 +465,7 @@ class TestDubinsPath(unittest.TestCase):
             DEFAULT_CONFIG,
             use_dubins_hybrid=True,
             use_hybrid_astar=False,
+            enable_connector_first_planner=False,
             astar_smooth_before_dubins=False,
             dubins_fallback_to_astar=True,
             dubins_collision_margin=1.8,

@@ -8,6 +8,7 @@ from shapely.geometry import LineString
 
 from .cost_estimator import heading_to_point, wrap_to_pi
 from .map_utils import WorldMap
+from .path_postprocess import simplify_reference_polyline
 from .planner_astar import AStarPlanner, HybridPlanDiagnostics
 
 
@@ -27,6 +28,8 @@ class DubinsHybridMeta:
     fallback_reason: str = ""
     fallback_details: str = ""
     debug_trace: str = ""
+    connector_type: str = ""
+    connector_summary: str = ""
 
 
 def _mod2pi(angle: float) -> float:
@@ -223,6 +226,16 @@ def _polyline_length(points: List[Point2D]) -> float:
     return total
 
 
+def _dedupe_points(points: List[Point2D]) -> List[Point2D]:
+    if not points:
+        return []
+    out = [points[0]]
+    for p in points[1:]:
+        if math.hypot(p[0] - out[-1][0], p[1] - out[-1][1]) > 1e-9:
+            out.append(p)
+    return out
+
+
 def _segment_collision_free(a: Point2D, b: Point2D, world: WorldMap, margin: float) -> bool:
     line = LineString([a, b])
     if margin > 0.0:
@@ -301,6 +314,483 @@ def _stage_reason_tags(diag: HybridPlanDiagnostics, stage: str) -> List[str]:
     if not tags and getattr(diag, "reason", ""):
         tags.append(str(diag.reason))
     return tags
+
+
+def _bbox_from_points(points: List[Point2D], padding: float) -> Tuple[float, float, float, float]:
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    pad = max(0.0, float(padding))
+    return min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad
+
+
+def _path_terminal_heading(points: List[Point2D], default_heading: float) -> float:
+    for i in range(len(points) - 1, 0, -1):
+        dx = points[i][0] - points[i - 1][0]
+        dy = points[i][1] - points[i - 1][1]
+        if math.hypot(dx, dy) > 1e-9:
+            return math.atan2(dy, dx)
+    return default_heading
+
+
+def _heading_error(a: float, b: float) -> float:
+    return abs(wrap_to_pi(a - b))
+
+
+def _connector_detour_too_large(
+    *,
+    candidate_length: float,
+    reference_length: float,
+    cfg,
+) -> bool:
+    if not math.isfinite(candidate_length) or not math.isfinite(reference_length):
+        return False
+    if reference_length <= 1e-9:
+        return False
+    ratio_limit = max(1.0, float(getattr(cfg, "connector_max_detour_ratio_vs_reference", 1.35)))
+    abs_limit = max(0.0, float(getattr(cfg, "connector_max_detour_abs_vs_reference", 12.0)))
+    return candidate_length > reference_length * ratio_limit + abs_limit
+
+
+def _try_straight_connector(
+    *,
+    start_pose: Pose2D,
+    goal_pose: Pose2D,
+    world: WorldMap,
+    margin: float,
+    heading_tolerance: float,
+) -> Tuple[List[Point2D], float, str]:
+    line_heading = heading_to_point((start_pose[0], start_pose[1]), (goal_pose[0], goal_pose[1]))
+    start_err = _heading_error(line_heading, start_pose[2])
+    goal_err = _heading_error(goal_pose[2], line_heading)
+    if max(start_err, goal_err) > max(0.0, float(heading_tolerance)) + 1e-9:
+        return [], float("inf"), "connector_heading_reject"
+
+    points = [(start_pose[0], start_pose[1]), (goal_pose[0], goal_pose[1])]
+    if not _polyline_collision_free(points, world=world, margin=margin):
+        return [], float("inf"), "connector_collision_reject"
+    return points, _polyline_length(points), "connector_straight_success"
+
+
+def _try_dubins_connector(
+    *,
+    start_pose: Pose2D,
+    goal_pose: Pose2D,
+    turn_radius: float,
+    sample_step: float,
+    world: WorldMap,
+    margin: float,
+) -> Tuple[List[Point2D], float, str]:
+    dubins_sol = _build_shortest_dubins_local(start_pose=start_pose, goal_pose=goal_pose, turn_radius=turn_radius)
+    if dubins_sol is not None:
+        word, params = dubins_sol
+        dubins_points = _sample_dubins_segment(
+            start_pose=start_pose,
+            word=word,
+            params=params,
+            turn_radius=turn_radius,
+            sample_step=sample_step,
+        )
+        dubins_points[0] = (start_pose[0], start_pose[1])
+        dubins_points[-1] = (goal_pose[0], goal_pose[1])
+        if _polyline_collision_free(dubins_points, world=world, margin=margin):
+            return dubins_points, _polyline_length(dubins_points), "connector_dubins_success"
+
+    recovered_points, recovered_len, _ = _try_direct_recovery_path(
+        start_pose=start_pose,
+        goal_pose=goal_pose,
+        turn_radius=turn_radius,
+        sample_step=sample_step,
+        world=world,
+        margin=margin,
+    )
+    if recovered_points and math.isfinite(recovered_len):
+        return recovered_points, recovered_len, "connector_dubins_success"
+    return [], float("inf"), "connector_collision_reject"
+
+
+def _empty_connector_meta(reason: str, debug_trace: str = "") -> DubinsHybridMeta:
+    return DubinsHybridMeta(
+        used_fallback=True,
+        fallback_segments=1,
+        dubins_segments=0,
+        sample_count=0,
+        dubins_ratio=0.0,
+        fallback_reason=reason,
+        fallback_details=reason,
+        debug_trace=debug_trace,
+    )
+
+
+def _finalize_connector_meta(
+    *,
+    points: List[Point2D],
+    length: float,
+    success_counts: Dict[str, int],
+    event_counts: Dict[str, int],
+    plain_astar_count: int,
+    debug_parts: List[str],
+) -> DubinsHybridMeta:
+    connector_type = "mixed"
+    if plain_astar_count > 0:
+        connector_type = "plain_astar"
+    else:
+        nonzero = [name for name, count in success_counts.items() if count > 0]
+        if len(nonzero) == 1:
+            connector_type = nonzero[0]
+        elif len(nonzero) > 1:
+            connector_type = "mixed"
+    connector_summary = "|".join(
+        [
+            f"straight:{success_counts.get('straight', 0)}",
+            f"reeds_shepp_like:{success_counts.get('reeds_shepp_like', 0)}",
+            f"dubins_like:{success_counts.get('dubins_like', 0)}",
+            f"hybrid_local:{success_counts.get('hybrid_local', 0)}",
+            f"plain_astar:{plain_astar_count}",
+        ]
+    )
+    event_summary = "|".join(f"{name}:{event_counts[name]}" for name in sorted(event_counts) if event_counts[name] > 0)
+    debug_trace = ";".join(part for part in debug_parts if part)
+    if event_summary:
+        debug_trace = f"{debug_trace};events:{event_summary}" if debug_trace else f"events:{event_summary}"
+
+    straight_len = math.hypot(points[-1][0] - points[0][0], points[-1][1] - points[0][1]) if len(points) >= 2 else 0.0
+    added_curve = max(0.0, length - straight_len)
+    ratio = 0.0 if length <= 1e-9 else max(0.0, min(1.0, added_curve / length))
+    used_fallback = plain_astar_count > 0
+    fallback_reason = "connector_plain_astar_fallback" if used_fallback else ""
+    fallback_details = event_summary if used_fallback else ""
+    return DubinsHybridMeta(
+        used_fallback=used_fallback,
+        fallback_segments=plain_astar_count,
+        dubins_segments=success_counts.get("reeds_shepp_like", 0) + success_counts.get("dubins_like", 0),
+        sample_count=len(points),
+        dubins_ratio=ratio,
+        fallback_reason=fallback_reason,
+        fallback_details=fallback_details,
+        debug_trace=debug_trace,
+        connector_type=connector_type,
+        connector_summary=connector_summary,
+    )
+
+
+def build_segment_connector_path(
+    world: WorldMap,
+    cfg,
+    start_pose: Pose2D,
+    goal_pose: Pose2D,
+    astar_planner: AStarPlanner,
+    turn_radius: float,
+    astar_path: Optional[List[Point2D]] = None,
+    astar_length: Optional[float] = None,
+) -> Tuple[List[Point2D], float, DubinsHybridMeta]:
+    if astar_path is None or astar_length is None:
+        astar_path, astar_length = astar_planner.plan((start_pose[0], start_pose[1]), (goal_pose[0], goal_pose[1]))
+    if not astar_path or astar_length == float("inf"):
+        return [], float("inf"), _empty_connector_meta("astar_unreachable", "connector_plain_astar_fallback")
+
+    collision_margin = float(getattr(cfg, "dubins_collision_margin", 0.0))
+    smoothing_margin = max(
+        collision_margin,
+        float(getattr(cfg, "vehicle_radius", 0.0)) + float(getattr(cfg, "safety_margin", 0.0)),
+    )
+    reference_path = simplify_reference_polyline(
+        world,
+        astar_path,
+        margin=smoothing_margin,
+        enable_shortcut=bool(getattr(cfg, "connector_shortcut_enable", True)),
+        enable_string_pull=bool(getattr(cfg, "connector_string_pull_enable", True)),
+        string_pull_passes=int(getattr(cfg, "connector_string_pull_passes", 2)),
+        split_turn_angle_threshold=float(getattr(cfg, "connector_split_turn_angle_threshold", 0.0)),
+    )
+    if len(reference_path) < 2:
+        reference_path = [(start_pose[0], start_pose[1]), (goal_pose[0], goal_pose[1])]
+    reference_path[0] = (start_pose[0], start_pose[1])
+    reference_path[-1] = (goal_pose[0], goal_pose[1])
+    reference_length = _polyline_length(reference_path)
+
+    straight_tol = float(getattr(cfg, "connector_max_heading_error_for_straight", 0.35))
+    short_span_tol = float(getattr(cfg, "connector_short_span_heading_error_for_straight", straight_tol))
+    rs_max_expansions = int(getattr(cfg, "connector_rs_max_expansions", 180))
+    rs_max_depth = int(getattr(cfg, "connector_rs_max_depth", 6))
+    hybrid_max_expansions = int(getattr(cfg, "connector_max_local_hybrid_expansions", 2600))
+    hybrid_heading_bins = int(getattr(cfg, "connector_local_hybrid_heading_bins", 48))
+    hybrid_goal_pos_tol = float(getattr(cfg, "connector_local_hybrid_goal_pos_tolerance", 1.8))
+    hybrid_goal_yaw_tol = float(getattr(cfg, "connector_local_hybrid_goal_heading_tolerance_rad", 0.95))
+    corridor_radius = float(getattr(cfg, "connector_corridor_radius", 6.0))
+    bbox_padding = float(getattr(cfg, "connector_local_bbox_padding", 4.0))
+    allow_reverse = bool(getattr(cfg, "hybrid_astar_allow_reverse", False))
+    plain_astar_ok = bool(getattr(cfg, "connector_use_plain_astar_fallback", True)) and bool(
+        getattr(cfg, "dubins_fallback_to_astar", True)
+    )
+
+    success_counts = {
+        "straight": 0,
+        "reeds_shepp_like": 0,
+        "dubins_like": 0,
+        "hybrid_local": 0,
+    }
+    event_counts = {
+        "connector_straight_success": 0,
+        "connector_rs_success": 0,
+        "connector_dubins_success": 0,
+        "connector_hybrid_local_success": 0,
+        "connector_plain_astar_fallback": 0,
+        "connector_collision_reject": 0,
+        "connector_heading_reject": 0,
+        "connector_stitch_failure": 0,
+    }
+    debug_parts = [f"connector_reference_points:{len(reference_path)}"]
+
+    if bool(getattr(cfg, "connector_direct_whole_segment_first", True)):
+        whole_bbox = _bbox_from_points(reference_path, corridor_radius + bbox_padding)
+        whole_dist = math.hypot(goal_pose[0] - start_pose[0], goal_pose[1] - start_pose[1])
+        whole_straight_tol = short_span_tol if whole_dist <= 2.0 * turn_radius else straight_tol
+        if bool(getattr(cfg, "connector_use_straight_first", True)):
+            points, length, tag = _try_straight_connector(
+                start_pose=start_pose,
+                goal_pose=goal_pose,
+                world=world,
+                margin=collision_margin,
+                heading_tolerance=whole_straight_tol,
+            )
+            if points and math.isfinite(length):
+                event_counts["connector_straight_success"] += 1
+                success_counts["straight"] += 1
+                return points, length, _finalize_connector_meta(
+                    points=points,
+                    length=length,
+                    success_counts=success_counts,
+                    event_counts=event_counts,
+                    plain_astar_count=0,
+                    debug_parts=debug_parts + [tag],
+                )
+            event_counts["connector_heading_reject" if tag == "connector_heading_reject" else "connector_collision_reject"] += 1
+
+        if allow_reverse and bool(getattr(cfg, "connector_use_reeds_shepp", True)):
+            points, length, diag = astar_planner.plan_local_connector(
+                start_pose=start_pose,
+                goal_pose=goal_pose,
+                turn_radius=turn_radius,
+                step_size=float(getattr(cfg, "hybrid_astar_step_size", 1.0)),
+                heading_bins=hybrid_heading_bins,
+                goal_pos_tolerance=hybrid_goal_pos_tol,
+                goal_heading_tolerance=hybrid_goal_yaw_tol,
+                allow_reverse=True,
+                max_expansions=rs_max_expansions,
+                max_depth=rs_max_depth,
+                connector_radius=max(corridor_radius, 1.2 * whole_dist),
+                search_bbox=whole_bbox,
+            )
+            if points and math.isfinite(length):
+                if _connector_detour_too_large(candidate_length=length, reference_length=reference_length, cfg=cfg):
+                    event_counts["connector_heading_reject"] += 1
+                    debug_parts.append("connector_rs_detour_reject")
+                else:
+                    event_counts["connector_rs_success"] += 1
+                    success_counts["reeds_shepp_like"] += 1
+                    return points, length, _finalize_connector_meta(
+                        points=points,
+                        length=length,
+                        success_counts=success_counts,
+                        event_counts=event_counts,
+                        plain_astar_count=0,
+                        debug_parts=debug_parts + ["connector_rs_success"],
+                    )
+            if getattr(diag, "reason", "") == "collision_on_connector":
+                event_counts["connector_collision_reject"] += 1
+
+        if bool(getattr(cfg, "connector_use_dubins", True)):
+            points, length, tag = _try_dubins_connector(
+                start_pose=start_pose,
+                goal_pose=goal_pose,
+                turn_radius=turn_radius,
+                sample_step=float(getattr(cfg, "dubins_sample_step", 0.5)),
+                world=world,
+                margin=collision_margin,
+            )
+            if points and math.isfinite(length):
+                if _connector_detour_too_large(candidate_length=length, reference_length=reference_length, cfg=cfg):
+                    event_counts["connector_heading_reject"] += 1
+                    debug_parts.append("connector_dubins_detour_reject")
+                else:
+                    event_counts["connector_dubins_success"] += 1
+                    success_counts["dubins_like"] += 1
+                    return points, length, _finalize_connector_meta(
+                        points=points,
+                        length=length,
+                        success_counts=success_counts,
+                        event_counts=event_counts,
+                        plain_astar_count=0,
+                        debug_parts=debug_parts + [tag],
+                    )
+            event_counts["connector_collision_reject"] += 1
+
+    out_points: List[Point2D] = [(start_pose[0], start_pose[1])]
+    current_pose = (float(start_pose[0]), float(start_pose[1]), float(start_pose[2]))
+    plain_astar_count = 0
+
+    for idx in range(1, len(reference_path)):
+        target_point = reference_path[idx]
+        if idx < len(reference_path) - 1:
+            target_heading = heading_to_point(target_point, reference_path[idx + 1])
+        else:
+            target_heading = float(goal_pose[2])
+        span_goal = (float(target_point[0]), float(target_point[1]), float(target_heading))
+        span_points_for_bbox = [current_pose[:2], target_point]
+        if idx < len(reference_path) - 1:
+            span_points_for_bbox.append(reference_path[idx + 1])
+        span_bbox = _bbox_from_points(span_points_for_bbox, corridor_radius + bbox_padding)
+        span_dist = math.hypot(target_point[0] - current_pose[0], target_point[1] - current_pose[1])
+        span_reference_length = span_dist
+        span_straight_tol = short_span_tol if span_dist <= 2.0 * turn_radius else straight_tol
+
+        accepted_points: List[Point2D] = []
+        accepted_length = float("inf")
+        accepted_heading = current_pose[2]
+
+        if bool(getattr(cfg, "connector_use_straight_first", True)):
+            points, length, tag = _try_straight_connector(
+                start_pose=current_pose,
+                goal_pose=span_goal,
+                world=world,
+                margin=collision_margin,
+                heading_tolerance=span_straight_tol,
+            )
+            if points and math.isfinite(length):
+                accepted_points = points
+                accepted_length = length
+                accepted_heading = _path_terminal_heading(points, span_goal[2])
+                success_counts["straight"] += 1
+                event_counts["connector_straight_success"] += 1
+                debug_parts.append(f"span{idx}:{tag}")
+            else:
+                event_counts["connector_heading_reject" if tag == "connector_heading_reject" else "connector_collision_reject"] += 1
+
+        if not accepted_points and allow_reverse and bool(getattr(cfg, "connector_use_reeds_shepp", True)):
+            points, length, diag = astar_planner.plan_local_connector(
+                start_pose=current_pose,
+                goal_pose=span_goal,
+                turn_radius=turn_radius,
+                step_size=float(getattr(cfg, "hybrid_astar_step_size", 1.0)),
+                heading_bins=hybrid_heading_bins,
+                goal_pos_tolerance=hybrid_goal_pos_tol,
+                goal_heading_tolerance=hybrid_goal_yaw_tol,
+                allow_reverse=True,
+                max_expansions=rs_max_expansions,
+                max_depth=rs_max_depth,
+                connector_radius=max(corridor_radius, 1.25 * span_dist),
+                search_bbox=span_bbox,
+            )
+            if points and math.isfinite(length):
+                if _connector_detour_too_large(candidate_length=length, reference_length=span_reference_length, cfg=cfg):
+                    event_counts["connector_heading_reject"] += 1
+                    debug_parts.append(f"span{idx}:connector_rs_detour_reject")
+                else:
+                    accepted_points = points
+                    accepted_length = length
+                    accepted_heading = span_goal[2]
+                    success_counts["reeds_shepp_like"] += 1
+                    event_counts["connector_rs_success"] += 1
+                    debug_parts.append(f"span{idx}:connector_rs_success")
+            elif getattr(diag, "reason", "") == "collision_on_connector":
+                event_counts["connector_collision_reject"] += 1
+
+        if not accepted_points and bool(getattr(cfg, "connector_use_dubins", True)):
+            points, length, tag = _try_dubins_connector(
+                start_pose=current_pose,
+                goal_pose=span_goal,
+                turn_radius=turn_radius,
+                sample_step=float(getattr(cfg, "dubins_sample_step", 0.5)),
+                world=world,
+                margin=collision_margin,
+            )
+            if points and math.isfinite(length):
+                if _connector_detour_too_large(candidate_length=length, reference_length=span_reference_length, cfg=cfg):
+                    event_counts["connector_heading_reject"] += 1
+                    debug_parts.append(f"span{idx}:connector_dubins_detour_reject")
+                else:
+                    accepted_points = points
+                    accepted_length = length
+                    accepted_heading = span_goal[2]
+                    success_counts["dubins_like"] += 1
+                    event_counts["connector_dubins_success"] += 1
+                    debug_parts.append(f"span{idx}:{tag}")
+            else:
+                event_counts["connector_collision_reject"] += 1
+
+        if not accepted_points and bool(getattr(cfg, "connector_use_hybrid_local_rescue", True)):
+            points, length, diag = astar_planner.plan_hybrid_detailed(
+                start_pose=current_pose,
+                goal_pose=span_goal,
+                turn_radius=turn_radius,
+                step_size=float(getattr(cfg, "hybrid_astar_step_size", 1.0)),
+                heading_bins=hybrid_heading_bins,
+                max_expansions=hybrid_max_expansions,
+                goal_pos_tolerance=hybrid_goal_pos_tol,
+                goal_heading_tolerance=hybrid_goal_yaw_tol,
+                allow_reverse=allow_reverse,
+                reverse_penalty=float(getattr(cfg, "hybrid_astar_reverse_penalty", 1.22)),
+                heuristic_weight=float(getattr(cfg, "hybrid_astar_heuristic_weight", 1.05)),
+                near_goal_connector_expansions=rs_max_expansions,
+                near_goal_connector_depth=rs_max_depth,
+                near_goal_connector_radius_factor=max(1.5, corridor_radius / max(turn_radius, 1e-6)),
+                search_bbox=span_bbox,
+            )
+            if points and math.isfinite(length):
+                accepted_points = points
+                accepted_length = length
+                accepted_heading = span_goal[2]
+                success_counts["hybrid_local"] += 1
+                event_counts["connector_hybrid_local_success"] += 1
+                debug_parts.append(f"span{idx}:connector_hybrid_local_success")
+            elif getattr(diag, "reason", "") == "collision_on_connector":
+                event_counts["connector_collision_reject"] += 1
+
+        if not accepted_points and plain_astar_ok:
+            span_astar_path, span_astar_len = astar_planner.plan(current_pose[:2], target_point)
+            if span_astar_path and math.isfinite(span_astar_len):
+                accepted_points = span_astar_path
+                accepted_length = span_astar_len
+                accepted_heading = _path_terminal_heading(span_astar_path, span_goal[2])
+                plain_astar_count += 1
+                event_counts["connector_plain_astar_fallback"] += 1
+                debug_parts.append(f"span{idx}:connector_plain_astar_fallback")
+
+        if not accepted_points or (not math.isfinite(accepted_length)):
+            return [], float("inf"), _empty_connector_meta(
+                "connector_stitch_failure",
+                ";".join(debug_parts + ["connector_stitch_failure"]),
+            )
+
+        stitched = _dedupe_points(out_points + accepted_points[1:])
+        if not _polyline_collision_free(stitched, world=world, margin=collision_margin):
+            event_counts["connector_stitch_failure"] += 1
+            if plain_astar_ok:
+                return astar_path, astar_length, _finalize_connector_meta(
+                    points=astar_path,
+                    length=astar_length,
+                    success_counts=success_counts,
+                    event_counts=event_counts,
+                    plain_astar_count=max(1, plain_astar_count),
+                    debug_parts=debug_parts + ["connector_stitch_failure", "connector_plain_astar_fallback"],
+                )
+            return [], float("inf"), _empty_connector_meta(
+                "connector_stitch_failure",
+                ";".join(debug_parts + ["connector_stitch_failure"]),
+            )
+
+        out_points = stitched
+        current_pose = (out_points[-1][0], out_points[-1][1], accepted_heading)
+
+    total_len = _polyline_length(out_points)
+    return out_points, total_len, _finalize_connector_meta(
+        points=out_points,
+        length=total_len,
+        success_counts=success_counts,
+        event_counts=event_counts,
+        plain_astar_count=plain_astar_count,
+        debug_parts=debug_parts,
+    )
 
 
 def _sample_recovery_arc(
@@ -819,6 +1309,22 @@ def build_dubins_hybrid_path(
     collision_margin = float(getattr(cfg, "dubins_collision_margin", 0.0))
     legacy_debug_prefix = ""
     legacy_reason_detail = ""
+
+    if use_dubins_hybrid and bool(getattr(cfg, "enable_connector_first_planner", True)) and not force_mode:
+        connector_points, connector_len, connector_meta = build_segment_connector_path(
+            world=world,
+            cfg=cfg,
+            start_pose=start_pose,
+            goal_pose=goal_pose,
+            astar_planner=astar_planner,
+            turn_radius=turn_radius,
+            astar_path=astar_path,
+            astar_length=astar_length,
+        )
+        if connector_points and math.isfinite(connector_len):
+            return connector_points, connector_len, connector_meta
+        if not bool(getattr(cfg, "hybrid_astar_fallback_to_legacy", True)):
+            return connector_points, connector_len, connector_meta
 
     def _finalize_legacy_return(
         points: List[Point2D],

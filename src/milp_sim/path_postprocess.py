@@ -7,7 +7,6 @@ from shapely.geometry import LineString, Point
 
 from .config import SimulationConfig
 from .cost_estimator import heading_to_point, wrap_to_pi
-from .dubins_path import build_dubins_hybrid_path
 from .entities import Point2D
 from .map_utils import WorldMap
 from .planner_astar import AStarPlanner
@@ -30,6 +29,103 @@ def polyline_is_clear(world: WorldMap, points: List[Point2D], margin: float) -> 
         swept = line.buffer(margin, cap_style=2, join_style=2)
         return not swept.intersects(world.obstacle_union)
     return not line.intersects(world.obstacle_union)
+
+
+def _dedupe_points(points: List[Point2D]) -> List[Point2D]:
+    if not points:
+        return []
+    out = [points[0]]
+    for p in points[1:]:
+        if math.hypot(p[0] - out[-1][0], p[1] - out[-1][1]) > 1e-9:
+            out.append(p)
+    return out
+
+
+def segment_is_clear(world: WorldMap, start: Point2D, end: Point2D, margin: float) -> bool:
+    return polyline_is_clear(world, [start, end], margin=margin)
+
+
+def shortcut_polyline(world: WorldMap, points: List[Point2D], margin: float) -> List[Point2D]:
+    path = _dedupe_points(points)
+    if len(path) <= 2:
+        return path
+
+    out: List[Point2D] = [path[0]]
+    anchor = 0
+    while anchor < len(path) - 1:
+        next_idx = anchor + 1
+        for probe in range(len(path) - 1, anchor + 1, -1):
+            if segment_is_clear(world, path[anchor], path[probe], margin=margin):
+                next_idx = probe
+                break
+        out.append(path[next_idx])
+        anchor = next_idx
+    return _dedupe_points(out)
+
+
+def string_pull_polyline(
+    world: WorldMap,
+    points: List[Point2D],
+    margin: float,
+    passes: int = 2,
+) -> List[Point2D]:
+    path = _dedupe_points(points)
+    if len(path) <= 2:
+        return path
+
+    out = list(path)
+    for _ in range(max(0, int(passes))):
+        updated = shortcut_polyline(world, out, margin=margin)
+        updated = list(reversed(shortcut_polyline(world, list(reversed(updated)), margin=margin)))
+        if len(updated) == len(out) and all(
+            math.hypot(a[0] - b[0], a[1] - b[1]) <= 1e-9 for a, b in zip(updated, out)
+        ):
+            break
+        out = updated
+    return _dedupe_points(out)
+
+
+def simplify_reference_polyline(
+    world: WorldMap,
+    points: List[Point2D],
+    margin: float,
+    *,
+    enable_shortcut: bool = True,
+    enable_string_pull: bool = True,
+    string_pull_passes: int = 2,
+    split_turn_angle_threshold: float = 0.0,
+) -> List[Point2D]:
+    path = _dedupe_points(points)
+    if len(path) <= 2:
+        return path
+
+    if enable_shortcut:
+        path = shortcut_polyline(world, path, margin=margin)
+    if enable_string_pull:
+        path = string_pull_polyline(world, path, margin=margin, passes=string_pull_passes)
+    if len(path) <= 2 or split_turn_angle_threshold <= 1e-9:
+        return path
+
+    out: List[Point2D] = [path[0]]
+    threshold = float(split_turn_angle_threshold)
+    for i in range(1, len(path) - 1):
+        prev_pt = out[-1]
+        cur_pt = path[i]
+        next_pt = path[i + 1]
+        ax = cur_pt[0] - prev_pt[0]
+        ay = cur_pt[1] - prev_pt[1]
+        bx = next_pt[0] - cur_pt[0]
+        by = next_pt[1] - cur_pt[1]
+        la = math.hypot(ax, ay)
+        lb = math.hypot(bx, by)
+        if la <= 1e-9 or lb <= 1e-9:
+            continue
+        dot = max(-1.0, min(1.0, (ax * bx + ay * by) / (la * lb)))
+        turn = math.acos(dot)
+        if turn + 1e-9 >= threshold:
+            out.append(cur_pt)
+    out.append(path[-1])
+    return _dedupe_points(out)
 
 
 def _sample_turn_recovery_arc(
@@ -81,6 +177,8 @@ def maybe_buffer_initial_turn_path(
     goal_heading: float,
     turn_radius: float,
 ) -> Tuple[List[Point2D], float]:
+    from .dubins_path import build_dubins_hybrid_path
+
     if len(path) < 2 or not math.isfinite(length):
         return path, length
 

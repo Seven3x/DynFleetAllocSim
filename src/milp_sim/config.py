@@ -109,6 +109,30 @@ class SimulationConfig:
 
     # Hybrid trajectory: A* skeleton + Dubins segments
     use_dubins_hybrid: bool = True
+    # Prefer cheap geometric / kinematic connectors before full Hybrid A*.
+    enable_connector_first_planner: bool = True
+    connector_use_straight_first: bool = True
+    connector_use_reeds_shepp: bool = True
+    connector_use_dubins: bool = True
+    connector_use_hybrid_local_rescue: bool = True
+    connector_use_plain_astar_fallback: bool = True
+    connector_direct_whole_segment_first: bool = True
+    connector_shortcut_enable: bool = True
+    connector_string_pull_enable: bool = True
+    connector_string_pull_passes: int = 2
+    connector_max_heading_error_for_straight: float = 0.35
+    connector_short_span_heading_error_for_straight: float = 0.70
+    connector_split_turn_angle_threshold: float = 0.40
+    connector_corridor_radius: float = 6.0
+    connector_local_bbox_padding: float = 4.0
+    connector_rs_max_expansions: int = 180
+    connector_rs_max_depth: int = 6
+    connector_max_detour_ratio_vs_reference: float = 1.35
+    connector_max_detour_abs_vs_reference: float = 12.0
+    connector_max_local_hybrid_expansions: int = 2600
+    connector_local_hybrid_heading_bins: int = 48
+    connector_local_hybrid_goal_pos_tolerance: float = 1.8
+    connector_local_hybrid_goal_heading_tolerance_rad: float = 0.95
     dubins_sample_step: float = 0.5
     dubins_collision_margin: float = 0.8
     # Safety-first defaults: if local fillet smoothing is unsafe, keep A* geometry.
@@ -219,6 +243,34 @@ class SimulationConfig:
             raise ValueError("hybrid_astar_near_goal_connector_radius_factor must be > 0")
         if int(self.hybrid_astar_fallback_log_limit) < -1:
             raise ValueError("hybrid_astar_fallback_log_limit must be >= -1")
+        if int(self.connector_string_pull_passes) < 0:
+            raise ValueError("connector_string_pull_passes must be >= 0")
+        if float(self.connector_max_heading_error_for_straight) < 0.0:
+            raise ValueError("connector_max_heading_error_for_straight must be >= 0")
+        if float(self.connector_short_span_heading_error_for_straight) < 0.0:
+            raise ValueError("connector_short_span_heading_error_for_straight must be >= 0")
+        if float(self.connector_split_turn_angle_threshold) < 0.0:
+            raise ValueError("connector_split_turn_angle_threshold must be >= 0")
+        if float(self.connector_corridor_radius) <= 0.0:
+            raise ValueError("connector_corridor_radius must be > 0")
+        if float(self.connector_local_bbox_padding) < 0.0:
+            raise ValueError("connector_local_bbox_padding must be >= 0")
+        if int(self.connector_rs_max_expansions) < 1:
+            raise ValueError("connector_rs_max_expansions must be >= 1")
+        if int(self.connector_rs_max_depth) < 1:
+            raise ValueError("connector_rs_max_depth must be >= 1")
+        if float(self.connector_max_detour_ratio_vs_reference) < 1.0:
+            raise ValueError("connector_max_detour_ratio_vs_reference must be >= 1")
+        if float(self.connector_max_detour_abs_vs_reference) < 0.0:
+            raise ValueError("connector_max_detour_abs_vs_reference must be >= 0")
+        if int(self.connector_max_local_hybrid_expansions) < 1:
+            raise ValueError("connector_max_local_hybrid_expansions must be >= 1")
+        if int(self.connector_local_hybrid_heading_bins) < 8:
+            raise ValueError("connector_local_hybrid_heading_bins must be >= 8")
+        if float(self.connector_local_hybrid_goal_pos_tolerance) <= 0.0:
+            raise ValueError("connector_local_hybrid_goal_pos_tolerance must be > 0")
+        if float(self.connector_local_hybrid_goal_heading_tolerance_rad) <= 0.0:
+            raise ValueError("connector_local_hybrid_goal_heading_tolerance_rad must be > 0")
 
 
 DEFAULT_CONFIG = SimulationConfig()

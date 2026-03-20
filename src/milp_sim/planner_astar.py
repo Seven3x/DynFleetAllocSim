@@ -16,6 +16,7 @@ GridPoint = Tuple[int, int]
 Point2D = Tuple[float, float]
 Pose2D = Tuple[float, float, float]
 HybridState = Tuple[int, int, int]
+SearchBounds = Tuple[float, float, float, float]
 
 
 @dataclass
@@ -143,6 +144,21 @@ class AStarPlanner:
         if ix < 0 or ix >= self.nx or iy < 0 or iy >= self.ny:
             return False
         return self.occ_grid[iy, ix] == 0
+
+    @staticmethod
+    def _point_in_search_bbox(p: Point2D, search_bbox: Optional[SearchBounds]) -> bool:
+        if search_bbox is None:
+            return True
+        min_x, min_y, max_x, max_y = search_bbox
+        return min_x - 1e-9 <= p[0] <= max_x + 1e-9 and min_y - 1e-9 <= p[1] <= max_y + 1e-9
+
+    def _samples_in_search_bbox(self, samples: List[Point2D], search_bbox: Optional[SearchBounds]) -> bool:
+        if search_bbox is None:
+            return True
+        for p in samples:
+            if not self._point_in_search_bbox(p, search_bbox):
+                return False
+        return True
 
     @staticmethod
     def _yaw_to_bin(yaw: float, heading_bins: int) -> int:
@@ -338,10 +354,19 @@ class AStarPlanner:
         max_expansions: int,
         max_depth: int,
         connector_radius: float,
+        search_bbox: Optional[SearchBounds] = None,
     ) -> Tuple[List[Point2D], float, HybridPlanDiagnostics]:
         mode = "reeds_shepp_like" if allow_reverse else "dubins_like"
         dist_start_to_goal = math.hypot(goal_pose[0] - start_pose[0], goal_pose[1] - start_pose[1])
         if dist_start_to_goal > connector_radius + 1e-9:
+            return [], float("inf"), HybridPlanDiagnostics(
+                reason="near_goal_connector_failed",
+                reason_tags=("near_goal_connector_failed",),
+                connector_mode=mode,
+            )
+        if (not self._point_in_search_bbox((start_pose[0], start_pose[1]), search_bbox)) or (
+            not self._point_in_search_bbox((goal_pose[0], goal_pose[1]), search_bbox)
+        ):
             return [], float("inf"), HybridPlanDiagnostics(
                 reason="near_goal_connector_failed",
                 reason_tags=("near_goal_connector_failed",),
@@ -432,7 +457,7 @@ class AStarPlanner:
                             direction=direction,
                             sample_step=sample_step,
                         )
-                        if not self._primitive_is_free(samples):
+                        if (not self._samples_in_search_bbox(samples, search_bbox)) or (not self._primitive_is_free(samples)):
                             saw_collision = True
                             continue
                         if math.hypot(nxt_pose[0] - start_pose[0], nxt_pose[1] - start_pose[1]) > connector_radius + 1e-9:
@@ -468,6 +493,69 @@ class AStarPlanner:
             connector_mode=mode,
         )
 
+    def plan_local_connector(
+        self,
+        start_pose: Pose2D,
+        goal_pose: Pose2D,
+        turn_radius: float,
+        step_size: Optional[float] = None,
+        heading_bins: int = 48,
+        goal_pos_tolerance: Optional[float] = None,
+        goal_heading_tolerance: float = 0.9,
+        allow_reverse: bool = False,
+        max_expansions: int = 180,
+        max_depth: int = 6,
+        connector_radius: Optional[float] = None,
+        search_bbox: Optional[SearchBounds] = None,
+    ) -> Tuple[List[Point2D], float, HybridPlanDiagnostics]:
+        step = max(0.2, float(step_size if step_size is not None else max(self.resolution, 0.8)))
+        turn_radius = max(1e-6, float(turn_radius))
+        pos_tol = (
+            max(self.resolution * 0.5, min(step, turn_radius))
+            if goal_pos_tolerance is None
+            else max(self.resolution * 0.5, float(goal_pos_tolerance))
+        )
+        connector_radius_eff = (
+            max(
+                1.15 * math.hypot(goal_pose[0] - start_pose[0], goal_pose[1] - start_pose[1]),
+                0.9 * turn_radius,
+                step * 2.0,
+            )
+            if connector_radius is None
+            else max(float(connector_radius), step)
+        )
+        points, length, diag = self._try_local_connector(
+            start_pose=start_pose,
+            goal_pose=goal_pose,
+            turn_radius=turn_radius,
+            step_size=step,
+            heading_bins=max(8, int(heading_bins)),
+            allow_reverse=allow_reverse,
+            goal_pos_tolerance=pos_tol,
+            goal_heading_tolerance=max(0.1, float(goal_heading_tolerance)),
+            max_expansions=max(1, int(max_expansions)),
+            max_depth=max(1, int(max_depth)),
+            connector_radius=connector_radius_eff,
+            search_bbox=search_bbox,
+        )
+        if not points or not math.isfinite(length):
+            return points, length, diag
+
+        connect_step = max(0.08, min(self.resolution, step * 0.5))
+        stitched = self._stitch_requested_endpoints(
+            points,
+            requested_start=(float(start_pose[0]), float(start_pose[1])),
+            requested_goal=(float(goal_pose[0]), float(goal_pose[1])),
+            connect_step=connect_step,
+        )
+        if not stitched:
+            return [], float("inf"), HybridPlanDiagnostics(
+                reason="near_goal_connector_failed",
+                reason_tags=("near_goal_connector_failed",),
+                connector_mode=diag.connector_mode,
+            )
+        return stitched, self._polyline_length(stitched), diag
+
     def plan_hybrid_detailed(
         self,
         start_pose: Pose2D,
@@ -484,6 +572,7 @@ class AStarPlanner:
         near_goal_connector_expansions: int = 160,
         near_goal_connector_depth: int = 6,
         near_goal_connector_radius_factor: float = 2.75,
+        search_bbox: Optional[SearchBounds] = None,
     ) -> Tuple[List[Point2D], float, HybridPlanDiagnostics]:
         heading_bins = max(8, int(heading_bins))
         max_expansions = max(1000, int(max_expansions))
@@ -524,6 +613,11 @@ class AStarPlanner:
             start = self.grid_to_world(start_grid)
         if not self._point_is_free_on_grid(goal):
             goal = self.grid_to_world(goal_grid)
+        if (not self._point_in_search_bbox(start, search_bbox)) or (not self._point_in_search_bbox(goal, search_bbox)):
+            return [], float("inf"), HybridPlanDiagnostics(
+                reason="unreachable_main_search",
+                reason_tags=("unreachable_main_search",),
+            )
 
         start_yaw = self._wrap_to_pi(float(start_pose[2]))
         goal_yaw = self._wrap_to_pi(float(goal_pose[2]))
@@ -544,6 +638,7 @@ class AStarPlanner:
             bool(allow_reverse),
             int(round(reverse_penalty * 100.0)),
             int(round(heuristic_weight * 100.0)),
+            None if search_bbox is None else tuple(int(round(v * 100.0)) for v in search_bbox),
         )
         cached = self._hybrid_cache_get(cache_key)
         if cached is not None:
@@ -615,6 +710,7 @@ class AStarPlanner:
                     max_expansions=connector_expansions,
                     max_depth=connector_depth,
                     connector_radius=connector_radius,
+                    search_bbox=search_bbox,
                 )
                 if connector_points and math.isfinite(connector_len):
                     prefix = self._trace_hybrid_points(current_key, parent, poses)
@@ -661,7 +757,7 @@ class AStarPlanner:
                             direction=direction,
                             sample_step=sample_step,
                         )
-                        if not self._primitive_is_free(samples):
+                        if (not self._samples_in_search_bbox(samples, search_bbox)) or (not self._primitive_is_free(samples)):
                             continue
 
                         nxt_key = self._pose_to_hybrid_state(nxt_pose, state_heading_bins)
@@ -700,6 +796,7 @@ class AStarPlanner:
                 max_expansions=connector_expansions,
                 max_depth=connector_depth,
                 connector_radius=connector_radius,
+                search_bbox=search_bbox,
             )
             if connector_points and math.isfinite(connector_len):
                 prefix = self._trace_hybrid_points(best_key, parent, poses)
@@ -786,6 +883,7 @@ class AStarPlanner:
         allow_reverse: bool = False,
         reverse_penalty: float = 1.6,
         heuristic_weight: float = 1.05,
+        search_bbox: Optional[SearchBounds] = None,
     ) -> Tuple[List[Point2D], float]:
         points, length, _ = self.plan_hybrid_detailed(
             start_pose=start_pose,
@@ -799,6 +897,7 @@ class AStarPlanner:
             allow_reverse=allow_reverse,
             reverse_penalty=reverse_penalty,
             heuristic_weight=heuristic_weight,
+            search_bbox=search_bbox,
         )
         return points, length
 

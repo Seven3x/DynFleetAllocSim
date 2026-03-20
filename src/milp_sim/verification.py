@@ -132,7 +132,7 @@ def _segment_corrected_time(
     should_emit_debug = debug_enabled and (target_vid < 0 or target_vid == vehicle.id) and (
         target_tid < 0 or target_tid == task.id
     )
-    if should_emit_debug and hybrid_meta is not None and bool(getattr(hybrid_meta, "used_fallback", False)):
+    if should_emit_debug and hybrid_meta is not None:
         ranked = sorted(
             cand_debug,
             key=lambda x: (0 if x.ok else 1, x.score if math.isfinite(x.score) else float("inf")),
@@ -161,11 +161,14 @@ def _segment_corrected_time(
             or getattr(hybrid_meta, "fallback_reason", "")
         )
         chosen_trace = str(getattr(hybrid_meta, "debug_trace", ""))
+        connector_type = str(getattr(hybrid_meta, "connector_type", "") or "-")
+        connector_summary = str(getattr(hybrid_meta, "connector_summary", "") or "-")
         debug_message = (
             f"verify_plan_debug task=T{task.id} "
             f"from=({start_pos[0]:.3f},{start_pos[1]:.3f},{math.degrees(start_heading):.1f}deg) "
             f"to=({task.position[0]:.3f},{task.position[1]:.3f}) "
             f"choose_h={math.degrees(chosen_heading):.1f} len={path_length:.3f} "
+            f"connector={connector_type} connector_summary={connector_summary} "
             f"fallback_detail={chosen_detail or '-'} trace={chosen_trace or '-'} "
             f"cand[{len(cand_debug)}]: " + " | ".join(parts)
         )
