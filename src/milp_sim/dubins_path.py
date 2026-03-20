@@ -773,48 +773,155 @@ def build_dubins_hybrid_path(
     force_mode = bool(getattr(cfg, "dubins_force_mode", False))
     use_dubins_hybrid = bool(getattr(cfg, "use_dubins_hybrid", False))
     collision_margin = float(getattr(cfg, "dubins_collision_margin", 0.0))
+    legacy_debug_prefix = ""
+
+    def _finalize_legacy_return(
+        points: List[Point2D],
+        length: float,
+        meta: DubinsHybridMeta,
+    ) -> Tuple[List[Point2D], float, DubinsHybridMeta]:
+        if not legacy_debug_prefix:
+            return points, length, meta
+
+        if not meta.debug_trace:
+            meta.debug_trace = legacy_debug_prefix
+        elif legacy_debug_prefix not in meta.debug_trace:
+            meta.debug_trace = f"{legacy_debug_prefix};{meta.debug_trace}"
+
+        if not meta.used_fallback:
+            meta.used_fallback = True
+            meta.fallback_segments = max(1, int(meta.fallback_segments))
+        if not meta.fallback_reason:
+            meta.fallback_reason = "hybrid_astar_fallback"
+        if not meta.fallback_details:
+            meta.fallback_details = legacy_debug_prefix
+        elif legacy_debug_prefix not in meta.fallback_details:
+            meta.fallback_details = f"{meta.fallback_details}|{legacy_debug_prefix}"
+        return points, length, meta
 
     # Primary mode: Hybrid A* on (x, y, yaw) state space.
     if use_dubins_hybrid and bool(getattr(cfg, "use_hybrid_astar", False)):
-        hybrid_points, hybrid_len = astar_planner.plan_hybrid(
-            start_pose=start_pose,
-            goal_pose=goal_pose,
-            turn_radius=turn_radius,
+        planner_clearance = max(0.0, float(getattr(astar_planner, "inflation_radius", 0.0)))
+
+        def _try_hybrid_once(
+            *,
+            step_size: float,
+            heading_bins: int,
+            max_expansions: int,
+            goal_pos_tolerance: float,
+            goal_heading_tolerance: float,
+            heuristic_weight: float,
+            allow_reverse: bool,
+            trace: str,
+        ) -> Tuple[Optional[Tuple[List[Point2D], float, DubinsHybridMeta]], str]:
+            hybrid_points, hybrid_len = astar_planner.plan_hybrid(
+                start_pose=start_pose,
+                goal_pose=goal_pose,
+                turn_radius=turn_radius,
+                step_size=step_size,
+                heading_bins=heading_bins,
+                max_expansions=max_expansions,
+                goal_pos_tolerance=goal_pos_tolerance,
+                goal_heading_tolerance=goal_heading_tolerance,
+                allow_reverse=allow_reverse,
+                reverse_penalty=float(getattr(cfg, "hybrid_astar_reverse_penalty", 1.6)),
+                heuristic_weight=heuristic_weight,
+            )
+            if not hybrid_points or not math.isfinite(hybrid_len):
+                return None, "hybrid_astar_unreachable"
+
+            hybrid_points[0] = (start_pose[0], start_pose[1])
+            hybrid_points[-1] = (goal_pose[0], goal_pose[1])
+            need_recheck = collision_margin > planner_clearance + 1e-9
+            if not force_mode and need_recheck and not _polyline_collision_free(
+                hybrid_points,
+                world=world,
+                margin=collision_margin,
+            ):
+                return None, "hybrid_astar_collision"
+
+            return (
+                hybrid_points,
+                hybrid_len,
+                DubinsHybridMeta(
+                    used_fallback=False,
+                    fallback_segments=0,
+                    dubins_segments=0,
+                    sample_count=len(hybrid_points),
+                    dubins_ratio=0.0,
+                    debug_trace=trace,
+                ),
+            ), ""
+
+        primary_out, primary_reason = _try_hybrid_once(
             step_size=float(getattr(cfg, "hybrid_astar_step_size", 0.8)),
             heading_bins=int(getattr(cfg, "hybrid_astar_heading_bins", 72)),
             max_expansions=int(getattr(cfg, "hybrid_astar_max_expansions", 45000)),
             goal_pos_tolerance=float(getattr(cfg, "hybrid_astar_goal_pos_tolerance", 1.5)),
             goal_heading_tolerance=float(getattr(cfg, "hybrid_astar_goal_heading_tolerance_rad", 0.8)),
-            allow_reverse=bool(getattr(cfg, "hybrid_astar_allow_reverse", False)),
-            reverse_penalty=float(getattr(cfg, "hybrid_astar_reverse_penalty", 1.6)),
             heuristic_weight=float(getattr(cfg, "hybrid_astar_heuristic_weight", 1.05)),
+            allow_reverse=bool(getattr(cfg, "hybrid_astar_allow_reverse", False)),
+            trace="hybrid_astar:ok",
         )
-        if hybrid_points and math.isfinite(hybrid_len):
-            hybrid_points[0] = (start_pose[0], start_pose[1])
-            hybrid_points[-1] = (goal_pose[0], goal_pose[1])
-            planner_clearance = max(0.0, float(getattr(astar_planner, "inflation_radius", 0.0)))
-            need_recheck = collision_margin > planner_clearance + 1e-9
-            if force_mode or (not need_recheck) or _polyline_collision_free(
-                hybrid_points,
-                world=world,
-                margin=collision_margin,
-            ):
-                return (
-                    hybrid_points,
-                    hybrid_len,
-                    DubinsHybridMeta(
-                        used_fallback=False,
-                        fallback_segments=0,
-                        dubins_segments=0,
-                        sample_count=len(hybrid_points),
-                        dubins_ratio=0.0,
-                        debug_trace="hybrid_astar:ok",
-                    ),
-                )
-            hybrid_fail_reason = "hybrid_astar_collision"
-        else:
-            hybrid_fail_reason = "hybrid_astar_unreachable"
+        if primary_out is not None:
+            return primary_out
 
+        hybrid_fail_reason = primary_reason or "hybrid_astar_unreachable"
+        debug_trace = f"hybrid_astar:primary_{hybrid_fail_reason}"
+
+        if bool(getattr(cfg, "hybrid_astar_retry_on_fail", True)):
+            retry_out, retry_reason = _try_hybrid_once(
+                step_size=float(getattr(cfg, "hybrid_astar_retry_step_size", 0.8)),
+                heading_bins=int(getattr(cfg, "hybrid_astar_retry_heading_bins", 72)),
+                max_expansions=int(getattr(cfg, "hybrid_astar_retry_max_expansions", 45000)),
+                goal_pos_tolerance=float(getattr(cfg, "hybrid_astar_retry_goal_pos_tolerance", 2.2)),
+                goal_heading_tolerance=float(getattr(cfg, "hybrid_astar_retry_goal_heading_tolerance_rad", 1.1)),
+                heuristic_weight=float(getattr(cfg, "hybrid_astar_retry_heuristic_weight", 1.02)),
+                allow_reverse=bool(
+                    getattr(
+                        cfg,
+                        "hybrid_astar_retry_allow_reverse",
+                        bool(getattr(cfg, "hybrid_astar_allow_reverse", False)),
+                    )
+                ),
+                trace="hybrid_astar:retry_ok",
+            )
+            if retry_out is not None:
+                return retry_out
+            retry_fail = retry_reason or "hybrid_astar_unreachable"
+            hybrid_fail_reason = retry_fail
+            debug_trace = f"{debug_trace}|retry_{retry_fail}"
+
+            # Single rescue pass for unreachable: relax terminal heading constraint.
+            if (
+                retry_fail == "hybrid_astar_unreachable"
+                and bool(getattr(cfg, "hybrid_astar_relaxed_goal_on_unreachable", True))
+            ):
+                relaxed_out, relaxed_reason = _try_hybrid_once(
+                    step_size=float(getattr(cfg, "hybrid_astar_retry_step_size", 0.8)),
+                    heading_bins=int(getattr(cfg, "hybrid_astar_retry_heading_bins", 72)),
+                    max_expansions=int(getattr(cfg, "hybrid_astar_relaxed_goal_max_expansions", 12000)),
+                    goal_pos_tolerance=float(getattr(cfg, "hybrid_astar_relaxed_goal_pos_tolerance", 3.0)),
+                    goal_heading_tolerance=float(
+                        getattr(cfg, "hybrid_astar_relaxed_goal_heading_tolerance_rad", math.pi)
+                    ),
+                    heuristic_weight=float(getattr(cfg, "hybrid_astar_retry_heuristic_weight", 1.02)),
+                    allow_reverse=bool(
+                        getattr(
+                            cfg,
+                            "hybrid_astar_retry_allow_reverse",
+                            bool(getattr(cfg, "hybrid_astar_allow_reverse", False)),
+                        )
+                    ),
+                    trace="hybrid_astar:relaxed_goal_ok",
+                )
+                if relaxed_out is not None:
+                    return relaxed_out
+                relaxed_fail = relaxed_reason or "hybrid_astar_unreachable"
+                hybrid_fail_reason = relaxed_fail
+                debug_trace = f"{debug_trace}|relaxed_{relaxed_fail}"
+
+        legacy_debug_prefix = debug_trace
         if not bool(getattr(cfg, "hybrid_astar_fallback_to_legacy", True)):
             return (
                 [],
@@ -827,7 +934,7 @@ def build_dubins_hybrid_path(
                     dubins_ratio=0.0,
                     fallback_reason=hybrid_fail_reason,
                     fallback_details=f"{hybrid_fail_reason}:1",
-                    debug_trace=f"hybrid_astar:{hybrid_fail_reason}",
+                    debug_trace=debug_trace,
                 ),
             )
 
@@ -835,7 +942,7 @@ def build_dubins_hybrid_path(
         astar_path, astar_length = astar_planner.plan((start_pose[0], start_pose[1]), (goal_pose[0], goal_pose[1]))
 
     if not astar_path or astar_length == float("inf"):
-        return (
+        return _finalize_legacy_return(
             [],
             float("inf"),
             DubinsHybridMeta(
@@ -846,6 +953,7 @@ def build_dubins_hybrid_path(
                 dubins_ratio=0.0,
                 fallback_reason="astar_unreachable",
                 fallback_details="astar_unreachable:1",
+                debug_trace=legacy_debug_prefix,
             ),
         )
 
@@ -861,8 +969,26 @@ def build_dubins_hybrid_path(
         base_path = astar_path
     base_len = _polyline_length(base_path)
 
+    # Hybrid failed already: skip expensive legacy fillet reconstruction and
+    # directly return smoothed A* fallback to keep runtime bounded.
+    if legacy_debug_prefix and bool(getattr(cfg, "hybrid_astar_direct_astar_fallback", True)):
+        return _finalize_legacy_return(
+            base_path,
+            base_len,
+            DubinsHybridMeta(
+                used_fallback=True,
+                fallback_segments=1,
+                dubins_segments=0,
+                sample_count=len(base_path),
+                dubins_ratio=0.0,
+                fallback_reason="hybrid_astar_fallback_to_astar",
+                fallback_details="hybrid_astar_fallback_to_astar:1",
+                debug_trace=legacy_debug_prefix,
+            ),
+        )
+
     if not use_dubins_hybrid:
-        return (
+        return _finalize_legacy_return(
             base_path,
             base_len,
             DubinsHybridMeta(
@@ -871,12 +997,13 @@ def build_dubins_hybrid_path(
                 dubins_segments=0,
                 sample_count=len(base_path),
                 dubins_ratio=0.0,
+                debug_trace=legacy_debug_prefix,
             ),
         )
 
     sparse_path = _compress_astar_path(base_path)
     if len(sparse_path) < 2:
-        return (
+        return _finalize_legacy_return(
             base_path,
             base_len,
             DubinsHybridMeta(
@@ -885,12 +1012,15 @@ def build_dubins_hybrid_path(
                 dubins_segments=0,
                 sample_count=len(base_path),
                 dubins_ratio=0.0,
+                debug_trace=legacy_debug_prefix,
             ),
         )
 
     if len(sparse_path) == 2:
         direct_reason = "direct_no_solution"
         debug_trace = "direct:start"
+        if legacy_debug_prefix:
+            debug_trace = f"{legacy_debug_prefix};{debug_trace}"
         dubins_sol = _build_shortest_dubins_local(start_pose=start_pose, goal_pose=goal_pose, turn_radius=turn_radius)
         if dubins_sol is not None:
             word, params = dubins_sol
@@ -909,12 +1039,14 @@ def build_dubins_hybrid_path(
                 world=world,
                 margin=cfg.dubins_collision_margin,
                 ):
-                debug_trace = f"direct:{word}:ok"
+                debug_trace = (
+                    f"{legacy_debug_prefix};direct:{word}:ok" if legacy_debug_prefix else f"direct:{word}:ok"
+                )
                 dubins_len = _polyline_length(dubins_points)
                 straight_len = math.hypot(goal_pose[0] - start_pose[0], goal_pose[1] - start_pose[1])
                 added_curve = max(0.0, dubins_len - straight_len)
                 ratio = 0.0 if dubins_len <= 1e-9 else max(0.0, min(1.0, added_curve / dubins_len))
-                return (
+                return _finalize_legacy_return(
                     dubins_points,
                     dubins_len,
                     DubinsHybridMeta(
@@ -927,7 +1059,11 @@ def build_dubins_hybrid_path(
                     ),
                 )
             direct_reason = "direct_collision"
-            debug_trace = f"direct:{word}:collision"
+            debug_trace = (
+                f"{legacy_debug_prefix};direct:{word}:collision"
+                if legacy_debug_prefix
+                else f"direct:{word}:collision"
+            )
 
         recovered_points, recovered_len, recovery_trace = _try_direct_recovery_path(
             start_pose=start_pose,
@@ -941,7 +1077,7 @@ def build_dubins_hybrid_path(
             straight_len = math.hypot(goal_pose[0] - start_pose[0], goal_pose[1] - start_pose[1])
             added_curve = max(0.0, recovered_len - straight_len)
             ratio = 0.0 if recovered_len <= 1e-9 else max(0.0, min(1.0, added_curve / recovered_len))
-            return (
+            return _finalize_legacy_return(
                 recovered_points,
                 recovered_len,
                 DubinsHybridMeta(
@@ -955,7 +1091,7 @@ def build_dubins_hybrid_path(
             )
 
         if cfg.dubins_fallback_to_astar:
-            return (
+            return _finalize_legacy_return(
                 base_path,
                 base_len,
                 DubinsHybridMeta(
@@ -969,7 +1105,7 @@ def build_dubins_hybrid_path(
                     debug_trace=f"{debug_trace};recovery:{recovery_trace}",
                 ),
             )
-        return (
+        return _finalize_legacy_return(
             [],
             float("inf"),
             DubinsHybridMeta(
@@ -984,7 +1120,7 @@ def build_dubins_hybrid_path(
             ),
         )
 
-    return _build_fillet_result(
+    out_points, out_len, out_meta = _build_fillet_result(
         sparse_path=sparse_path,
         fallback_path=base_path,
         fallback_len=base_len,
@@ -994,4 +1130,6 @@ def build_dubins_hybrid_path(
         cfg=cfg,
         turn_radius=turn_radius,
         force_mode=force_mode,
+        debug_trace=legacy_debug_prefix,
     )
+    return _finalize_legacy_return(out_points, out_len, out_meta)

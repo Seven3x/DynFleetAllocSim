@@ -65,10 +65,43 @@ class SimulationConfig:
     hybrid_astar_reverse_penalty: float = 1.6
     hybrid_astar_heuristic_weight: float = 1.15
     # Limit how many terminal-heading candidates are fully planned in Hybrid A* mode.
-    hybrid_astar_heading_candidate_limit: int = 2
+    hybrid_astar_heading_candidate_limit: int = 3
+    # If primary heading candidates all degrade to fallback, expand a few extra candidates.
+    hybrid_astar_heading_candidate_retry_limit: int = 2
+    # In multi-candidate evaluation, skip per-candidate robust retry to avoid N x retry blow-up.
+    hybrid_astar_primary_disable_retry: bool = True
+    # When primary pass still has no pure-hybrid solution, robust-retry only top-K candidates.
+    hybrid_astar_robust_retry_headings: int = 1
+    # Stop heading expansion early once a non-fallback candidate is found.
+    hybrid_astar_stop_on_first_non_fallback: bool = True
+    # Prefer pure Hybrid A* solutions over legacy fallback when scores are close.
+    hybrid_astar_fallback_penalty: float = 6.0
+    # If fast Hybrid A* attempt fails, retry once with robust parameters.
+    hybrid_astar_retry_on_fail: bool = True
+    hybrid_astar_retry_step_size: float = 0.8
+    hybrid_astar_retry_heading_bins: int = 72
+    hybrid_astar_retry_max_expansions: int = 18000
+    hybrid_astar_retry_goal_pos_tolerance: float = 2.6
+    hybrid_astar_retry_goal_heading_tolerance_rad: float = 1.2
+    # Retry stage can enable reverse motion even if primary stage keeps forward-only for speed.
+    hybrid_astar_retry_allow_reverse: bool = True
+    hybrid_astar_retry_heuristic_weight: float = 1.02
+    # Final rescue for unreachable cases: relax terminal heading requirement once.
+    hybrid_astar_relaxed_goal_on_unreachable: bool = True
+    hybrid_astar_relaxed_goal_pos_tolerance: float = 3.0
+    hybrid_astar_relaxed_goal_heading_tolerance_rad: float = math.pi
+    hybrid_astar_relaxed_goal_max_expansions: int = 12000
+    # When Hybrid A* has already failed, directly use smoothed A* fallback
+    # instead of trying expensive fillet reconstruction again.
+    hybrid_astar_direct_astar_fallback: bool = True
+    # Emit per-verification debug lines when Hybrid A* falls back.
+    hybrid_astar_fallback_log_enabled: bool = True
+    # Maximum number of per-verification Hybrid A* fallback lines in one run.
+    # Set < 0 to disable the cap.
+    hybrid_astar_fallback_log_limit: int = 80
 
     # Offline GUI: auto comparison computes two extra full allocations and can be slow.
-    offline_enable_comparison: bool = True
+    offline_enable_comparison: bool = False
 
     # Hybrid trajectory: A* skeleton + Dubins segments
     use_dubins_hybrid: bool = True
@@ -119,7 +152,7 @@ class SimulationConfig:
     # Number of future tasks kept/visualized beyond the current in-progress task.
     online_future_task_horizon: int = 3
     # Planner debug: dump heading-candidate scores into event logs.
-    plan_debug_enabled: bool = True
+    plan_debug_enabled: bool = False
     plan_debug_vehicle_id: int = 2
     plan_debug_task_id: int = 7
     plan_debug_top_k: int = 8
@@ -150,6 +183,32 @@ class SimulationConfig:
             raise ValueError("hybrid_astar_heuristic_weight must be > 0")
         if int(self.hybrid_astar_heading_candidate_limit) < 1:
             raise ValueError("hybrid_astar_heading_candidate_limit must be >= 1")
+        if int(self.hybrid_astar_heading_candidate_retry_limit) < 0:
+            raise ValueError("hybrid_astar_heading_candidate_retry_limit must be >= 0")
+        if int(self.hybrid_astar_robust_retry_headings) < 1:
+            raise ValueError("hybrid_astar_robust_retry_headings must be >= 1")
+        if float(self.hybrid_astar_fallback_penalty) < 0.0:
+            raise ValueError("hybrid_astar_fallback_penalty must be >= 0")
+        if float(self.hybrid_astar_retry_step_size) <= 0.0:
+            raise ValueError("hybrid_astar_retry_step_size must be > 0")
+        if int(self.hybrid_astar_retry_heading_bins) < 8:
+            raise ValueError("hybrid_astar_retry_heading_bins must be >= 8")
+        if int(self.hybrid_astar_retry_max_expansions) < 1000:
+            raise ValueError("hybrid_astar_retry_max_expansions must be >= 1000")
+        if float(self.hybrid_astar_retry_goal_pos_tolerance) <= 0.0:
+            raise ValueError("hybrid_astar_retry_goal_pos_tolerance must be > 0")
+        if float(self.hybrid_astar_retry_goal_heading_tolerance_rad) <= 0.0:
+            raise ValueError("hybrid_astar_retry_goal_heading_tolerance_rad must be > 0")
+        if float(self.hybrid_astar_retry_heuristic_weight) <= 0.0:
+            raise ValueError("hybrid_astar_retry_heuristic_weight must be > 0")
+        if float(self.hybrid_astar_relaxed_goal_pos_tolerance) <= 0.0:
+            raise ValueError("hybrid_astar_relaxed_goal_pos_tolerance must be > 0")
+        if float(self.hybrid_astar_relaxed_goal_heading_tolerance_rad) <= 0.0:
+            raise ValueError("hybrid_astar_relaxed_goal_heading_tolerance_rad must be > 0")
+        if int(self.hybrid_astar_relaxed_goal_max_expansions) < 1000:
+            raise ValueError("hybrid_astar_relaxed_goal_max_expansions must be >= 1000")
+        if int(self.hybrid_astar_fallback_log_limit) < -1:
+            raise ValueError("hybrid_astar_fallback_log_limit must be >= -1")
 
 
 DEFAULT_CONFIG = SimulationConfig()

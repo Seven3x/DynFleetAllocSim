@@ -135,7 +135,11 @@ class AStarPlanner:
     def _yaw_to_bin(yaw: float, heading_bins: int) -> int:
         wrapped = yaw % (2.0 * math.pi)
         step = (2.0 * math.pi) / max(heading_bins, 1)
-        return int(round(wrapped / step)) % heading_bins
+        # Use floor-style quantization for stable state hashing.
+        # `round` can collapse nearby turning primitives into the same heading
+        # bin as the straight primitive (especially with large turn radius),
+        # which may make hybrid search appear unreachable in open space.
+        return int(wrapped / step) % heading_bins
 
     def _pose_to_hybrid_state(self, pose: Pose2D, heading_bins: int) -> HybridState:
         x, y, yaw = pose
