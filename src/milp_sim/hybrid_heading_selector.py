@@ -12,6 +12,22 @@ from .planner_astar import AStarPlanner
 Point2D = Tuple[float, float]
 
 
+def _append_meta_reason(meta: DubinsHybridMeta | None, reason: str) -> None:
+    if meta is None or not reason:
+        return
+
+    detail = str(getattr(meta, "fallback_details", "") or "")
+    parts = [part.strip() for part in detail.split("|") if part.strip()]
+    if reason not in parts:
+        parts.append(reason)
+        setattr(meta, "fallback_details", "|".join(parts))
+
+    trace = str(getattr(meta, "debug_trace", "") or "")
+    trace_token = f"selector:{reason}"
+    if trace_token not in trace:
+        setattr(meta, "debug_trace", f"{trace}|{trace_token}" if trace else trace_token)
+
+
 @dataclass
 class HeadingCandidateEval:
     heading: float
@@ -32,6 +48,7 @@ class HeadingSelectionResult:
     chosen_meta: DubinsHybridMeta | None
     cand_debug: List[HeadingCandidateEval]
     found_non_fallback: bool
+    selection_reason_tags: Tuple[str, ...] = ()
 
 
 def select_best_heading_path(
@@ -56,18 +73,19 @@ def select_best_heading_path(
     if use_hybrid_mode and primary_disable_retry and bool(getattr(cfg, "hybrid_astar_retry_on_fail", True)):
         cfg_no_hybrid_retry = replace(cfg, hybrid_astar_retry_on_fail=False)
 
-    headings = list(all_headings)
+    all_headings_list = list(all_headings)
+    headings = list(all_headings_list)
     retry_headings: List[float] = []
     retry_cap = 0
     if use_hybrid_mode:
         headings = prioritize_goal_heading_candidates(
-            headings=list(all_headings),
+            headings=list(all_headings_list),
             current_heading=start_heading,
             target_heading=target_heading,
             limit=int(getattr(cfg, "hybrid_astar_heading_candidate_limit", 2)),
         )
         retry_cap = max(0, int(getattr(cfg, "hybrid_astar_heading_candidate_retry_limit", 0)))
-        retry_headings = [h for h in all_headings if all(abs(wrap_to_pi(h - k)) > 1e-4 for k in headings)]
+        retry_headings = [h for h in all_headings_list if all(abs(wrap_to_pi(h - k)) > 1e-4 for k in headings)]
 
     turn_penalty = max(0.0, float(getattr(cfg, "goal_heading_turn_penalty", 0.0)))
     fallback_penalty = max(0.0, float(getattr(cfg, "hybrid_astar_fallback_penalty", 0.0))) if use_hybrid_mode else 0.0
@@ -86,9 +104,15 @@ def select_best_heading_path(
     fallback_score = float("inf")
     fallback_meta: DubinsHybridMeta | None = None
     fallback_path: List[Point2D] = []
+    soft_heading = target_heading
+    soft_length = float("inf")
+    soft_score = float("inf")
+    soft_meta: DubinsHybridMeta | None = None
+    soft_path: List[Point2D] = []
 
     cand_debug: List[HeadingCandidateEval] = []
     found_non_fallback = False
+    pruned_by_dpsi = False
 
     def _evaluate_heading(goal_heading: float, *, allow_hybrid_retry: bool = False) -> None:
         nonlocal fallback_heading
@@ -101,7 +125,13 @@ def select_best_heading_path(
         nonlocal best_score
         nonlocal best_meta
         nonlocal best_path
+        nonlocal soft_heading
+        nonlocal soft_length
+        nonlocal soft_score
+        nonlocal soft_meta
+        nonlocal soft_path
         nonlocal found_non_fallback
+        nonlocal pruned_by_dpsi
 
         planner_cfg = cfg if allow_hybrid_retry else cfg_no_hybrid_retry
         hybrid_path, hybrid_len, hybrid_meta = build_path_fn(
@@ -158,6 +188,16 @@ def select_best_heading_path(
         if not fallback_used:
             found_non_fallback = True
         if dpsi > dpsi_limit_eff + 1e-9:
+            pruned_by_dpsi = True
+            if not fallback_used:
+                soft_penalty = turn_penalty * turn_radius * max(0.0, dpsi - dpsi_limit_eff) * 1.5
+                soft_candidate_score = score + soft_penalty
+                if soft_candidate_score < soft_score:
+                    soft_heading = goal_heading
+                    soft_length = hybrid_len
+                    soft_score = soft_candidate_score
+                    soft_meta = hybrid_meta
+                    soft_path = hybrid_path
             return
         if score < best_score:
             best_heading = goal_heading
@@ -198,10 +238,23 @@ def select_best_heading_path(
     chosen_meta = best_meta
     chosen_path = best_path
     if not math.isfinite(chosen_length):
-        chosen_heading = fallback_heading
-        chosen_length = fallback_length
-        chosen_meta = fallback_meta
-        chosen_path = fallback_path
+        if math.isfinite(soft_length):
+            chosen_heading = soft_heading
+            chosen_length = soft_length
+            chosen_meta = soft_meta
+            chosen_path = soft_path
+        if not math.isfinite(chosen_length):
+            chosen_heading = fallback_heading
+            chosen_length = fallback_length
+            chosen_meta = fallback_meta
+            chosen_path = fallback_path
+
+    selection_reason_tags: List[str] = []
+    if pruned_by_dpsi or (use_hybrid_mode and len(headings) < len(all_headings_list)):
+        selection_reason_tags.append("goal_heading_pruned")
+    if selection_reason_tags and bool(getattr(chosen_meta, "used_fallback", False)):
+        for reason in selection_reason_tags:
+            _append_meta_reason(chosen_meta, reason)
 
     return HeadingSelectionResult(
         chosen_heading=chosen_heading,
@@ -210,4 +263,5 @@ def select_best_heading_path(
         chosen_meta=chosen_meta,
         cand_debug=cand_debug,
         found_non_fallback=found_non_fallback,
+        selection_reason_tags=tuple(selection_reason_tags),
     )

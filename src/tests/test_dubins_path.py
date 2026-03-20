@@ -10,7 +10,7 @@ try:
     from milp_sim.dubins_path import DUBINS_WORDS, build_dubins_hybrid_path, solve_dubins_word
     from milp_sim.entities import Task, Vehicle
     from milp_sim.map_utils import WorldMap
-    from milp_sim.planner_astar import AStarPlanner
+    from milp_sim.planner_astar import AStarPlanner, HybridPlanDiagnostics
     from milp_sim.session import SimulationSession
     from milp_sim.verification import verify_bid
 
@@ -112,7 +112,160 @@ class TestDubinsPath(unittest.TestCase):
         self.assertGreater(len(points), 2)
         self.assertTrue(math.isfinite(length))
         self.assertFalse(meta.used_fallback)
-        self.assertEqual(meta.debug_trace, "hybrid_astar:ok")
+        self.assertTrue(meta.debug_trace.startswith("hybrid_astar:"))
+
+    def test_hybrid_astar_primary_search_can_use_reverse_without_retry(self) -> None:
+        world = WorldMap(
+            width=30.0,
+            height=30.0,
+            depot_polygon=box(0.0, 0.0, 4.0, 4.0),
+            obstacles=[
+                box(13.55, 5.81, 18.44, 11.67),
+                box(20.61, 21.40, 25.73, 28.66),
+            ],
+        )
+        planner = AStarPlanner(
+            world=world,
+            resolution=1.0,
+            inflation_radius=DEFAULT_CONFIG.vehicle_radius + DEFAULT_CONFIG.safety_margin,
+            connect_diagonal=True,
+        )
+        start = (8.0, 8.0, 0.0)
+        goal = (9.730830828623107, 21.71061219428649, 0.30598675032964895)
+
+        forward_cfg = replace(
+            DEFAULT_CONFIG,
+            use_dubins_hybrid=True,
+            use_hybrid_astar=True,
+            hybrid_astar_fallback_to_legacy=False,
+            hybrid_astar_allow_reverse=False,
+            hybrid_astar_retry_on_fail=False,
+            hybrid_astar_step_size=1.0,
+            hybrid_astar_max_expansions=12000,
+        )
+        reverse_cfg = replace(
+            forward_cfg,
+            hybrid_astar_allow_reverse=True,
+            hybrid_astar_reverse_penalty=1.22,
+        )
+
+        forward_points, forward_length, forward_meta = build_dubins_hybrid_path(
+            world=world,
+            cfg=forward_cfg,
+            start_pose=start,
+            goal_pose=goal,
+            astar_planner=planner,
+            turn_radius=5.0,
+        )
+        reverse_points, reverse_length, reverse_meta = build_dubins_hybrid_path(
+            world=world,
+            cfg=reverse_cfg,
+            start_pose=start,
+            goal_pose=goal,
+            astar_planner=planner,
+            turn_radius=5.0,
+        )
+
+        self.assertEqual(forward_points, [])
+        self.assertEqual(forward_length, float("inf"))
+        self.assertTrue(forward_meta.used_fallback)
+        self.assertIn("unreachable_main_search", forward_meta.fallback_details)
+
+        self.assertGreater(len(reverse_points), 2)
+        self.assertTrue(math.isfinite(reverse_length))
+        self.assertFalse(reverse_meta.used_fallback)
+        self.assertIn("reeds_shepp_like", reverse_meta.debug_trace)
+
+    def test_near_goal_connector_can_rescue_search_before_fallback(self) -> None:
+        goal = (29.277877625513483, 47.65375351775711, -0.8170957868197246)
+        weak_planner = AStarPlanner(
+            world=self.world,
+            resolution=1.0,
+            inflation_radius=DEFAULT_CONFIG.vehicle_radius + DEFAULT_CONFIG.safety_margin,
+            connect_diagonal=True,
+        )
+        strong_planner = AStarPlanner(
+            world=self.world,
+            resolution=1.0,
+            inflation_radius=DEFAULT_CONFIG.vehicle_radius + DEFAULT_CONFIG.safety_margin,
+            connect_diagonal=True,
+        )
+
+        weak_points, weak_length, weak_diag = weak_planner.plan_hybrid_detailed(
+            start_pose=(12.0, 14.0, 0.2),
+            goal_pose=goal,
+            turn_radius=10.0,
+            step_size=1.2,
+            heading_bins=48,
+            max_expansions=4000,
+            goal_pos_tolerance=1.2,
+            goal_heading_tolerance=0.35,
+            allow_reverse=True,
+            reverse_penalty=1.22,
+            heuristic_weight=1.15,
+            near_goal_connector_expansions=1,
+            near_goal_connector_depth=1,
+            near_goal_connector_radius_factor=0.3,
+        )
+        strong_points, strong_length, strong_diag = strong_planner.plan_hybrid_detailed(
+            start_pose=(12.0, 14.0, 0.2),
+            goal_pose=goal,
+            turn_radius=10.0,
+            step_size=1.2,
+            heading_bins=48,
+            max_expansions=4000,
+            goal_pos_tolerance=1.2,
+            goal_heading_tolerance=0.35,
+            allow_reverse=True,
+            reverse_penalty=1.22,
+            heuristic_weight=1.15,
+            near_goal_connector_expansions=160,
+            near_goal_connector_depth=6,
+            near_goal_connector_radius_factor=2.75,
+        )
+
+        self.assertEqual(weak_points, [])
+        self.assertEqual(weak_length, float("inf"))
+        self.assertIn("near_goal_connector_failed", weak_diag.reason_tags)
+
+        self.assertGreater(len(strong_points), 2)
+        self.assertTrue(math.isfinite(strong_length))
+        self.assertTrue(strong_diag.used_connector)
+        self.assertIn("connector:reeds_shepp_like:ok", strong_diag.debug_trace)
+
+    def test_plain_astar_fallback_still_available_as_last_resort(self) -> None:
+        cfg = replace(
+            DEFAULT_CONFIG,
+            use_dubins_hybrid=True,
+            use_hybrid_astar=True,
+            hybrid_astar_fallback_to_legacy=True,
+            hybrid_astar_direct_astar_fallback=True,
+        )
+        start = (12.0, 14.0, 0.2)
+        goal = (85.0, 76.0, 1.0)
+        fail_diag = HybridPlanDiagnostics(
+            reason="unreachable_main_search",
+            reason_tags=("unreachable_main_search", "near_goal_connector_failed"),
+            debug_trace="hybrid_astar:primary_unreachable_main_search|near_goal_connector_failed",
+        )
+
+        with patch.object(self.planner, "plan_hybrid_detailed", return_value=([], float("inf"), fail_diag)):
+            points, length, meta = build_dubins_hybrid_path(
+                world=self.world,
+                cfg=cfg,
+                start_pose=start,
+                goal_pose=goal,
+                astar_planner=self.planner,
+                turn_radius=12.0,
+            )
+
+        self.assertGreater(len(points), 1)
+        self.assertTrue(math.isfinite(length))
+        self.assertTrue(meta.used_fallback)
+        self.assertEqual(meta.fallback_reason, "degraded_to_plain_astar")
+        self.assertIn("unreachable_main_search", meta.fallback_details)
+        self.assertIn("degraded_to_plain_astar", meta.fallback_details)
+        self.assertIn("near_goal_connector_failed", meta.fallback_details)
 
     def test_hybrid_fallback_to_astar_when_collision_too_strict(self) -> None:
         cfg = replace(

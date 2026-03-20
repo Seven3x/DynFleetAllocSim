@@ -8,7 +8,7 @@ from shapely.geometry import LineString
 
 from .cost_estimator import heading_to_point, wrap_to_pi
 from .map_utils import WorldMap
-from .planner_astar import AStarPlanner
+from .planner_astar import AStarPlanner, HybridPlanDiagnostics
 
 
 Point2D = Tuple[float, float]
@@ -257,6 +257,50 @@ def _bump_reason(reason_counts: Dict[str, int], reason: str) -> None:
     if not reason:
         return
     reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+
+def _reason_tokens(text: str) -> List[str]:
+    out: List[str] = []
+    for raw in text.split("|"):
+        token = raw.strip()
+        if not token:
+            continue
+        if ":" in token:
+            head, tail = token.rsplit(":", 1)
+            if tail.isdigit():
+                token = head.strip()
+        if token and token not in out:
+            out.append(token)
+    return out
+
+
+def _append_reason_tokens(text: str, *tokens: str) -> str:
+    out = _reason_tokens(text)
+    for token in tokens:
+        tok = str(token).strip()
+        if not tok or tok in out:
+            continue
+        out.append(tok)
+    return "|".join(out)
+
+
+def _primary_reason_token(text: str, default: str = "") -> str:
+    tokens = _reason_tokens(text)
+    return tokens[0] if tokens else default
+
+
+def _stage_reason_tags(diag: HybridPlanDiagnostics, stage: str) -> List[str]:
+    tags: List[str] = []
+    if stage == "primary":
+        tags.append("unreachable_main_search")
+    elif stage == "retry":
+        tags.append("unreachable_after_retry")
+    for tag in getattr(diag, "reason_tags", ()) or ():
+        if tag not in tags:
+            tags.append(tag)
+    if not tags and getattr(diag, "reason", ""):
+        tags.append(str(diag.reason))
+    return tags
 
 
 def _sample_recovery_arc(
@@ -774,6 +818,7 @@ def build_dubins_hybrid_path(
     use_dubins_hybrid = bool(getattr(cfg, "use_dubins_hybrid", False))
     collision_margin = float(getattr(cfg, "dubins_collision_margin", 0.0))
     legacy_debug_prefix = ""
+    legacy_reason_detail = ""
 
     def _finalize_legacy_return(
         points: List[Point2D],
@@ -791,12 +836,9 @@ def build_dubins_hybrid_path(
         if not meta.used_fallback:
             meta.used_fallback = True
             meta.fallback_segments = max(1, int(meta.fallback_segments))
+        meta.fallback_details = _append_reason_tokens(meta.fallback_details, *_reason_tokens(legacy_reason_detail))
         if not meta.fallback_reason:
-            meta.fallback_reason = "hybrid_astar_fallback"
-        if not meta.fallback_details:
-            meta.fallback_details = legacy_debug_prefix
-        elif legacy_debug_prefix not in meta.fallback_details:
-            meta.fallback_details = f"{meta.fallback_details}|{legacy_debug_prefix}"
+            meta.fallback_reason = _primary_reason_token(meta.fallback_details, default="hybrid_astar_fallback")
         return points, length, meta
 
     # Primary mode: Hybrid A* on (x, y, yaw) state space.
@@ -813,8 +855,8 @@ def build_dubins_hybrid_path(
             heuristic_weight: float,
             allow_reverse: bool,
             trace: str,
-        ) -> Tuple[Optional[Tuple[List[Point2D], float, DubinsHybridMeta]], str]:
-            hybrid_points, hybrid_len = astar_planner.plan_hybrid(
+        ) -> Tuple[Optional[Tuple[List[Point2D], float, DubinsHybridMeta]], HybridPlanDiagnostics]:
+            hybrid_points, hybrid_len, hybrid_diag = astar_planner.plan_hybrid_detailed(
                 start_pose=start_pose,
                 goal_pose=goal_pose,
                 turn_radius=turn_radius,
@@ -826,9 +868,16 @@ def build_dubins_hybrid_path(
                 allow_reverse=allow_reverse,
                 reverse_penalty=float(getattr(cfg, "hybrid_astar_reverse_penalty", 1.6)),
                 heuristic_weight=heuristic_weight,
+                near_goal_connector_expansions=int(
+                    getattr(cfg, "hybrid_astar_near_goal_connector_expansions", 160)
+                ),
+                near_goal_connector_depth=int(getattr(cfg, "hybrid_astar_near_goal_connector_depth", 6)),
+                near_goal_connector_radius_factor=float(
+                    getattr(cfg, "hybrid_astar_near_goal_connector_radius_factor", 2.75)
+                ),
             )
             if not hybrid_points or not math.isfinite(hybrid_len):
-                return None, "hybrid_astar_unreachable"
+                return None, hybrid_diag
 
             need_recheck = collision_margin > planner_clearance + 1e-9
             if not force_mode and need_recheck and not _polyline_collision_free(
@@ -836,7 +885,14 @@ def build_dubins_hybrid_path(
                 world=world,
                 margin=collision_margin,
             ):
-                return None, "hybrid_astar_collision"
+                return None, HybridPlanDiagnostics(
+                    reason="collision_on_connector",
+                    reason_tags=("collision_on_connector",),
+                    debug_trace="hybrid_astar:margin_collision",
+                    expansions=hybrid_diag.expansions,
+                    used_connector=hybrid_diag.used_connector,
+                    connector_mode=hybrid_diag.connector_mode,
+                )
 
             return (
                 hybrid_points,
@@ -847,11 +903,11 @@ def build_dubins_hybrid_path(
                     dubins_segments=0,
                     sample_count=len(hybrid_points),
                     dubins_ratio=0.0,
-                    debug_trace=trace,
+                    debug_trace=str(getattr(hybrid_diag, "debug_trace", "") or trace),
                 ),
-            ), ""
+            ), hybrid_diag
 
-        primary_out, primary_reason = _try_hybrid_once(
+        primary_out, primary_diag = _try_hybrid_once(
             step_size=float(getattr(cfg, "hybrid_astar_step_size", 0.8)),
             heading_bins=int(getattr(cfg, "hybrid_astar_heading_bins", 72)),
             max_expansions=int(getattr(cfg, "hybrid_astar_max_expansions", 45000)),
@@ -864,11 +920,13 @@ def build_dubins_hybrid_path(
         if primary_out is not None:
             return primary_out
 
-        hybrid_fail_reason = primary_reason or "hybrid_astar_unreachable"
-        debug_trace = f"hybrid_astar:primary_{hybrid_fail_reason}"
+        hybrid_fail_reason = getattr(primary_diag, "reason", "") or "unreachable_main_search"
+        primary_tags = _stage_reason_tags(primary_diag, stage="primary")
+        debug_trace = "hybrid_astar:primary_" + "|".join(primary_tags)
+        legacy_reason_detail = _append_reason_tokens(legacy_reason_detail, *primary_tags)
 
         if bool(getattr(cfg, "hybrid_astar_retry_on_fail", True)):
-            retry_out, retry_reason = _try_hybrid_once(
+            retry_out, retry_diag = _try_hybrid_once(
                 step_size=float(getattr(cfg, "hybrid_astar_retry_step_size", 0.8)),
                 heading_bins=int(getattr(cfg, "hybrid_astar_retry_heading_bins", 72)),
                 max_expansions=int(getattr(cfg, "hybrid_astar_retry_max_expansions", 45000)),
@@ -886,16 +944,18 @@ def build_dubins_hybrid_path(
             )
             if retry_out is not None:
                 return retry_out
-            retry_fail = retry_reason or "hybrid_astar_unreachable"
+            retry_tags = _stage_reason_tags(retry_diag, stage="retry")
+            retry_fail = getattr(retry_diag, "reason", "") or "unreachable_after_retry"
             hybrid_fail_reason = retry_fail
-            debug_trace = f"{debug_trace}|retry_{retry_fail}"
+            debug_trace = f"{debug_trace}|retry_" + "|".join(retry_tags)
+            legacy_reason_detail = _append_reason_tokens(legacy_reason_detail, *retry_tags)
 
             # Single rescue pass for unreachable: relax terminal heading constraint.
             if (
-                retry_fail == "hybrid_astar_unreachable"
+                retry_fail in {"unreachable_main_search", "unreachable_after_retry", "exceeded_expansions"}
                 and bool(getattr(cfg, "hybrid_astar_relaxed_goal_on_unreachable", True))
             ):
-                relaxed_out, relaxed_reason = _try_hybrid_once(
+                relaxed_out, relaxed_diag = _try_hybrid_once(
                     step_size=float(getattr(cfg, "hybrid_astar_retry_step_size", 0.8)),
                     heading_bins=int(getattr(cfg, "hybrid_astar_retry_heading_bins", 72)),
                     max_expansions=int(getattr(cfg, "hybrid_astar_relaxed_goal_max_expansions", 12000)),
@@ -915,9 +975,11 @@ def build_dubins_hybrid_path(
                 )
                 if relaxed_out is not None:
                     return relaxed_out
-                relaxed_fail = relaxed_reason or "hybrid_astar_unreachable"
+                relaxed_tags = list(getattr(relaxed_diag, "reason_tags", ()) or ())
+                relaxed_fail = getattr(relaxed_diag, "reason", "") or "unreachable_after_retry"
                 hybrid_fail_reason = relaxed_fail
-                debug_trace = f"{debug_trace}|relaxed_{relaxed_fail}"
+                debug_trace = f"{debug_trace}|relaxed_" + ("|".join(relaxed_tags) if relaxed_tags else relaxed_fail)
+                legacy_reason_detail = _append_reason_tokens(legacy_reason_detail, *relaxed_tags)
 
         legacy_debug_prefix = debug_trace
         if not bool(getattr(cfg, "hybrid_astar_fallback_to_legacy", True)):
@@ -930,8 +992,8 @@ def build_dubins_hybrid_path(
                     dubins_segments=0,
                     sample_count=0,
                     dubins_ratio=0.0,
-                    fallback_reason=hybrid_fail_reason,
-                    fallback_details=f"{hybrid_fail_reason}:1",
+                    fallback_reason=_primary_reason_token(legacy_reason_detail, default=hybrid_fail_reason),
+                    fallback_details=legacy_reason_detail or hybrid_fail_reason,
                     debug_trace=debug_trace,
                 ),
             )
@@ -979,8 +1041,8 @@ def build_dubins_hybrid_path(
                 dubins_segments=0,
                 sample_count=len(base_path),
                 dubins_ratio=0.0,
-                fallback_reason="hybrid_astar_fallback_to_astar",
-                fallback_details="hybrid_astar_fallback_to_astar:1",
+                fallback_reason="degraded_to_plain_astar",
+                fallback_details=_append_reason_tokens(legacy_reason_detail, "degraded_to_plain_astar"),
                 debug_trace=legacy_debug_prefix,
             ),
         )

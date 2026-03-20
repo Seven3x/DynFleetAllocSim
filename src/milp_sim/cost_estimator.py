@@ -119,9 +119,12 @@ def prioritize_goal_heading_candidates(
     def d_to_current(h: float) -> float:
         return abs(wrap_to_pi(h - current_heading))
 
+    def signed_to_target(h: float) -> float:
+        return wrap_to_pi(h - target_heading)
+
     center = min(headings, key=d_to_target)
     smooth = min(headings, key=d_to_current)
-    ranked = sorted(
+    ranked_combined = sorted(
         headings,
         key=lambda h: (
             d_to_target(h) + 0.35 * d_to_current(h),
@@ -129,9 +132,21 @@ def prioritize_goal_heading_candidates(
             d_to_current(h),
         ),
     )
+    ranked_target = sorted(headings, key=d_to_target)
+    ranked_current = sorted(headings, key=d_to_current)
+    left_of_target = [h for h in ranked_target if signed_to_target(h) < -1e-6]
+    right_of_target = [h for h in ranked_target if signed_to_target(h) > 1e-6]
 
     out: List[float] = []
-    for h in (center, smooth, *ranked):
+    for h in (
+        center,
+        smooth,
+        left_of_target[0] if left_of_target else center,
+        right_of_target[0] if right_of_target else center,
+        *ranked_combined,
+        *ranked_target,
+        *ranked_current,
+    ):
         if all(abs(wrap_to_pi(h - v)) > 1e-4 for v in out):
             out.append(h)
         if len(out) >= n:

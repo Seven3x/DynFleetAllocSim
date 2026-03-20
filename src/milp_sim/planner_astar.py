@@ -3,6 +3,7 @@ from __future__ import annotations
 import heapq
 import math
 from collections import deque
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -15,6 +16,16 @@ GridPoint = Tuple[int, int]
 Point2D = Tuple[float, float]
 Pose2D = Tuple[float, float, float]
 HybridState = Tuple[int, int, int]
+
+
+@dataclass
+class HybridPlanDiagnostics:
+    reason: str = ""
+    reason_tags: Tuple[str, ...] = ()
+    debug_trace: str = ""
+    expansions: int = 0
+    used_connector: bool = False
+    connector_mode: str = ""
 
 
 class AStarPlanner:
@@ -256,7 +267,208 @@ class AStarPlanner:
             oldest_key = next(iter(self._hybrid_cache))
             del self._hybrid_cache[oldest_key]
 
-    def plan_hybrid(
+    @staticmethod
+    def _polyline_length(points: List[Point2D]) -> float:
+        total = 0.0
+        for i in range(len(points) - 1):
+            total += math.hypot(points[i + 1][0] - points[i][0], points[i + 1][1] - points[i][1])
+        return total
+
+    @staticmethod
+    def _dedupe_points(points: List[Point2D]) -> List[Point2D]:
+        if not points:
+            return []
+        out = [points[0]]
+        for p in points[1:]:
+            if math.hypot(p[0] - out[-1][0], p[1] - out[-1][1]) > 1e-9:
+                out.append(p)
+        return out
+
+    def _trace_hybrid_points(
+        self,
+        goal_key: HybridState,
+        parent: Dict[HybridState, HybridState],
+        poses: Dict[HybridState, Pose2D],
+    ) -> List[Point2D]:
+        trace_keys: List[HybridState] = [goal_key]
+        cursor = goal_key
+        while cursor in parent:
+            cursor = parent[cursor]
+            trace_keys.append(cursor)
+        trace_keys.reverse()
+        return [(poses[key][0], poses[key][1]) for key in trace_keys]
+
+    def _stitch_requested_endpoints(
+        self,
+        points: List[Point2D],
+        requested_start: Point2D,
+        requested_goal: Point2D,
+        connect_step: float,
+    ) -> List[Point2D]:
+        points = self._dedupe_points(points)
+        if not points:
+            return []
+
+        if math.hypot(points[0][0] - requested_start[0], points[0][1] - requested_start[1]) > 1e-6:
+            if not self._segment_is_free(requested_start, points[0], connect_step):
+                return []
+            points = [requested_start] + points
+        else:
+            points[0] = requested_start
+
+        if math.hypot(points[-1][0] - requested_goal[0], points[-1][1] - requested_goal[1]) > 1e-6:
+            if not self._segment_is_free(points[-1], requested_goal, connect_step):
+                return []
+            points = points + [requested_goal]
+        else:
+            points[-1] = requested_goal
+        return self._dedupe_points(points)
+
+    def _try_local_connector(
+        self,
+        *,
+        start_pose: Pose2D,
+        goal_pose: Pose2D,
+        turn_radius: float,
+        step_size: float,
+        heading_bins: int,
+        allow_reverse: bool,
+        goal_pos_tolerance: float,
+        goal_heading_tolerance: float,
+        max_expansions: int,
+        max_depth: int,
+        connector_radius: float,
+    ) -> Tuple[List[Point2D], float, HybridPlanDiagnostics]:
+        mode = "reeds_shepp_like" if allow_reverse else "dubins_like"
+        dist_start_to_goal = math.hypot(goal_pose[0] - start_pose[0], goal_pose[1] - start_pose[1])
+        if dist_start_to_goal > connector_radius + 1e-9:
+            return [], float("inf"), HybridPlanDiagnostics(
+                reason="near_goal_connector_failed",
+                reason_tags=("near_goal_connector_failed",),
+                connector_mode=mode,
+            )
+
+        sample_step = max(0.08, min(step_size * 0.5, self.resolution))
+        curvature_abs = 1.0 / max(turn_radius, 1e-6)
+        curvatures = tuple(curvature_abs * c for c in (-1.0, -0.6, -0.3, 0.0, 0.3, 0.6, 1.0))
+        directions = (1.0, -1.0) if allow_reverse else (1.0,)
+        local_bins = max(heading_bins, 24)
+
+        node_pose: List[Pose2D] = [start_pose]
+        node_parent: List[int] = [-1]
+        node_segment: List[List[Point2D]] = [[(start_pose[0], start_pose[1])]]
+        node_depth: List[int] = [0]
+        node_g: List[float] = [0.0]
+        open_heap: List[Tuple[float, int, int]] = []
+        push_count = 0
+        best_seen: Dict[Tuple[HybridState, int], float] = {}
+        start_key = self._pose_to_hybrid_state(start_pose, local_bins)
+        best_seen[(start_key, 0)] = 0.0
+
+        def heuristic(pose: Pose2D) -> float:
+            dist = math.hypot(goal_pose[0] - pose[0], goal_pose[1] - pose[1])
+            yaw_err = abs(self._wrap_to_pi(goal_pose[2] - pose[2]))
+            return dist + 0.20 * turn_radius * yaw_err
+
+        heapq.heappush(open_heap, (heuristic(start_pose), push_count, 0))
+        push_count += 1
+
+        saw_collision = False
+        expansions = 0
+
+        while open_heap and expansions < max_expansions:
+            _, _, node_idx = heapq.heappop(open_heap)
+            pose = node_pose[node_idx]
+            depth = node_depth[node_idx]
+            expansions += 1
+
+            dist_to_goal = math.hypot(goal_pose[0] - pose[0], goal_pose[1] - pose[1])
+            yaw_to_goal = abs(self._wrap_to_pi(goal_pose[2] - pose[2]))
+            if dist_to_goal <= goal_pos_tolerance and yaw_to_goal <= goal_heading_tolerance:
+                path_points: List[Point2D] = []
+                cursor = node_idx
+                chain: List[int] = []
+                while cursor >= 0:
+                    chain.append(cursor)
+                    cursor = node_parent[cursor]
+                chain.reverse()
+                for idx in chain:
+                    segment = node_segment[idx]
+                    if not path_points:
+                        path_points.extend(segment)
+                    else:
+                        path_points.extend(segment[1:])
+                path_points = self._dedupe_points(path_points)
+                return path_points, self._polyline_length(path_points), HybridPlanDiagnostics(
+                    debug_trace=f"connector:{mode}:ok",
+                    expansions=expansions,
+                    used_connector=True,
+                    connector_mode=mode,
+                )
+
+            if depth >= max_depth:
+                continue
+
+            step_candidates: List[float] = []
+            for value in (
+                min(step_size, max(goal_pos_tolerance * 0.8, dist_to_goal)),
+                min(step_size, max(goal_pos_tolerance * 0.8, dist_to_goal * 0.7)),
+                min(step_size, max(goal_pos_tolerance * 0.8, turn_radius * 0.55)),
+                min(step_size, max(goal_pos_tolerance * 0.8, abs(self._wrap_to_pi(goal_pose[2] - pose[2])) * turn_radius)),
+            ):
+                if value <= 1e-6:
+                    continue
+                if all(abs(value - existing) > 1e-6 for existing in step_candidates):
+                    step_candidates.append(value)
+
+            for direction in directions:
+                for primitive_step in step_candidates:
+                    turn_penalty = 0.02 * primitive_step
+                    for curvature in curvatures:
+                        samples, nxt_pose = self._simulate_motion_primitive(
+                            start_pose=pose,
+                            curvature=curvature,
+                            step_size=primitive_step,
+                            direction=direction,
+                            sample_step=sample_step,
+                        )
+                        if not self._primitive_is_free(samples):
+                            saw_collision = True
+                            continue
+                        if math.hypot(nxt_pose[0] - start_pose[0], nxt_pose[1] - start_pose[1]) > connector_radius + 1e-9:
+                            continue
+
+                        nxt_depth = depth + 1
+                        state_key = self._pose_to_hybrid_state(nxt_pose, local_bins)
+                        step_cost = primitive_step * (1.25 if direction < 0.0 else 1.0)
+                        if abs(curvature) > 1e-9:
+                            step_cost += turn_penalty
+                        tentative_g = node_g[node_idx] + step_cost
+                        best_key = (state_key, nxt_depth)
+                        if tentative_g + 1e-9 >= best_seen.get(best_key, float("inf")):
+                            continue
+
+                        best_seen[best_key] = tentative_g
+                        node_pose.append(nxt_pose)
+                        node_parent.append(node_idx)
+                        node_segment.append([pose[:2]] + samples)
+                        node_depth.append(nxt_depth)
+                        node_g.append(tentative_g)
+                        score = tentative_g + heuristic(nxt_pose) + 0.1 * nxt_depth
+                        heapq.heappush(open_heap, (score, push_count, len(node_pose) - 1))
+                        push_count += 1
+
+        reason = "collision_on_connector" if saw_collision else "near_goal_connector_failed"
+        debug_trace = f"connector:{mode}:{reason}"
+        return [], float("inf"), HybridPlanDiagnostics(
+            reason=reason,
+            reason_tags=(reason,),
+            debug_trace=debug_trace,
+            expansions=expansions,
+            connector_mode=mode,
+        )
+
+    def plan_hybrid_detailed(
         self,
         start_pose: Pose2D,
         goal_pose: Pose2D,
@@ -269,7 +481,10 @@ class AStarPlanner:
         allow_reverse: bool = False,
         reverse_penalty: float = 1.6,
         heuristic_weight: float = 1.05,
-    ) -> Tuple[List[Point2D], float]:
+        near_goal_connector_expansions: int = 160,
+        near_goal_connector_depth: int = 6,
+        near_goal_connector_radius_factor: float = 2.75,
+    ) -> Tuple[List[Point2D], float, HybridPlanDiagnostics]:
         heading_bins = max(8, int(heading_bins))
         max_expansions = max(1000, int(max_expansions))
         step = max(0.2, float(step_size if step_size is not None else max(self.resolution, 0.8)))
@@ -286,13 +501,23 @@ class AStarPlanner:
         turn_radius = max(1e-6, float(turn_radius))
         min_bins_for_turn = int(math.ceil((2.0 * math.pi) / max(step / turn_radius, 1e-3)))
         state_heading_bins = max(heading_bins, min_bins_for_turn)
+        connector_radius = max(
+            pos_tol * max(1.5, float(near_goal_connector_radius_factor)),
+            step * max(1.0, float(near_goal_connector_radius_factor)),
+            0.9 * turn_radius,
+        )
+        connector_expansions = max(1, int(near_goal_connector_expansions))
+        connector_depth = max(1, int(near_goal_connector_depth))
 
         start = (float(start_pose[0]), float(start_pose[1]))
         goal = (float(goal_pose[0]), float(goal_pose[1]))
         start_grid = self._nearest_free(self.world_to_grid(start))
         goal_grid = self._nearest_free(self.world_to_grid(goal))
         if start_grid is None or goal_grid is None:
-            return [], float("inf")
+            return [], float("inf"), HybridPlanDiagnostics(
+                reason="unreachable_main_search",
+                reason_tags=("unreachable_main_search",),
+            )
         goal_grid_dist = self._grid_heuristic_get(goal_grid)
 
         if not self._point_is_free_on_grid(start):
@@ -322,7 +547,8 @@ class AStarPlanner:
         )
         cached = self._hybrid_cache_get(cache_key)
         if cached is not None:
-            return cached
+            path, length = cached
+            return path, length, HybridPlanDiagnostics(debug_trace="hybrid_astar:cache")
 
         start_state = (start[0], start[1], start_yaw)
         start_key = self._pose_to_hybrid_state(start_state, state_heading_bins)
@@ -349,6 +575,7 @@ class AStarPlanner:
         best_key = start_key
         best_progress = float("inf")
         goal_key: Optional[HybridState] = None
+        connector_failure: Optional[HybridPlanDiagnostics] = None
 
         curvature_abs = 1.0 / turn_radius
         curvature_scales = (-1.0, -0.6, -0.3, 0.0, 0.3, 0.6, 1.0)
@@ -374,6 +601,41 @@ class AStarPlanner:
             if dist_to_goal <= pos_tol and yaw_to_goal <= yaw_tol:
                 goal_key = current_key
                 break
+
+            if dist_to_goal <= connector_radius + 1e-9:
+                connector_points, connector_len, connector_diag = self._try_local_connector(
+                    start_pose=pose,
+                    goal_pose=(goal[0], goal[1], goal_yaw),
+                    turn_radius=turn_radius,
+                    step_size=max(step_min, min(step, dist_to_goal + pos_tol)),
+                    heading_bins=state_heading_bins,
+                    allow_reverse=allow_reverse,
+                    goal_pos_tolerance=pos_tol,
+                    goal_heading_tolerance=yaw_tol,
+                    max_expansions=connector_expansions,
+                    max_depth=connector_depth,
+                    connector_radius=connector_radius,
+                )
+                if connector_points and math.isfinite(connector_len):
+                    prefix = self._trace_hybrid_points(current_key, parent, poses)
+                    combined = self._dedupe_points(prefix + connector_points[1:])
+                    requested_start = (float(start_pose[0]), float(start_pose[1]))
+                    requested_goal = (float(goal_pose[0]), float(goal_pose[1]))
+                    connect_step = max(0.08, min(self.resolution, step * 0.5))
+                    stitched = self._stitch_requested_endpoints(
+                        combined,
+                        requested_start=requested_start,
+                        requested_goal=requested_goal,
+                        connect_step=connect_step,
+                    )
+                    if stitched:
+                        length = self._polyline_length(stitched)
+                        self._hybrid_cache_set(cache_key, stitched, length)
+                        connector_diag.debug_trace = f"hybrid_astar:{connector_diag.debug_trace}"
+                        connector_diag.expansions += expansions
+                        return stitched, length, connector_diag
+                elif connector_failure is None or connector_failure.reason != "collision_on_connector":
+                    connector_failure = connector_diag
 
             adaptive_step = max(
                 step_min,
@@ -423,50 +685,121 @@ class AStarPlanner:
         if goal_key is None:
             near_pose = poses.get(best_key)
             if near_pose is None:
-                self._hybrid_cache_set(cache_key, [], float("inf"))
-                return [], float("inf")
-            if math.hypot(near_pose[0] - goal[0], near_pose[1] - goal[1]) > max(pos_tol * 2.0, step * 2.0):
-                self._hybrid_cache_set(cache_key, [], float("inf"))
-                return [], float("inf")
-            goal_key = best_key
+                reason = "exceeded_expansions" if expansions >= max_expansions else "unreachable_main_search"
+                return [], float("inf"), HybridPlanDiagnostics(reason=reason, reason_tags=(reason,), expansions=expansions)
 
-        trace_keys: List[HybridState] = [goal_key]
-        cursor = goal_key
-        while cursor in parent:
-            cursor = parent[cursor]
-            trace_keys.append(cursor)
-        trace_keys.reverse()
+            connector_points, connector_len, connector_diag = self._try_local_connector(
+                start_pose=near_pose,
+                goal_pose=(goal[0], goal[1], goal_yaw),
+                turn_radius=turn_radius,
+                step_size=max(step_min, min(step, math.hypot(near_pose[0] - goal[0], near_pose[1] - goal[1]) + pos_tol)),
+                heading_bins=state_heading_bins,
+                allow_reverse=allow_reverse,
+                goal_pos_tolerance=pos_tol,
+                goal_heading_tolerance=yaw_tol,
+                max_expansions=connector_expansions,
+                max_depth=connector_depth,
+                connector_radius=connector_radius,
+            )
+            if connector_points and math.isfinite(connector_len):
+                prefix = self._trace_hybrid_points(best_key, parent, poses)
+                combined = self._dedupe_points(prefix + connector_points[1:])
+                requested_start = (float(start_pose[0]), float(start_pose[1]))
+                requested_goal = (float(goal_pose[0]), float(goal_pose[1]))
+                connect_step = max(0.08, min(self.resolution, step * 0.5))
+                stitched = self._stitch_requested_endpoints(
+                    combined,
+                    requested_start=requested_start,
+                    requested_goal=requested_goal,
+                    connect_step=connect_step,
+                )
+                if stitched:
+                    length = self._polyline_length(stitched)
+                    self._hybrid_cache_set(cache_key, stitched, length)
+                    connector_diag.debug_trace = f"hybrid_astar:{connector_diag.debug_trace}"
+                    connector_diag.expansions += expansions
+                    return stitched, length, connector_diag
 
-        points: List[Point2D] = [(poses[key][0], poses[key][1]) for key in trace_keys]
+            reason_tags: List[str] = []
+            if expansions >= max_expansions:
+                reason_tags.append("exceeded_expansions")
+            else:
+                reason_tags.append("unreachable_main_search")
+            final_connector_failure = connector_diag if connector_diag.reason else connector_failure
+            if final_connector_failure is not None and final_connector_failure.reason:
+                reason_tags.append(final_connector_failure.reason)
+            return [], float("inf"), HybridPlanDiagnostics(
+                reason=reason_tags[0],
+                reason_tags=tuple(reason_tags),
+                debug_trace=(
+                    f"hybrid_astar:{final_connector_failure.debug_trace}"
+                    if final_connector_failure is not None and final_connector_failure.debug_trace
+                    else ""
+                ),
+                expansions=expansions + connector_diag.expansions,
+                connector_mode=(
+                    final_connector_failure.connector_mode
+                    if final_connector_failure is not None
+                    else connector_diag.connector_mode
+                ),
+            )
+
+        points = self._trace_hybrid_points(goal_key, parent, poses)
         if not points:
-            self._hybrid_cache_set(cache_key, [], float("inf"))
-            return [], float("inf")
+            return [], float("inf"), HybridPlanDiagnostics(
+                reason="unreachable_main_search",
+                reason_tags=("unreachable_main_search",),
+                expansions=expansions,
+            )
 
         requested_start = (float(start_pose[0]), float(start_pose[1]))
         requested_goal = (float(goal_pose[0]), float(goal_pose[1]))
         connect_step = max(0.08, min(self.resolution, step * 0.5))
+        points = self._stitch_requested_endpoints(
+            points,
+            requested_start=requested_start,
+            requested_goal=requested_goal,
+            connect_step=connect_step,
+        )
+        if not points:
+            return [], float("inf"), HybridPlanDiagnostics(
+                reason="near_goal_connector_failed",
+                reason_tags=("near_goal_connector_failed",),
+                expansions=expansions,
+            )
 
-        if math.hypot(points[0][0] - requested_start[0], points[0][1] - requested_start[1]) > 1e-6:
-            if not self._segment_is_free(requested_start, points[0], connect_step):
-                self._hybrid_cache_set(cache_key, [], float("inf"))
-                return [], float("inf")
-            points = [requested_start] + points
-        else:
-            points[0] = requested_start
-
-        if math.hypot(points[-1][0] - requested_goal[0], points[-1][1] - requested_goal[1]) > 1e-6:
-            if not self._segment_is_free(points[-1], requested_goal, connect_step):
-                self._hybrid_cache_set(cache_key, [], float("inf"))
-                return [], float("inf")
-            points = points + [requested_goal]
-        else:
-            points[-1] = requested_goal
-
-        length = 0.0
-        for i in range(len(points) - 1):
-            length += math.hypot(points[i + 1][0] - points[i][0], points[i + 1][1] - points[i][1])
+        length = self._polyline_length(points)
 
         self._hybrid_cache_set(cache_key, points, length)
+        return points, length, HybridPlanDiagnostics(debug_trace="hybrid_astar:ok", expansions=expansions)
+
+    def plan_hybrid(
+        self,
+        start_pose: Pose2D,
+        goal_pose: Pose2D,
+        turn_radius: float,
+        step_size: Optional[float] = None,
+        heading_bins: int = 72,
+        max_expansions: int = 45000,
+        goal_pos_tolerance: Optional[float] = None,
+        goal_heading_tolerance: float = 0.8,
+        allow_reverse: bool = False,
+        reverse_penalty: float = 1.6,
+        heuristic_weight: float = 1.05,
+    ) -> Tuple[List[Point2D], float]:
+        points, length, _ = self.plan_hybrid_detailed(
+            start_pose=start_pose,
+            goal_pose=goal_pose,
+            turn_radius=turn_radius,
+            step_size=step_size,
+            heading_bins=heading_bins,
+            max_expansions=max_expansions,
+            goal_pos_tolerance=goal_pos_tolerance,
+            goal_heading_tolerance=goal_heading_tolerance,
+            allow_reverse=allow_reverse,
+            reverse_penalty=reverse_penalty,
+            heuristic_weight=heuristic_weight,
+        )
         return points, length
 
     def plan(self, start: Point2D, goal: Point2D) -> Tuple[List[Point2D], float]:

@@ -183,6 +183,10 @@ class SimulationSession:
                     token = part.strip()
                     if not token:
                         continue
+                    if ":" in token:
+                        head, tail = token.rsplit(":", 1)
+                        if tail.isdigit():
+                            token = head.strip()
                     if token.startswith("hybrid_astar:primary_"):
                         label = token[len("hybrid_astar:primary_") :].strip()
                     elif token.startswith("retry_"):
