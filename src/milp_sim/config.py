@@ -65,15 +65,15 @@ class SimulationConfig:
     hybrid_astar_reverse_penalty: float = 1.22
     hybrid_astar_heuristic_weight: float = 1.15
     # Limit how many terminal-heading candidates are fully planned in Hybrid A* mode.
-    hybrid_astar_heading_candidate_limit: int = 6
+    hybrid_astar_heading_candidate_limit: int = 3
     # If primary heading candidates all degrade to fallback, expand a few extra candidates.
-    hybrid_astar_heading_candidate_retry_limit: int = 3
+    hybrid_astar_heading_candidate_retry_limit: int = 1
     # In multi-candidate evaluation, skip per-candidate robust retry to avoid N x retry blow-up.
     hybrid_astar_primary_disable_retry: bool = True
     # When primary pass still has no pure-hybrid solution, robust-retry only top-K candidates.
-    hybrid_astar_robust_retry_headings: int = 2
+    hybrid_astar_robust_retry_headings: int = 1
     # Stop heading expansion early once a non-fallback candidate is found.
-    hybrid_astar_stop_on_first_non_fallback: bool = False
+    hybrid_astar_stop_on_first_non_fallback: bool = True
     # Prefer pure Hybrid A* solutions over legacy fallback when scores are close.
     hybrid_astar_fallback_penalty: float = 6.0
     # If fast Hybrid A* attempt fails, retry once with robust parameters.
