@@ -49,11 +49,11 @@ class SimulationConfig:
     # Bid verification runs in lightweight mode by default so ranking is stable
     # and less sensitive to local trajectory beautification details.
     bid_verification_use_next_task_heading: bool = False
-    bid_verification_use_dubins_hybrid: bool = False
+    bid_verification_use_dubins_hybrid: bool = True
     bid_verification_enable_connector_first: bool = False
     bid_verification_enable_initial_turn_buffer: bool = False
     # When False, bid verification only rejects infeasible paths (not cost-gap underestimation).
-    bid_verification_reject_on_cost_gap: bool = False
+    bid_verification_reject_on_cost_gap: bool = True
 
     astar_resolution: float = 1.0
     astar_connect_diagonal: bool = True
