@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 from .config import SimulationConfig
-from .cost_estimator import goal_heading_candidates, heading_to_point, prioritize_goal_heading_candidates, wrap_to_pi
-from .dubins_path import DubinsHybridMeta, build_dubins_hybrid_path
+from .cost_estimator import goal_heading_candidates, heading_to_point, wrap_to_pi
+from .dubins_path import DubinsHybridMeta, build_dubins_hybrid_path  # backward-compatible import for tests/patching
+from .hybrid_heading_selector import select_best_heading_path
 from .entities import Task, Vehicle
 from .path_postprocess import maybe_buffer_initial_turn_path
 from .planner_astar import AStarPlanner
@@ -85,146 +86,25 @@ def _segment_corrected_time(
         tolerance_rad=cfg.goal_heading_tolerance_rad,
         num_samples=cfg.goal_heading_num_samples,
     )
-    use_hybrid_mode = bool(getattr(cfg, "use_hybrid_astar", False))
-    stop_on_first_non_fallback = bool(getattr(cfg, "hybrid_astar_stop_on_first_non_fallback", True))
-    primary_disable_retry = bool(getattr(cfg, "hybrid_astar_primary_disable_retry", True))
-    cfg_no_hybrid_retry = cfg
-    if use_hybrid_mode and primary_disable_retry and bool(getattr(cfg, "hybrid_astar_retry_on_fail", True)):
-        cfg_no_hybrid_retry = replace(cfg, hybrid_astar_retry_on_fail=False)
-    headings = list(all_headings)
-    retry_headings: List[float] = []
-    retry_cap = 0
-    if use_hybrid_mode:
-        headings = prioritize_goal_heading_candidates(
-            headings=all_headings,
-            current_heading=start_heading,
-            target_heading=target_heading,
-            limit=int(getattr(cfg, "hybrid_astar_heading_candidate_limit", 2)),
-        )
-        retry_cap = max(0, int(getattr(cfg, "hybrid_astar_heading_candidate_retry_limit", 0)))
-        retry_headings = [
-            h
-            for h in all_headings
-            if all(abs(wrap_to_pi(h - k)) > 1e-4 for k in headings)
-        ]
-    turn_penalty = max(0.0, float(getattr(cfg, "goal_heading_turn_penalty", 0.0)))
-    fallback_penalty = (
-        max(0.0, float(getattr(cfg, "hybrid_astar_fallback_penalty", 0.0))) if use_hybrid_mode else 0.0
+    heading_sel = select_best_heading_path(
+        cfg=cfg,
+        world=planner.world,
+        planner=planner,
+        start_pos=start_pos,
+        start_heading=start_heading,
+        task_pos=task.position,
+        target_heading=target_heading,
+        turn_radius=turn_radius,
+        all_headings=all_headings,
+        astar_path=path,
+        astar_length=astar_len,
+        build_path_fn=build_dubins_hybrid_path,
     )
-    dpsi_limit = max(0.0, float(getattr(cfg, "goal_heading_max_dpsi_rad", 0.0)))
-    dpsi_slack = max(0.0, float(getattr(cfg, "goal_heading_max_dpsi_slack_rad", 0.0)))
-    dpsi_limit_eff = dpsi_limit + dpsi_slack
-
-    best_heading = target_heading
-    best_length = float("inf")
-    best_score = float("inf")
-    best_meta: DubinsHybridMeta | None = None
-    best_path: List[Tuple[float, float]] = []
-
-    fallback_heading = target_heading
-    fallback_length = float("inf")
-    fallback_score = float("inf")
-    fallback_meta: DubinsHybridMeta | None = None
-    fallback_path: List[Tuple[float, float]] = []
-    cand_debug: List[Tuple[float, float, bool, float, float, bool, str, str]] = []
-    found_non_fallback = False
-
-    def _evaluate_heading(goal_heading: float, *, allow_hybrid_retry: bool = False) -> None:
-        nonlocal fallback_heading
-        nonlocal fallback_length
-        nonlocal fallback_score
-        nonlocal fallback_meta
-        nonlocal fallback_path
-        nonlocal best_heading
-        nonlocal best_length
-        nonlocal best_score
-        nonlocal best_meta
-        nonlocal best_path
-        nonlocal found_non_fallback
-
-        planner_cfg = cfg if allow_hybrid_retry else cfg_no_hybrid_retry
-        hybrid_path, hybrid_len, hybrid_meta = build_dubins_hybrid_path(
-            world=planner.world,
-            cfg=planner_cfg,
-            start_pose=(start_pos[0], start_pos[1], start_heading),
-            goal_pose=(task.position[0], task.position[1], goal_heading),
-            astar_planner=planner,
-            turn_radius=turn_radius,
-            astar_path=path,
-            astar_length=astar_len,
-        )
-        ok = bool(hybrid_path) and hybrid_len != float("inf")
-        if not ok:
-            detail = str(
-                getattr(hybrid_meta, "fallback_details", "")
-                or getattr(hybrid_meta, "fallback_reason", "")
-            )
-            trace = str(getattr(hybrid_meta, "debug_trace", ""))
-            cand_debug.append((goal_heading, hybrid_len, False, float("inf"), float("inf"), True, detail, trace))
-            return
-
-        fallback_used = bool(getattr(hybrid_meta, "used_fallback", False))
-        dpsi = abs(wrap_to_pi(goal_heading - start_heading))
-        score = hybrid_len + turn_penalty * turn_radius * dpsi + (fallback_penalty if fallback_used else 0.0)
-        detail = str(
-            getattr(hybrid_meta, "fallback_details", "")
-            or getattr(hybrid_meta, "fallback_reason", "")
-        )
-        trace = str(getattr(hybrid_meta, "debug_trace", ""))
-        cand_debug.append((goal_heading, hybrid_len, True, score, dpsi, fallback_used, detail, trace))
-        if score < fallback_score:
-            fallback_heading = goal_heading
-            fallback_length = hybrid_len
-            fallback_score = score
-            fallback_meta = hybrid_meta
-            fallback_path = hybrid_path
-        if not fallback_used:
-            found_non_fallback = True
-        if dpsi > dpsi_limit_eff + 1e-9:
-            return
-        if score < best_score:
-            best_heading = goal_heading
-            best_length = hybrid_len
-            best_score = score
-            best_meta = hybrid_meta
-            best_path = hybrid_path
-
-    for goal_heading in headings:
-        _evaluate_heading(goal_heading)
-        if stop_on_first_non_fallback and found_non_fallback and math.isfinite(best_score):
-            break
-    if use_hybrid_mode and (not found_non_fallback) and retry_cap > 0:
-        for goal_heading in retry_headings[:retry_cap]:
-            _evaluate_heading(goal_heading)
-            if stop_on_first_non_fallback and found_non_fallback and math.isfinite(best_score):
-                break
-
-    if (
-        use_hybrid_mode
-        and primary_disable_retry
-        and (not found_non_fallback)
-        and bool(getattr(cfg, "hybrid_astar_retry_on_fail", True))
-        and math.isfinite(fallback_score)
-    ):
-        robust_cap = max(1, int(getattr(cfg, "hybrid_astar_robust_retry_headings", 1)))
-        robust_headings: List[float] = [fallback_heading]
-        for h in headings + retry_headings:
-            if all(abs(wrap_to_pi(h - k)) > 1e-4 for k in robust_headings):
-                robust_headings.append(h)
-        for goal_heading in robust_headings[:robust_cap]:
-            _evaluate_heading(goal_heading, allow_hybrid_retry=True)
-            if found_non_fallback and math.isfinite(best_score):
-                break
-
-    chosen_heading = best_heading
-    path_length = best_length
-    hybrid_meta = best_meta
-    chosen_path = best_path
-    if not math.isfinite(path_length):
-        chosen_heading = fallback_heading
-        path_length = fallback_length
-        hybrid_meta = fallback_meta
-        chosen_path = fallback_path
+    chosen_heading = heading_sel.chosen_heading
+    path_length = heading_sel.chosen_length
+    hybrid_meta = heading_sel.chosen_meta
+    chosen_path = heading_sel.chosen_path
+    cand_debug = heading_sel.cand_debug
     if not math.isfinite(path_length):
         return float("inf"), float("inf"), start_heading, None, ""
 
@@ -255,10 +135,18 @@ def _segment_corrected_time(
     if should_emit_debug and hybrid_meta is not None and bool(getattr(hybrid_meta, "used_fallback", False)):
         ranked = sorted(
             cand_debug,
-            key=lambda x: (0 if x[2] else 1, x[3] if math.isfinite(x[3]) else float("inf")),
+            key=lambda x: (0 if x.ok else 1, x.score if math.isfinite(x.score) else float("inf")),
         )[: max(1, int(getattr(cfg, "plan_debug_top_k", 5)))]
         parts: List[str] = []
-        for h, l, ok, score, dpsi, fallback_used, detail, trace in ranked:
+        for cand in ranked:
+            h = cand.heading
+            l = cand.length
+            ok = cand.ok
+            score = cand.score
+            dpsi = cand.dpsi
+            fallback_used = cand.fallback_used
+            detail = cand.detail
+            trace = cand.trace
             ls = f"{l:.3f}" if math.isfinite(l) else "inf"
             ss = f"{score:.3f}" if math.isfinite(score) else "inf"
             dpsi_deg = math.degrees(dpsi) if math.isfinite(dpsi) else float("inf")

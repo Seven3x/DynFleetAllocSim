@@ -18,11 +18,12 @@ from shapely.geometry import LineString, Point, Polygon
 
 from .auction_core import AllocationEngine, AllocationResult, EventLog
 from .config import DEFAULT_CONFIG, SimulationConfig
-from .cost_estimator import goal_heading_candidates, heading_to_point, prioritize_goal_heading_candidates, wrap_to_pi
+from .cost_estimator import goal_heading_candidates, heading_to_point, wrap_to_pi
 from .debug import debug_log
 from .dubins_path import build_dubins_hybrid_path
 from .dynamic_events import generate_new_task
 from .entities import Task, Vehicle
+from .hybrid_heading_selector import select_best_heading_path
 from .log_export import write_auction_big_log, write_coordination_log, write_event_log, write_verification_log
 from .neighbor_coordination import TaskRecord
 from .planner_astar import AStarPlanner
@@ -788,124 +789,24 @@ class SimulationSession:
             tolerance_rad=self.cfg.goal_heading_tolerance_rad,
             num_samples=self.cfg.goal_heading_num_samples,
         )
-        use_hybrid_mode = bool(getattr(self.cfg, "use_hybrid_astar", False))
-        stop_on_first_non_fallback = bool(getattr(self.cfg, "hybrid_astar_stop_on_first_non_fallback", True))
-        primary_disable_retry = bool(getattr(self.cfg, "hybrid_astar_primary_disable_retry", True))
-        cfg_no_hybrid_retry = self.cfg
-        if use_hybrid_mode and primary_disable_retry and bool(getattr(self.cfg, "hybrid_astar_retry_on_fail", True)):
-            cfg_no_hybrid_retry = replace(self.cfg, hybrid_astar_retry_on_fail=False)
-        headings = list(all_headings)
-        retry_headings: list[float] = []
-        retry_cap = 0
-        if use_hybrid_mode:
-            headings = prioritize_goal_heading_candidates(
-                headings=all_headings,
-                current_heading=v.current_heading,
-                target_heading=heading_to_point(v.current_pos, task.position),
-                limit=int(getattr(self.cfg, "hybrid_astar_heading_candidate_limit", 2)),
-            )
-            retry_cap = max(0, int(getattr(self.cfg, "hybrid_astar_heading_candidate_retry_limit", 0)))
-            retry_headings = [
-                h
-                for h in all_headings
-                if all(abs(wrap_to_pi(h - k)) > 1e-4 for k in headings)
-            ]
-        best_path: list[tuple[float, float]] = []
-        best_length = float("inf")
-        best_score = float("inf")
-        best_goal_heading = heading_to_point(v.current_pos, task.position)
-        cand_meta: list[tuple[float, float, bool, float, float, bool, str]] = []
-        turn_penalty = max(0.0, float(getattr(self.cfg, "goal_heading_turn_penalty", 0.0)))
-        fallback_penalty = (
-            max(0.0, float(getattr(self.cfg, "hybrid_astar_fallback_penalty", 0.0))) if use_hybrid_mode else 0.0
+        target_heading = heading_to_point(v.current_pos, task.position)
+        base_astar_path, base_astar_len = self.artifacts.planner.plan(v.current_pos, task.position)
+        heading_sel = select_best_heading_path(
+            cfg=self.cfg,
+            world=self.artifacts.world,
+            planner=self.artifacts.planner,
+            start_pos=v.current_pos,
+            start_heading=v.current_heading,
+            task_pos=task.position,
+            target_heading=target_heading,
+            turn_radius=turn_radius,
+            all_headings=all_headings,
+            astar_path=base_astar_path,
+            astar_length=base_astar_len,
         )
-        dpsi_limit = max(0.0, float(getattr(self.cfg, "goal_heading_max_dpsi_rad", 0.0)))
-        dpsi_slack = max(0.0, float(getattr(self.cfg, "goal_heading_max_dpsi_slack_rad", 0.0)))
-        dpsi_limit_eff = dpsi_limit + dpsi_slack
-        fallback_path: list[tuple[float, float]] = []
-        fallback_length = float("inf")
-        fallback_score = float("inf")
-        fallback_goal_heading = best_goal_heading
-        found_non_fallback = False
-
-        def _evaluate_heading(goal_heading: float, *, allow_hybrid_retry: bool = False) -> None:
-            nonlocal fallback_path
-            nonlocal fallback_length
-            nonlocal fallback_score
-            nonlocal fallback_goal_heading
-            nonlocal best_path
-            nonlocal best_length
-            nonlocal best_score
-            nonlocal best_goal_heading
-            nonlocal found_non_fallback
-
-            planner_cfg = self.cfg if allow_hybrid_retry else cfg_no_hybrid_retry
-            cand_path, cand_length, cand_hybrid_meta = build_dubins_hybrid_path(
-                world=self.artifacts.world,
-                cfg=planner_cfg,
-                start_pose=(v.current_pos[0], v.current_pos[1], v.current_heading),
-                goal_pose=(task.position[0], task.position[1], goal_heading),
-                astar_planner=self.artifacts.planner,
-                turn_radius=turn_radius,
-            )
-            ok = bool(cand_path) and cand_length != float("inf")
-            dpsi = abs(wrap_to_pi(goal_heading - v.current_heading))
-            score = float("inf")
-            fallback_used = bool(getattr(cand_hybrid_meta, "used_fallback", False))
-            if ok:
-                score = cand_length + turn_penalty * turn_radius * dpsi + (fallback_penalty if fallback_used else 0.0)
-            fallback_detail = str(
-                getattr(cand_hybrid_meta, "fallback_details", "")
-                or getattr(cand_hybrid_meta, "fallback_reason", "")
-            )
-            cand_meta.append((goal_heading, cand_length, ok, score, dpsi, fallback_used, fallback_detail))
-            if ok and score < fallback_score:
-                fallback_path = cand_path
-                fallback_length = cand_length
-                fallback_score = score
-                fallback_goal_heading = goal_heading
-            if ok and not fallback_used:
-                found_non_fallback = True
-            if ok and dpsi <= dpsi_limit_eff + 1e-9 and score < best_score:
-                best_path = cand_path
-                best_length = cand_length
-                best_score = score
-                best_goal_heading = goal_heading
-
-        for goal_heading in headings:
-            _evaluate_heading(goal_heading)
-            if stop_on_first_non_fallback and found_non_fallback and math.isfinite(best_score):
-                break
-        if use_hybrid_mode and (not found_non_fallback) and retry_cap > 0:
-            for goal_heading in retry_headings[:retry_cap]:
-                _evaluate_heading(goal_heading)
-                if stop_on_first_non_fallback and found_non_fallback and math.isfinite(best_score):
-                    break
-
-        if (
-            use_hybrid_mode
-            and primary_disable_retry
-            and (not found_non_fallback)
-            and bool(getattr(self.cfg, "hybrid_astar_retry_on_fail", True))
-            and math.isfinite(fallback_score)
-        ):
-            robust_cap = max(1, int(getattr(self.cfg, "hybrid_astar_robust_retry_headings", 1)))
-            robust_headings: list[float] = [fallback_goal_heading]
-            for h in headings + retry_headings:
-                if all(abs(wrap_to_pi(h - k)) > 1e-4 for k in robust_headings):
-                    robust_headings.append(h)
-            for goal_heading in robust_headings[:robust_cap]:
-                _evaluate_heading(goal_heading, allow_hybrid_retry=True)
-                if found_non_fallback and math.isfinite(best_score):
-                    break
-
-        if not best_path and fallback_path:
-            best_path = fallback_path
-            best_length = fallback_length
-            best_score = fallback_score
-            best_goal_heading = fallback_goal_heading
-
-        path, length = best_path, best_length
+        best_goal_heading = heading_sel.chosen_heading
+        path, length = heading_sel.chosen_path, heading_sel.chosen_length
+        cand_meta = heading_sel.cand_debug
 
         if bool(getattr(self.cfg, "plan_debug_enabled", False)):
             target_vid = int(getattr(self.cfg, "plan_debug_vehicle_id", -1))
@@ -914,11 +815,18 @@ class SimulationSession:
                 top_k = max(1, int(getattr(self.cfg, "plan_debug_top_k", 5)))
                 ranked = sorted(
                     cand_meta,
-                    key=lambda x: (0 if x[2] else 1, x[3] if x[2] else float("inf")),
+                    key=lambda x: (0 if x.ok else 1, x.score if x.ok else float("inf")),
                 )[:top_k]
                 parts: list[str] = []
-                for h, l, ok, score, dpsi, fallback_used, fallback_detail in ranked:
-                    dpsi_deg = math.degrees(dpsi)
+                for cand in ranked:
+                    h = cand.heading
+                    l = cand.length
+                    ok = cand.ok
+                    score = cand.score
+                    dpsi = cand.dpsi
+                    fallback_used = cand.fallback_used
+                    fallback_detail = cand.detail
+                    dpsi_deg = math.degrees(dpsi) if math.isfinite(dpsi) else float("inf")
                     ls = f"{l:.3f}" if ok else "inf"
                     ss = f"{score:.3f}" if ok else "inf"
                     fb = fallback_detail if fallback_detail else "-"

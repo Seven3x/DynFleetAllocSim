@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .config import SimulationConfig
@@ -8,12 +8,10 @@ from .cost_estimator import (
     fast_cost_estimate_from_state,
     goal_heading_candidates,
     heading_to_point,
-    prioritize_goal_heading_candidates,
-    wrap_to_pi,
 )
 from .debug import debug_log
-from .dubins_path import build_dubins_hybrid_path
 from .entities import Task, Vehicle
+from .hybrid_heading_selector import select_best_heading_path
 from .map_utils import WorldMap
 from .neighbor_coordination import CoordinationLog, TaskRecord, build_neighbors, run_coordination
 from .path_postprocess import maybe_buffer_initial_turn_path, resample_path
@@ -726,126 +724,23 @@ class AllocationEngine:
                     tolerance_rad=self.cfg.goal_heading_tolerance_rad,
                     num_samples=self.cfg.goal_heading_num_samples,
                 )
-                use_hybrid_mode = bool(getattr(self.cfg, "use_hybrid_astar", False))
-                stop_on_first_non_fallback = bool(
-                    getattr(self.cfg, "hybrid_astar_stop_on_first_non_fallback", True)
+                target_heading = heading_to_point(cur, task.position)
+                base_astar_path, base_astar_len = self.planner.plan(cur, task.position)
+                heading_sel = select_best_heading_path(
+                    cfg=self.cfg,
+                    world=self.world,
+                    planner=self.planner,
+                    start_pos=cur,
+                    start_heading=cur_heading,
+                    task_pos=task.position,
+                    target_heading=target_heading,
+                    turn_radius=turn_radius,
+                    all_headings=all_headings,
+                    astar_path=base_astar_path,
+                    astar_length=base_astar_len,
                 )
-                primary_disable_retry = bool(getattr(self.cfg, "hybrid_astar_primary_disable_retry", True))
-                cfg_no_hybrid_retry = self.cfg
-                if use_hybrid_mode and primary_disable_retry and bool(
-                    getattr(self.cfg, "hybrid_astar_retry_on_fail", True)
-                ):
-                    cfg_no_hybrid_retry = replace(self.cfg, hybrid_astar_retry_on_fail=False)
-                headings = list(all_headings)
-                retry_headings: List[float] = []
-                retry_cap = 0
-                if use_hybrid_mode:
-                    headings = prioritize_goal_heading_candidates(
-                        headings=all_headings,
-                        current_heading=cur_heading,
-                        target_heading=heading_to_point(cur, task.position),
-                        limit=int(getattr(self.cfg, "hybrid_astar_heading_candidate_limit", 2)),
-                    )
-                    retry_cap = max(0, int(getattr(self.cfg, "hybrid_astar_heading_candidate_retry_limit", 0)))
-                    retry_headings = [
-                        h
-                        for h in all_headings
-                        if all(abs(wrap_to_pi(h - k)) > 1e-4 for k in headings)
-                    ]
-                best_path: List[Tuple[float, float]] = []
-                best_len = float("inf")
-                best_score = float("inf")
-                best_goal_heading = heading_to_point(cur, task.position)
-                turn_penalty = max(0.0, float(getattr(self.cfg, "goal_heading_turn_penalty", 0.0)))
-                fallback_penalty = (
-                    max(0.0, float(getattr(self.cfg, "hybrid_astar_fallback_penalty", 0.0)))
-                    if use_hybrid_mode
-                    else 0.0
-                )
-                dpsi_limit = max(0.0, float(getattr(self.cfg, "goal_heading_max_dpsi_rad", 0.0)))
-                dpsi_slack = max(0.0, float(getattr(self.cfg, "goal_heading_max_dpsi_slack_rad", 0.0)))
-                dpsi_limit_eff = dpsi_limit + dpsi_slack
-                fallback_path: List[Tuple[float, float]] = []
-                fallback_len = float("inf")
-                fallback_score = float("inf")
-                fallback_heading = best_goal_heading
-                found_non_fallback = False
-
-                def _evaluate_heading(goal_heading: float, *, allow_hybrid_retry: bool = False) -> None:
-                    nonlocal fallback_path
-                    nonlocal fallback_len
-                    nonlocal fallback_score
-                    nonlocal fallback_heading
-                    nonlocal best_path
-                    nonlocal best_len
-                    nonlocal best_score
-                    nonlocal best_goal_heading
-                    nonlocal found_non_fallback
-
-                    planner_cfg = self.cfg if allow_hybrid_retry else cfg_no_hybrid_retry
-                    cand_path, cand_len, cand_hybrid_meta = build_dubins_hybrid_path(
-                        world=self.world,
-                        cfg=planner_cfg,
-                        start_pose=(cur[0], cur[1], cur_heading),
-                        goal_pose=(task.position[0], task.position[1], goal_heading),
-                        astar_planner=self.planner,
-                        turn_radius=turn_radius,
-                    )
-                    ok = bool(cand_path) and cand_len != float("inf")
-                    if not ok:
-                        return
-                    fallback_used = bool(getattr(cand_hybrid_meta, "used_fallback", False))
-                    dpsi = abs(wrap_to_pi(goal_heading - cur_heading))
-                    score = cand_len + turn_penalty * turn_radius * dpsi + (fallback_penalty if fallback_used else 0.0)
-                    if score < fallback_score:
-                        fallback_path = cand_path
-                        fallback_len = cand_len
-                        fallback_score = score
-                        fallback_heading = goal_heading
-                    if not fallback_used:
-                        found_non_fallback = True
-                    if dpsi > dpsi_limit_eff + 1e-9:
-                        return
-                    if score < best_score:
-                        best_path = cand_path
-                        best_len = cand_len
-                        best_score = score
-                        best_goal_heading = goal_heading
-
-                for goal_heading in headings:
-                    _evaluate_heading(goal_heading)
-                    if stop_on_first_non_fallback and found_non_fallback and best_score < float("inf"):
-                        break
-                if use_hybrid_mode and (not found_non_fallback) and retry_cap > 0:
-                    for goal_heading in retry_headings[:retry_cap]:
-                        _evaluate_heading(goal_heading)
-                        if stop_on_first_non_fallback and found_non_fallback and best_score < float("inf"):
-                            break
-
-                if (
-                    use_hybrid_mode
-                    and primary_disable_retry
-                    and (not found_non_fallback)
-                    and bool(getattr(self.cfg, "hybrid_astar_retry_on_fail", True))
-                    and fallback_score < float("inf")
-                ):
-                    robust_cap = max(1, int(getattr(self.cfg, "hybrid_astar_robust_retry_headings", 1)))
-                    robust_headings: List[float] = [fallback_heading]
-                    for h in headings + retry_headings:
-                        if all(abs(wrap_to_pi(h - k)) > 1e-4 for k in robust_headings):
-                            robust_headings.append(h)
-                    for goal_heading in robust_headings[:robust_cap]:
-                        _evaluate_heading(goal_heading, allow_hybrid_retry=True)
-                        if found_non_fallback and best_score < float("inf"):
-                            break
-
-                if not best_path and fallback_path:
-                    best_path = fallback_path
-                    best_len = fallback_len
-                    best_score = fallback_score
-                    best_goal_heading = fallback_heading
-
-                path, length = best_path, best_len
+                best_goal_heading = heading_sel.chosen_heading
+                path, length = heading_sel.chosen_path, heading_sel.chosen_length
                 if not path or length == float("inf"):
                     raise RuntimeError(
                         f"Hybrid planning failed for vehicle={v.id}, task={tid}, from={cur} to={task.position}."

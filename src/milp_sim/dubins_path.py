@@ -830,8 +830,6 @@ def build_dubins_hybrid_path(
             if not hybrid_points or not math.isfinite(hybrid_len):
                 return None, "hybrid_astar_unreachable"
 
-            hybrid_points[0] = (start_pose[0], start_pose[1])
-            hybrid_points[-1] = (goal_pose[0], goal_pose[1])
             need_recheck = collision_margin > planner_clearance + 1e-9
             if not force_mode and need_recheck and not _polyline_collision_free(
                 hybrid_points,

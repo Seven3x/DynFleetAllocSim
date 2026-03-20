@@ -101,7 +101,7 @@ class SimulationConfig:
     hybrid_astar_fallback_log_limit: int = 80
 
     # Offline GUI: auto comparison computes two extra full allocations and can be slow.
-    offline_enable_comparison: bool = False
+    offline_enable_comparison: bool = True
 
     # Hybrid trajectory: A* skeleton + Dubins segments
     use_dubins_hybrid: bool = True
