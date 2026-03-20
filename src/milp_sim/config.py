@@ -46,6 +46,14 @@ class SimulationConfig:
     corridor_width: float = 8.0
     verify_epsilon: float = 0.25
     enable_bid_verification: bool = True
+    # Bid verification runs in lightweight mode by default so ranking is stable
+    # and less sensitive to local trajectory beautification details.
+    bid_verification_use_next_task_heading: bool = False
+    bid_verification_use_dubins_hybrid: bool = False
+    bid_verification_enable_connector_first: bool = False
+    bid_verification_enable_initial_turn_buffer: bool = False
+    # When False, bid verification only rejects infeasible paths (not cost-gap underestimation).
+    bid_verification_reject_on_cost_gap: bool = False
 
     astar_resolution: float = 1.0
     astar_connect_diagonal: bool = True
@@ -116,6 +124,23 @@ class SimulationConfig:
     connector_use_dubins: bool = True
     connector_use_hybrid_local_rescue: bool = True
     connector_use_plain_astar_fallback: bool = True
+    # Prefer rsplan Reeds-Shepp connector for terminal pose-to-pose local links.
+    use_rsplan_connector: bool = True
+    # Keep verification lightweight by default to avoid ranking instability.
+    rsplan_enable_in_verification: bool = False
+    # 0 means "derive from current segment turn radius".
+    rsplan_turn_radius: float = 0.0
+    rsplan_step_size: float = 0.4
+    rsplan_runway_length: float = 0.0
+    rsplan_length_tolerance: float = 2.0
+    rsplan_collision_sample_step: float = 0.25
+    rsplan_fallback_to_custom_connector: bool = True
+    # For internal (non-terminal) guide points, use inferred soft heading in rsplan.
+    rsplan_enable_internal_waypoint_soft_heading: bool = True
+    rsplan_internal_max_detour_ratio_vs_reference: float = 1.20
+    rsplan_internal_max_detour_abs_vs_reference: float = 2.0
+    # Internal reference waypoints are treated as position-only guide points.
+    connector_internal_waypoints_position_only: bool = True
     connector_direct_whole_segment_first: bool = True
     connector_shortcut_enable: bool = True
     connector_string_pull_enable: bool = True
@@ -259,6 +284,18 @@ class SimulationConfig:
             raise ValueError("connector_rs_max_expansions must be >= 1")
         if int(self.connector_rs_max_depth) < 1:
             raise ValueError("connector_rs_max_depth must be >= 1")
+        if float(self.rsplan_turn_radius) < 0.0:
+            raise ValueError("rsplan_turn_radius must be >= 0")
+        if float(self.rsplan_step_size) <= 0.0:
+            raise ValueError("rsplan_step_size must be > 0")
+        if float(self.rsplan_length_tolerance) < 0.0:
+            raise ValueError("rsplan_length_tolerance must be >= 0")
+        if float(self.rsplan_collision_sample_step) <= 0.0:
+            raise ValueError("rsplan_collision_sample_step must be > 0")
+        if float(self.rsplan_internal_max_detour_ratio_vs_reference) < 1.0:
+            raise ValueError("rsplan_internal_max_detour_ratio_vs_reference must be >= 1")
+        if float(self.rsplan_internal_max_detour_abs_vs_reference) < 0.0:
+            raise ValueError("rsplan_internal_max_detour_abs_vs_reference must be >= 0")
         if float(self.connector_max_detour_ratio_vs_reference) < 1.0:
             raise ValueError("connector_max_detour_ratio_vs_reference must be >= 1")
         if float(self.connector_max_detour_abs_vs_reference) < 0.0:

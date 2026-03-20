@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+from dataclasses import dataclass, replace
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from shapely.geometry import LineString
 
@@ -10,6 +10,11 @@ from .cost_estimator import heading_to_point, wrap_to_pi
 from .map_utils import WorldMap
 from .path_postprocess import simplify_reference_polyline
 from .planner_astar import AStarPlanner, HybridPlanDiagnostics
+
+try:
+    import rsplan
+except ImportError:  # pragma: no cover - validated by behavior when dependency is missing
+    rsplan = None  # type: ignore[assignment]
 
 
 Point2D = Tuple[float, float]
@@ -297,6 +302,19 @@ def _append_reason_tokens(text: str, *tokens: str) -> str:
     return "|".join(out)
 
 
+def _append_trace_tokens(text: str, *tokens: str) -> str:
+    out: List[str] = []
+    for raw in str(text).split(";"):
+        token = raw.strip()
+        if token and token not in out:
+            out.append(token)
+    for token in tokens:
+        tok = str(token).strip()
+        if tok and tok not in out:
+            out.append(tok)
+    return ";".join(out)
+
+
 def _primary_reason_token(text: str, default: str = "") -> str:
     tokens = _reason_tokens(text)
     return tokens[0] if tokens else default
@@ -336,18 +354,35 @@ def _heading_error(a: float, b: float) -> float:
     return abs(wrap_to_pi(a - b))
 
 
+def _blend_heading_soft(current_heading: float, next_heading: float) -> float:
+    return wrap_to_pi(current_heading + 0.5 * wrap_to_pi(next_heading - current_heading))
+
+
 def _connector_detour_too_large(
     *,
     candidate_length: float,
     reference_length: float,
     cfg,
 ) -> bool:
+    return _detour_too_large(
+        candidate_length=candidate_length,
+        reference_length=reference_length,
+        ratio_limit=max(1.0, float(getattr(cfg, "connector_max_detour_ratio_vs_reference", 1.35))),
+        abs_limit=max(0.0, float(getattr(cfg, "connector_max_detour_abs_vs_reference", 12.0))),
+    )
+
+
+def _detour_too_large(
+    *,
+    candidate_length: float,
+    reference_length: float,
+    ratio_limit: float,
+    abs_limit: float,
+) -> bool:
     if not math.isfinite(candidate_length) or not math.isfinite(reference_length):
         return False
     if reference_length <= 1e-9:
         return False
-    ratio_limit = max(1.0, float(getattr(cfg, "connector_max_detour_ratio_vs_reference", 1.35)))
-    abs_limit = max(0.0, float(getattr(cfg, "connector_max_detour_abs_vs_reference", 12.0)))
     return candidate_length > reference_length * ratio_limit + abs_limit
 
 
@@ -358,17 +393,99 @@ def _try_straight_connector(
     world: WorldMap,
     margin: float,
     heading_tolerance: float,
+    enforce_goal_heading: bool = True,
 ) -> Tuple[List[Point2D], float, str]:
     line_heading = heading_to_point((start_pose[0], start_pose[1]), (goal_pose[0], goal_pose[1]))
     start_err = _heading_error(line_heading, start_pose[2])
     goal_err = _heading_error(goal_pose[2], line_heading)
-    if max(start_err, goal_err) > max(0.0, float(heading_tolerance)) + 1e-9:
+    if enforce_goal_heading:
+        if max(start_err, goal_err) > max(0.0, float(heading_tolerance)) + 1e-9:
+            return [], float("inf"), "connector_heading_reject"
+    elif start_err > max(0.0, float(heading_tolerance)) + 1e-9:
         return [], float("inf"), "connector_heading_reject"
 
     points = [(start_pose[0], start_pose[1]), (goal_pose[0], goal_pose[1])]
     if not _polyline_collision_free(points, world=world, margin=margin):
         return [], float("inf"), "connector_collision_reject"
     return points, _polyline_length(points), "connector_straight_success"
+
+
+def _resample_polyline_max_step(points: List[Point2D], max_step: float) -> List[Point2D]:
+    if len(points) < 2 or max_step <= 1e-9:
+        return list(points)
+    out: List[Point2D] = [points[0]]
+    for i in range(len(points) - 1):
+        a = points[i]
+        b = points[i + 1]
+        seg_len = math.hypot(b[0] - a[0], b[1] - a[1])
+        if seg_len <= 1e-9:
+            continue
+        n = max(1, int(math.ceil(seg_len / max_step)))
+        for k in range(1, n + 1):
+            t = k / n
+            p = (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+            if math.hypot(p[0] - out[-1][0], p[1] - out[-1][1]) > 1e-9:
+                out.append(p)
+    return out
+
+
+def build_rsplan_connector(
+    *,
+    start_pose: Pose2D,
+    goal_pose: Pose2D,
+    turn_radius: float,
+    world: WorldMap,
+    cfg,
+    margin: float,
+    require_terminal_heading: bool,
+) -> Tuple[List[Point2D], float, str]:
+    if rsplan is None:
+        return [], float("inf"), "rsplan_import_unavailable"
+
+    radius_cfg = float(getattr(cfg, "rsplan_turn_radius", 0.0))
+    radius = max(1e-6, radius_cfg if radius_cfg > 1e-9 else float(turn_radius))
+    step_size = max(0.02, float(getattr(cfg, "rsplan_step_size", max(0.1, getattr(cfg, "dubins_sample_step", 0.5)))))
+    runway_length = float(getattr(cfg, "rsplan_runway_length", 0.0))
+    length_tolerance = max(0.0, float(getattr(cfg, "rsplan_length_tolerance", 2.0)))
+    collision_step = max(
+        0.02,
+        float(
+            getattr(
+                cfg,
+                "rsplan_collision_sample_step",
+                min(step_size, max(0.1, getattr(cfg, "dubins_sample_step", 0.5))),
+            )
+        ),
+    )
+
+    try:
+        rs_path = rsplan.path(
+            start_pose=(float(start_pose[0]), float(start_pose[1]), float(start_pose[2])),
+            end_pose=(float(goal_pose[0]), float(goal_pose[1]), float(goal_pose[2])),
+            turn_radius=radius,
+            runway_length=runway_length,
+            step_size=step_size,
+            length_tolerance=length_tolerance,
+        )
+        rs_waypoints = list(rs_path.waypoints())
+    except Exception:
+        return [], float("inf"), "rsplan_generation_failed"
+
+    if len(rs_waypoints) < 2:
+        return [], float("inf"), "rsplan_generation_failed"
+
+    points = _dedupe_points([(float(wp.x), float(wp.y)) for wp in rs_waypoints])
+    if len(points) < 2:
+        return [], float("inf"), "rsplan_generation_failed"
+
+    points[0] = (float(start_pose[0]), float(start_pose[1]))
+    points[-1] = (float(goal_pose[0]), float(goal_pose[1]))
+    sampled_points = _resample_polyline_max_step(points, max_step=collision_step)
+    if (not _collision_free(sampled_points, world=world, margin=margin)) or (
+        not _polyline_collision_free(points, world=world, margin=margin)
+    ):
+        return [], float("inf"), "rsplan_collision_reject"
+    return points, _polyline_length(points), "connector_rsplan_success"
 
 
 def _try_dubins_connector(
@@ -442,6 +559,7 @@ def _finalize_connector_meta(
     connector_summary = "|".join(
         [
             f"straight:{success_counts.get('straight', 0)}",
+            f"rsplan:{success_counts.get('rsplan', 0)}",
             f"reeds_shepp_like:{success_counts.get('reeds_shepp_like', 0)}",
             f"dubins_like:{success_counts.get('dubins_like', 0)}",
             f"hybrid_local:{success_counts.get('hybrid_local', 0)}",
@@ -462,7 +580,9 @@ def _finalize_connector_meta(
     return DubinsHybridMeta(
         used_fallback=used_fallback,
         fallback_segments=plain_astar_count,
-        dubins_segments=success_counts.get("reeds_shepp_like", 0) + success_counts.get("dubins_like", 0),
+        dubins_segments=success_counts.get("rsplan", 0)
+        + success_counts.get("reeds_shepp_like", 0)
+        + success_counts.get("dubins_like", 0),
         sample_count=len(points),
         dubins_ratio=ratio,
         fallback_reason=fallback_reason,
@@ -519,18 +639,24 @@ def build_segment_connector_path(
     corridor_radius = float(getattr(cfg, "connector_corridor_radius", 6.0))
     bbox_padding = float(getattr(cfg, "connector_local_bbox_padding", 4.0))
     allow_reverse = bool(getattr(cfg, "hybrid_astar_allow_reverse", False))
+    internal_position_only = bool(getattr(cfg, "connector_internal_waypoints_position_only", True))
     plain_astar_ok = bool(getattr(cfg, "connector_use_plain_astar_fallback", True)) and bool(
         getattr(cfg, "dubins_fallback_to_astar", True)
     )
+    use_rsplan_connector = bool(getattr(cfg, "use_rsplan_connector", False))
+    rsplan_fallback_to_custom = bool(getattr(cfg, "rsplan_fallback_to_custom_connector", True))
+    rsplan_internal_soft = bool(getattr(cfg, "rsplan_enable_internal_waypoint_soft_heading", True))
 
     success_counts = {
         "straight": 0,
+        "rsplan": 0,
         "reeds_shepp_like": 0,
         "dubins_like": 0,
         "hybrid_local": 0,
     }
     event_counts = {
         "connector_straight_success": 0,
+        "connector_rsplan_success": 0,
         "connector_rs_success": 0,
         "connector_dubins_success": 0,
         "connector_hybrid_local_success": 0,
@@ -538,6 +664,13 @@ def build_segment_connector_path(
         "connector_collision_reject": 0,
         "connector_heading_reject": 0,
         "connector_stitch_failure": 0,
+        "rsplan_import_unavailable": 0,
+        "rsplan_generation_failed": 0,
+        "rsplan_collision_reject": 0,
+        "rsplan_terminal_heading_only": 0,
+        "rsplan_internal_waypoint_position_only": 0,
+        "rsplan_fallback_custom_connector": 0,
+        "rsplan_fallback_plain_astar": 0,
     }
     debug_parts = [f"connector_reference_points:{len(reference_path)}"]
 
@@ -566,7 +699,46 @@ def build_segment_connector_path(
                 )
             event_counts["connector_heading_reject" if tag == "connector_heading_reject" else "connector_collision_reject"] += 1
 
-        if allow_reverse and bool(getattr(cfg, "connector_use_reeds_shepp", True)):
+        rsplan_failed = False
+        if allow_reverse and use_rsplan_connector:
+            event_counts["rsplan_terminal_heading_only"] += 1
+            points, length, tag = build_rsplan_connector(
+                start_pose=start_pose,
+                goal_pose=goal_pose,
+                turn_radius=turn_radius,
+                world=world,
+                cfg=cfg,
+                margin=collision_margin,
+                require_terminal_heading=True,
+            )
+            if points and math.isfinite(length):
+                if _connector_detour_too_large(candidate_length=length, reference_length=reference_length, cfg=cfg):
+                    event_counts["connector_heading_reject"] += 1
+                    debug_parts.append("connector_rsplan_detour_reject")
+                else:
+                    event_counts["connector_rsplan_success"] += 1
+                    success_counts["rsplan"] += 1
+                    return points, length, _finalize_connector_meta(
+                        points=points,
+                        length=length,
+                        success_counts=success_counts,
+                        event_counts=event_counts,
+                        plain_astar_count=0,
+                        debug_parts=debug_parts + ["connector_rsplan_success"],
+                    )
+            else:
+                rsplan_failed = True
+                if tag in event_counts:
+                    event_counts[tag] += 1
+                if tag == "rsplan_collision_reject":
+                    event_counts["connector_collision_reject"] += 1
+                debug_parts.append(tag)
+
+        use_custom_connector = (not use_rsplan_connector) or (not rsplan_failed) or rsplan_fallback_to_custom
+        if rsplan_failed and use_custom_connector:
+            event_counts["rsplan_fallback_custom_connector"] += 1
+
+        if use_custom_connector and allow_reverse and bool(getattr(cfg, "connector_use_reeds_shepp", True)):
             points, length, diag = astar_planner.plan_local_connector(
                 start_pose=start_pose,
                 goal_pose=goal_pose,
@@ -599,7 +771,7 @@ def build_segment_connector_path(
             if getattr(diag, "reason", "") == "collision_on_connector":
                 event_counts["connector_collision_reject"] += 1
 
-        if bool(getattr(cfg, "connector_use_dubins", True)):
+        if use_custom_connector and bool(getattr(cfg, "connector_use_dubins", True)):
             points, length, tag = _try_dubins_connector(
                 start_pose=start_pose,
                 goal_pose=goal_pose,
@@ -631,10 +803,16 @@ def build_segment_connector_path(
 
     for idx in range(1, len(reference_path)):
         target_point = reference_path[idx]
-        if idx < len(reference_path) - 1:
-            target_heading = heading_to_point(target_point, reference_path[idx + 1])
-        else:
+        is_terminal_waypoint = idx == len(reference_path) - 1
+        span_position_only = internal_position_only and (not is_terminal_waypoint)
+        if is_terminal_waypoint:
             target_heading = float(goal_pose[2])
+        elif span_position_only:
+            incoming_heading = heading_to_point(current_pose[:2], target_point)
+            outgoing_heading = heading_to_point(target_point, reference_path[idx + 1])
+            target_heading = _blend_heading_soft(incoming_heading, outgoing_heading)
+        else:
+            target_heading = heading_to_point(target_point, reference_path[idx + 1])
         span_goal = (float(target_point[0]), float(target_point[1]), float(target_heading))
         span_points_for_bbox = [current_pose[:2], target_point]
         if idx < len(reference_path) - 1:
@@ -647,6 +825,13 @@ def build_segment_connector_path(
         accepted_points: List[Point2D] = []
         accepted_length = float("inf")
         accepted_heading = current_pose[2]
+        if span_position_only:
+            debug_parts.append(f"span{idx}:position_only")
+            if use_rsplan_connector and not rsplan_internal_soft:
+                event_counts["rsplan_internal_waypoint_position_only"] += 1
+                debug_parts.append(f"span{idx}:rsplan_internal_waypoint_position_only")
+        else:
+            debug_parts.append(f"span{idx}:terminal_pose_goal")
 
         if bool(getattr(cfg, "connector_use_straight_first", True)):
             points, length, tag = _try_straight_connector(
@@ -655,6 +840,7 @@ def build_segment_connector_path(
                 world=world,
                 margin=collision_margin,
                 heading_tolerance=span_straight_tol,
+                enforce_goal_heading=not span_position_only,
             )
             if points and math.isfinite(length):
                 accepted_points = points
@@ -666,7 +852,73 @@ def build_segment_connector_path(
             else:
                 event_counts["connector_heading_reject" if tag == "connector_heading_reject" else "connector_collision_reject"] += 1
 
-        if not accepted_points and allow_reverse and bool(getattr(cfg, "connector_use_reeds_shepp", True)):
+        rsplan_failed = False
+        if (
+            (not accepted_points)
+            and allow_reverse
+            and use_rsplan_connector
+            and ((not span_position_only) or rsplan_internal_soft)
+        ):
+            if span_position_only:
+                event_counts["rsplan_internal_waypoint_position_only"] += 1
+                debug_parts.append(f"span{idx}:rsplan_internal_waypoint_position_only")
+            else:
+                event_counts["rsplan_terminal_heading_only"] += 1
+            points, length, tag = build_rsplan_connector(
+                start_pose=current_pose,
+                goal_pose=span_goal,
+                turn_radius=turn_radius,
+                world=world,
+                cfg=cfg,
+                margin=collision_margin,
+                require_terminal_heading=not span_position_only,
+            )
+            if points and math.isfinite(length):
+                internal_detour_reject = span_position_only and _detour_too_large(
+                    candidate_length=length,
+                    reference_length=span_reference_length,
+                    ratio_limit=max(
+                        1.0,
+                        float(getattr(cfg, "rsplan_internal_max_detour_ratio_vs_reference", 1.20)),
+                    ),
+                    abs_limit=max(
+                        0.0,
+                        float(getattr(cfg, "rsplan_internal_max_detour_abs_vs_reference", 2.0)),
+                    ),
+                )
+                if internal_detour_reject or _connector_detour_too_large(
+                    candidate_length=length,
+                    reference_length=span_reference_length,
+                    cfg=cfg,
+                ):
+                    event_counts["connector_heading_reject"] += 1
+                    debug_parts.append(f"span{idx}:connector_rsplan_detour_reject")
+                else:
+                    accepted_points = points
+                    accepted_length = length
+                    accepted_heading = span_goal[2]
+                    success_counts["rsplan"] += 1
+                    event_counts["connector_rsplan_success"] += 1
+                    debug_parts.append(f"span{idx}:connector_rsplan_success")
+            else:
+                rsplan_failed = True
+                if tag in event_counts:
+                    event_counts[tag] += 1
+                if tag == "rsplan_collision_reject":
+                    event_counts["connector_collision_reject"] += 1
+                debug_parts.append(f"span{idx}:{tag}")
+
+        use_custom_connector = (not use_rsplan_connector) or (not rsplan_failed) or rsplan_fallback_to_custom
+        if rsplan_failed and use_custom_connector:
+            event_counts["rsplan_fallback_custom_connector"] += 1
+
+        if (
+            (not accepted_points)
+            and (not span_position_only)
+            and use_custom_connector
+            and allow_reverse
+            and bool(getattr(cfg, "connector_use_reeds_shepp", True))
+        ):
             points, length, diag = astar_planner.plan_local_connector(
                 start_pose=current_pose,
                 goal_pose=span_goal,
@@ -695,7 +947,12 @@ def build_segment_connector_path(
             elif getattr(diag, "reason", "") == "collision_on_connector":
                 event_counts["connector_collision_reject"] += 1
 
-        if not accepted_points and bool(getattr(cfg, "connector_use_dubins", True)):
+        if (
+            (not accepted_points)
+            and (not span_position_only)
+            and use_custom_connector
+            and bool(getattr(cfg, "connector_use_dubins", True))
+        ):
             points, length, tag = _try_dubins_connector(
                 start_pose=current_pose,
                 goal_pose=span_goal,
@@ -718,7 +975,12 @@ def build_segment_connector_path(
             else:
                 event_counts["connector_collision_reject"] += 1
 
-        if not accepted_points and bool(getattr(cfg, "connector_use_hybrid_local_rescue", True)):
+        if (
+            (not accepted_points)
+            and (not span_position_only)
+            and use_custom_connector
+            and bool(getattr(cfg, "connector_use_hybrid_local_rescue", True))
+        ):
             points, length, diag = astar_planner.plan_hybrid_detailed(
                 start_pose=current_pose,
                 goal_pose=span_goal,
@@ -746,7 +1008,7 @@ def build_segment_connector_path(
             elif getattr(diag, "reason", "") == "collision_on_connector":
                 event_counts["connector_collision_reject"] += 1
 
-        if not accepted_points and plain_astar_ok:
+        if not accepted_points and (plain_astar_ok or span_position_only):
             span_astar_path, span_astar_len = astar_planner.plan(current_pose[:2], target_point)
             if span_astar_path and math.isfinite(span_astar_len):
                 accepted_points = span_astar_path
@@ -754,6 +1016,10 @@ def build_segment_connector_path(
                 accepted_heading = _path_terminal_heading(span_astar_path, span_goal[2])
                 plain_astar_count += 1
                 event_counts["connector_plain_astar_fallback"] += 1
+                if use_rsplan_connector:
+                    event_counts["rsplan_fallback_plain_astar"] += 1
+                if span_position_only:
+                    debug_parts.append(f"span{idx}:skipped_heading_for_internal_waypoint")
                 debug_parts.append(f"span{idx}:connector_plain_astar_fallback")
 
         if not accepted_points or (not math.isfinite(accepted_length)):
@@ -766,6 +1032,8 @@ def build_segment_connector_path(
         if not _polyline_collision_free(stitched, world=world, margin=collision_margin):
             event_counts["connector_stitch_failure"] += 1
             if plain_astar_ok:
+                if use_rsplan_connector:
+                    event_counts["rsplan_fallback_plain_astar"] += 1
                 return astar_path, astar_length, _finalize_connector_meta(
                     points=astar_path,
                     length=astar_length,
@@ -1294,6 +1562,28 @@ def _build_fillet_result(
     return out_points, total_len, meta
 
 
+def _build_bid_verification_cfg(cfg):
+    return replace(
+        cfg,
+        use_dubins_hybrid=bool(getattr(cfg, "bid_verification_use_dubins_hybrid", False)),
+        enable_connector_first_planner=bool(getattr(cfg, "bid_verification_enable_connector_first", False)),
+        use_rsplan_connector=bool(getattr(cfg, "use_rsplan_connector", False))
+        and bool(getattr(cfg, "rsplan_enable_in_verification", False)),
+        hybrid_astar_retry_on_fail=False,
+        hybrid_astar_relaxed_goal_on_unreachable=False,
+        connector_use_hybrid_local_rescue=False,
+    )
+
+
+def _tag_meta_debug(meta: DubinsHybridMeta, *tokens: str) -> DubinsHybridMeta:
+    meta.debug_trace = _append_trace_tokens(meta.debug_trace, *tokens)
+    if meta.used_fallback:
+        meta.fallback_details = _append_reason_tokens(meta.fallback_details, *tokens)
+        if not meta.fallback_reason:
+            meta.fallback_reason = _primary_reason_token(meta.fallback_details, default="mode_tagged_fallback")
+    return meta
+
+
 def build_dubins_hybrid_path(
     world: WorldMap,
     cfg,
@@ -1699,3 +1989,55 @@ def build_dubins_hybrid_path(
         debug_trace=legacy_debug_prefix,
     )
     return _finalize_legacy_return(out_points, out_len, out_meta)
+
+
+def build_bid_verification_path(
+    world: WorldMap,
+    cfg,
+    start_pose: Pose2D,
+    goal_pose: Pose2D,
+    astar_planner: AStarPlanner,
+    turn_radius: float,
+    astar_path: Optional[List[Point2D]] = None,
+    astar_length: Optional[float] = None,
+) -> Tuple[List[Point2D], float, DubinsHybridMeta]:
+    verify_cfg = _build_bid_verification_cfg(cfg)
+    points, length, meta = build_dubins_hybrid_path(
+        world=world,
+        cfg=verify_cfg,
+        start_pose=start_pose,
+        goal_pose=goal_pose,
+        astar_planner=astar_planner,
+        turn_radius=turn_radius,
+        astar_path=astar_path,
+        astar_length=astar_length,
+    )
+    return points, length, _tag_meta_debug(
+        meta,
+        "mode:bid_verification",
+        "verify_mode_position_only",
+        "verify_mode_terminal_heading_only",
+    )
+
+
+def build_final_execution_path(
+    world: WorldMap,
+    cfg,
+    start_pose: Pose2D,
+    goal_pose: Pose2D,
+    astar_planner: AStarPlanner,
+    turn_radius: float,
+    astar_path: Optional[List[Point2D]] = None,
+    astar_length: Optional[float] = None,
+) -> Tuple[List[Point2D], float, DubinsHybridMeta]:
+    points, length, meta = build_dubins_hybrid_path(
+        world=world,
+        cfg=cfg,
+        start_pose=start_pose,
+        goal_pose=goal_pose,
+        astar_planner=astar_planner,
+        turn_radius=turn_radius,
+        astar_path=astar_path,
+        astar_length=astar_length,
+    )
+    return points, length, _tag_meta_debug(meta, "mode:final_execution", "final_mode_heading_refined")

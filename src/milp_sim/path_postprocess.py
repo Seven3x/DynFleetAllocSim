@@ -177,7 +177,7 @@ def maybe_buffer_initial_turn_path(
     goal_heading: float,
     turn_radius: float,
 ) -> Tuple[List[Point2D], float]:
-    from .dubins_path import build_dubins_hybrid_path
+    from .dubins_path import build_final_execution_path
 
     if len(path) < 2 or not math.isfinite(length):
         return path, length
@@ -228,7 +228,7 @@ def maybe_buffer_initial_turn_path(
         if not polyline_is_clear(world, arc_points, margin=clearance):
             continue
 
-        tail_path, tail_length, _ = build_dubins_hybrid_path(
+        tail_path, tail_length, _ = build_final_execution_path(
             world=world,
             cfg=cfg,
             start_pose=arc_end_pose,

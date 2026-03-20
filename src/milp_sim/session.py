@@ -20,7 +20,7 @@ from .auction_core import AllocationEngine, AllocationResult, EventLog
 from .config import DEFAULT_CONFIG, SimulationConfig
 from .cost_estimator import goal_heading_candidates, heading_to_point, wrap_to_pi
 from .debug import debug_log
-from .dubins_path import build_dubins_hybrid_path
+from .dubins_path import build_final_execution_path
 from .dynamic_events import generate_new_task
 from .entities import Task, Vehicle
 from .hybrid_heading_selector import select_best_heading_path
@@ -201,7 +201,7 @@ class SimulationSession:
         debug_log(
             "SimulationSession._reset_core initial allocation done "
             f"rounds={len(self.engine.auction_logs)} verifications={len(self.engine.verification_logs)} "
-            f"fallback_verifications={fallback_count} top_fallback={top_reasons}"
+            f"fallback_verifications={fallback_count}(verification_only) top_fallback={top_reasons}"
         )
         self.step = 10_000
         self._undo_stack.clear()
@@ -807,6 +807,7 @@ class SimulationSession:
             all_headings=all_headings,
             astar_path=base_astar_path,
             astar_length=base_astar_len,
+            build_path_fn=build_final_execution_path,
         )
         best_goal_heading = heading_sel.chosen_heading
         path, length = heading_sel.chosen_path, heading_sel.chosen_length
@@ -1072,7 +1073,7 @@ class SimulationSession:
             if not self._polyline_is_clear(arc_points, margin=clearance):
                 continue
 
-            tail_path, tail_length, _ = build_dubins_hybrid_path(
+            tail_path, tail_length, _ = build_final_execution_path(
                 world=self.artifacts.world,
                 cfg=self.cfg,
                 start_pose=arc_end_pose,

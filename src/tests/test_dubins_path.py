@@ -8,7 +8,7 @@ try:
 
     from milp_sim.config import DEFAULT_CONFIG
     from milp_sim.cost_estimator import heading_to_point
-    from milp_sim.dubins_path import DUBINS_WORDS, build_dubins_hybrid_path, solve_dubins_word
+    from milp_sim.dubins_path import DUBINS_WORDS, build_dubins_hybrid_path, build_rsplan_connector, solve_dubins_word
     from milp_sim.entities import Task, Vehicle
     from milp_sim.map_utils import WorldMap
     from milp_sim.planner_astar import AStarPlanner, HybridPlanDiagnostics
@@ -303,6 +303,63 @@ class TestDubinsPath(unittest.TestCase):
         self.assertIn(meta.fallback_reason, {"direct_collision", "corner_collision", "final_collision"})
         self.assertIn("collision", meta.fallback_details)
 
+    def test_build_rsplan_connector_handles_missing_dependency(self) -> None:
+        cfg = replace(DEFAULT_CONFIG, use_rsplan_connector=True)
+        start = (12.0, 14.0, 0.2)
+        goal = (18.0, 20.0, 0.7)
+
+        with patch("milp_sim.dubins_path.rsplan", None):
+            points, length, reason = build_rsplan_connector(
+                start_pose=start,
+                goal_pose=goal,
+                turn_radius=8.0,
+                world=self.world,
+                cfg=cfg,
+                margin=cfg.dubins_collision_margin,
+                require_terminal_heading=True,
+            )
+
+        self.assertEqual(points, [])
+        self.assertEqual(length, float("inf"))
+        self.assertEqual(reason, "rsplan_import_unavailable")
+
+    def test_connector_first_can_use_rsplan_primary(self) -> None:
+        cfg = replace(
+            DEFAULT_CONFIG,
+            use_dubins_hybrid=True,
+            use_hybrid_astar=True,
+            enable_connector_first_planner=True,
+            connector_use_straight_first=False,
+            connector_use_reeds_shepp=False,
+            connector_use_dubins=False,
+            connector_use_hybrid_local_rescue=False,
+            connector_use_plain_astar_fallback=False,
+            hybrid_astar_allow_reverse=True,
+            hybrid_astar_fallback_to_legacy=False,
+            use_rsplan_connector=True,
+        )
+        start = (12.0, 14.0, 0.0)
+        goal = (28.0, 18.0, 0.2)
+        fake_path = [(12.0, 14.0), (20.0, 16.0), (28.0, 18.0)]
+
+        with patch(
+            "milp_sim.dubins_path.build_rsplan_connector",
+            return_value=(fake_path, 16.5, "connector_rsplan_success"),
+        ):
+            points, length, meta = build_dubins_hybrid_path(
+                world=self.world,
+                cfg=cfg,
+                start_pose=start,
+                goal_pose=goal,
+                astar_planner=self.planner,
+                turn_radius=8.0,
+            )
+
+        self.assertEqual(points, fake_path)
+        self.assertAlmostEqual(length, 16.5, places=6)
+        self.assertEqual(meta.connector_type, "rsplan")
+        self.assertIn("connector_rsplan_success", meta.debug_trace)
+
     def test_connector_first_prefers_straight_in_open_space(self) -> None:
         cfg = replace(
             DEFAULT_CONFIG,
@@ -335,6 +392,7 @@ class TestDubinsPath(unittest.TestCase):
             use_dubins_hybrid=True,
             use_hybrid_astar=True,
             enable_connector_first_planner=True,
+            use_rsplan_connector=False,
             connector_use_straight_first=False,
             connector_use_dubins=False,
             connector_use_reeds_shepp=True,
@@ -371,7 +429,7 @@ class TestDubinsPath(unittest.TestCase):
             )
 
         self.assertEqual(points, hybrid_path)
-        self.assertAlmostEqual(length, 16.5, places=6)
+        self.assertAlmostEqual(length, 2.0 * math.hypot(8.0, 2.0), places=6)
         self.assertEqual(meta.connector_type, "hybrid_local")
         self.assertIn("connector_rs_detour_reject", meta.debug_trace)
         self.assertIn("connector_hybrid_local_success", meta.debug_trace)

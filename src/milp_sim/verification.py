@@ -6,7 +6,12 @@ from typing import Dict, List, Tuple
 
 from .config import SimulationConfig
 from .cost_estimator import goal_heading_candidates, heading_to_point, wrap_to_pi
-from .dubins_path import DubinsHybridMeta, build_dubins_hybrid_path  # backward-compatible import for tests/patching
+from .dubins_path import (
+    DubinsHybridMeta,
+    build_bid_verification_path,
+    build_dubins_hybrid_path,  # backward-compatible import for tests/patching
+    build_final_execution_path,
+)
 from .hybrid_heading_selector import select_best_heading_path
 from .entities import Task, Vehicle
 from .path_postprocess import maybe_buffer_initial_turn_path
@@ -22,6 +27,19 @@ class VerificationResult:
     dubins_used_fallback: bool = False
     dubins_fallback_details: str = ""
     debug_message: str = ""
+
+
+def _append_pipe_tokens(text: str, *tokens: str) -> str:
+    out: List[str] = []
+    for raw in str(text).split("|"):
+        token = raw.strip()
+        if token and token not in out:
+            out.append(token)
+    for token in tokens:
+        tok = str(token).strip()
+        if tok and tok not in out:
+            out.append(tok)
+    return "|".join(out)
 
 
 def _committed_prefix_task_ids(
@@ -64,28 +82,67 @@ def _segment_corrected_time(
     next_task_pos: Tuple[float, float] | None,
     cfg: SimulationConfig,
     planner: AStarPlanner,
+    mode: str = "bid_verification",
 ) -> Tuple[float, float, float, DubinsHybridMeta | None, str]:
+    is_bid_mode = mode == "bid_verification"
+    mode_tags: List[str] = []
+    if is_bid_mode:
+        mode_tags.extend(["verify_mode_position_only", "verify_mode_terminal_heading_only"])
+        if not bool(getattr(cfg, "bid_verification_use_next_task_heading", False)):
+            mode_tags.append("next_task_heading_disabled_for_verification")
+
+    debug_enabled = bool(getattr(cfg, "plan_debug_enabled", False))
+    target_vid = int(getattr(cfg, "plan_debug_vehicle_id", -1))
+    target_tid = int(getattr(cfg, "plan_debug_task_id", -1))
+    should_emit_debug = debug_enabled and (target_vid < 0 or target_vid == vehicle.id) and (
+        target_tid < 0 or target_tid == task.id
+    )
+
     path, astar_len = planner.plan(start_pos, task.position)
     if not path or astar_len == float("inf"):
         return float("inf"), float("inf"), start_heading, None, ""
 
     turn_radius = vehicle.speed / max(vehicle.max_omega, 1e-6)
     target_heading = heading_to_point(start_pos, task.position)
-    if not cfg.use_dubins_hybrid:
+    use_dubins_hybrid = bool(getattr(cfg, "use_dubins_hybrid", False))
+    if is_bid_mode:
+        use_dubins_hybrid = bool(getattr(cfg, "bid_verification_use_dubins_hybrid", False))
+    if not use_dubins_hybrid:
         delta_heading = abs(wrap_to_pi(target_heading - start_heading))
         corrected_length = astar_len + cfg.lambda_psi * turn_radius * delta_heading
         corrected_time = corrected_length / max(vehicle.speed, 1e-9)
-        return astar_len, corrected_time, target_heading, None, ""
+        debug_message = ""
+        if should_emit_debug:
+            mode_txt = mode if mode else ("bid_verification" if is_bid_mode else "final_execution")
+            tag_txt = ",".join(mode_tags) if mode_tags else "-"
+            debug_message = (
+                f"verify_plan_debug mode={mode_txt} tags={tag_txt} "
+                f"task=T{task.id} from=({start_pos[0]:.3f},{start_pos[1]:.3f},{math.degrees(start_heading):.1f}deg) "
+                f"to=({task.position[0]:.3f},{task.position[1]:.3f}) "
+                f"path_model=astar_only len={astar_len:.3f} "
+                f"terminal_heading={math.degrees(target_heading):.1f}deg"
+            )
+        return astar_len, corrected_time, target_heading, None, debug_message
 
-    all_headings = goal_heading_candidates(
-        current_pos=start_pos,
-        task_pos=task.position,
-        next_task_pos=next_task_pos,
-        turn_radius=turn_radius,
-        blend_turn_radius_factor=cfg.goal_heading_blend_turn_radius_factor,
-        tolerance_rad=cfg.goal_heading_tolerance_rad,
-        num_samples=cfg.goal_heading_num_samples,
-    )
+    use_next_task_heading = True
+    if is_bid_mode and (not bool(getattr(cfg, "bid_verification_use_next_task_heading", False))):
+        use_next_task_heading = False
+    effective_next_task_pos = next_task_pos if use_next_task_heading else None
+
+    if is_bid_mode:
+        # Verification mode keeps only terminal direct-heading scoring and avoids
+        # multi-heading local beautification for ranking stability/speed.
+        all_headings = [target_heading]
+    else:
+        all_headings = goal_heading_candidates(
+            current_pos=start_pos,
+            task_pos=task.position,
+            next_task_pos=effective_next_task_pos,
+            turn_radius=turn_radius,
+            blend_turn_radius_factor=cfg.goal_heading_blend_turn_radius_factor,
+            tolerance_rad=cfg.goal_heading_tolerance_rad,
+            num_samples=cfg.goal_heading_num_samples,
+        )
     heading_sel = select_best_heading_path(
         cfg=cfg,
         world=planner.world,
@@ -98,7 +155,7 @@ def _segment_corrected_time(
         all_headings=all_headings,
         astar_path=path,
         astar_length=astar_len,
-        build_path_fn=build_dubins_hybrid_path,
+        build_path_fn=build_bid_verification_path if is_bid_mode else build_final_execution_path,
     )
     chosen_heading = heading_sel.chosen_heading
     path_length = heading_sel.chosen_length
@@ -108,7 +165,10 @@ def _segment_corrected_time(
     if not math.isfinite(path_length):
         return float("inf"), float("inf"), start_heading, None, ""
 
-    if chosen_path:
+    apply_initial_turn_buffer = (not is_bid_mode) or bool(
+        getattr(cfg, "bid_verification_enable_initial_turn_buffer", False)
+    )
+    if chosen_path and apply_initial_turn_buffer:
         _, path_length = maybe_buffer_initial_turn_path(
             world=planner.world,
             cfg=cfg,
@@ -125,13 +185,18 @@ def _segment_corrected_time(
     delta_heading = abs(wrap_to_pi(chosen_heading - start_heading))
     corrected_length = path_length + cfg.lambda_psi * turn_radius * delta_heading
     corrected_time = corrected_length / max(vehicle.speed, 1e-9)
+    if hybrid_meta is not None and mode_tags:
+        hybrid_meta.debug_trace = _append_pipe_tokens(
+            str(getattr(hybrid_meta, "debug_trace", "")).replace(";", "|"),
+            *mode_tags,
+        ).replace("|", ";")
+        if bool(getattr(hybrid_meta, "used_fallback", False)):
+            hybrid_meta.fallback_details = _append_pipe_tokens(
+                getattr(hybrid_meta, "fallback_details", ""),
+                *mode_tags,
+            )
+
     debug_message = ""
-    debug_enabled = bool(getattr(cfg, "plan_debug_enabled", False))
-    target_vid = int(getattr(cfg, "plan_debug_vehicle_id", -1))
-    target_tid = int(getattr(cfg, "plan_debug_task_id", -1))
-    should_emit_debug = debug_enabled and (target_vid < 0 or target_vid == vehicle.id) and (
-        target_tid < 0 or target_tid == task.id
-    )
     if should_emit_debug and hybrid_meta is not None:
         ranked = sorted(
             cand_debug,
@@ -163,8 +228,10 @@ def _segment_corrected_time(
         chosen_trace = str(getattr(hybrid_meta, "debug_trace", ""))
         connector_type = str(getattr(hybrid_meta, "connector_type", "") or "-")
         connector_summary = str(getattr(hybrid_meta, "connector_summary", "") or "-")
+        mode_txt = mode if mode else ("bid_verification" if is_bid_mode else "final_execution")
+        tag_txt = ",".join(mode_tags) if mode_tags else "-"
         debug_message = (
-            f"verify_plan_debug task=T{task.id} "
+            f"verify_plan_debug mode={mode_txt} tags={tag_txt} task=T{task.id} "
             f"from=({start_pos[0]:.3f},{start_pos[1]:.3f},{math.degrees(start_heading):.1f}deg) "
             f"to=({task.position[0]:.3f},{task.position[1]:.3f}) "
             f"choose_h={math.degrees(chosen_heading):.1f} len={path_length:.3f} "
@@ -217,6 +284,7 @@ def verify_bid(
             next_task_pos=next_task_pos,
             cfg=cfg,
             planner=planner,
+            mode="bid_verification",
         )
         if seg_time == float("inf"):
             return VerificationResult(
@@ -256,8 +324,9 @@ def verify_bid(
         )
 
     e_under = (c_tilde_total - c_hat) / c_tilde_total
+    reject_on_cost_gap = bool(getattr(cfg, "bid_verification_reject_on_cost_gap", True))
     return VerificationResult(
-        passed=e_under <= cfg.verify_epsilon,
+        passed=(e_under <= cfg.verify_epsilon) if reject_on_cost_gap else True,
         path_length=path_length_total,
         c_tilde=c_tilde_total,
         e_under=e_under,

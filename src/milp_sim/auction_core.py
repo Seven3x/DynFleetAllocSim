@@ -10,6 +10,7 @@ from .cost_estimator import (
     heading_to_point,
 )
 from .debug import debug_log
+from .dubins_path import build_final_execution_path
 from .entities import Task, Vehicle
 from .hybrid_heading_selector import select_best_heading_path
 from .map_utils import WorldMap
@@ -738,9 +739,33 @@ class AllocationEngine:
                     all_headings=all_headings,
                     astar_path=base_astar_path,
                     astar_length=base_astar_len,
+                    build_path_fn=build_final_execution_path,
                 )
                 best_goal_heading = heading_sel.chosen_heading
                 path, length = heading_sel.chosen_path, heading_sel.chosen_length
+                if bool(getattr(self.cfg, "plan_debug_enabled", False)):
+                    target_vid = int(getattr(self.cfg, "plan_debug_vehicle_id", -1))
+                    target_tid = int(getattr(self.cfg, "plan_debug_task_id", -1))
+                    if (target_vid < 0 or target_vid == v.id) and (target_tid < 0 or target_tid == tid):
+                        chosen_trace = str(getattr(heading_sel.chosen_meta, "debug_trace", "") or "-")
+                        internal_mode = (
+                            "position_only"
+                            if bool(getattr(self.cfg, "connector_internal_waypoints_position_only", True))
+                            else "terminal_pose_goal"
+                        )
+                        self.event_logs.append(
+                            EventLog(
+                                step=self._round_idx,
+                                event_type="final_plan_debug",
+                                task_id=tid,
+                                message=(
+                                    f"mode=final_execution tags=final_mode_heading_refined "
+                                    f"vehicle=V{v.id} task=T{tid} "
+                                    f"intermediate_waypoints={internal_mode} "
+                                    f"trace={chosen_trace}"
+                                ),
+                            )
+                        )
                 if not path or length == float("inf"):
                     raise RuntimeError(
                         f"Hybrid planning failed for vehicle={v.id}, task={tid}, from={cur} to={task.position}."
