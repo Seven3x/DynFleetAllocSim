@@ -771,6 +771,66 @@ def build_dubins_hybrid_path(
     astar_length: Optional[float] = None,
 ) -> Tuple[List[Point2D], float, DubinsHybridMeta]:
     force_mode = bool(getattr(cfg, "dubins_force_mode", False))
+    use_dubins_hybrid = bool(getattr(cfg, "use_dubins_hybrid", False))
+    collision_margin = float(getattr(cfg, "dubins_collision_margin", 0.0))
+
+    # Primary mode: Hybrid A* on (x, y, yaw) state space.
+    if use_dubins_hybrid and bool(getattr(cfg, "use_hybrid_astar", False)):
+        hybrid_points, hybrid_len = astar_planner.plan_hybrid(
+            start_pose=start_pose,
+            goal_pose=goal_pose,
+            turn_radius=turn_radius,
+            step_size=float(getattr(cfg, "hybrid_astar_step_size", 0.8)),
+            heading_bins=int(getattr(cfg, "hybrid_astar_heading_bins", 72)),
+            max_expansions=int(getattr(cfg, "hybrid_astar_max_expansions", 45000)),
+            goal_pos_tolerance=float(getattr(cfg, "hybrid_astar_goal_pos_tolerance", 1.5)),
+            goal_heading_tolerance=float(getattr(cfg, "hybrid_astar_goal_heading_tolerance_rad", 0.8)),
+            allow_reverse=bool(getattr(cfg, "hybrid_astar_allow_reverse", False)),
+            reverse_penalty=float(getattr(cfg, "hybrid_astar_reverse_penalty", 1.6)),
+            heuristic_weight=float(getattr(cfg, "hybrid_astar_heuristic_weight", 1.05)),
+        )
+        if hybrid_points and math.isfinite(hybrid_len):
+            hybrid_points[0] = (start_pose[0], start_pose[1])
+            hybrid_points[-1] = (goal_pose[0], goal_pose[1])
+            planner_clearance = max(0.0, float(getattr(astar_planner, "inflation_radius", 0.0)))
+            need_recheck = collision_margin > planner_clearance + 1e-9
+            if force_mode or (not need_recheck) or _polyline_collision_free(
+                hybrid_points,
+                world=world,
+                margin=collision_margin,
+            ):
+                return (
+                    hybrid_points,
+                    hybrid_len,
+                    DubinsHybridMeta(
+                        used_fallback=False,
+                        fallback_segments=0,
+                        dubins_segments=0,
+                        sample_count=len(hybrid_points),
+                        dubins_ratio=0.0,
+                        debug_trace="hybrid_astar:ok",
+                    ),
+                )
+            hybrid_fail_reason = "hybrid_astar_collision"
+        else:
+            hybrid_fail_reason = "hybrid_astar_unreachable"
+
+        if not bool(getattr(cfg, "hybrid_astar_fallback_to_legacy", True)):
+            return (
+                [],
+                float("inf"),
+                DubinsHybridMeta(
+                    used_fallback=True,
+                    fallback_segments=1,
+                    dubins_segments=0,
+                    sample_count=0,
+                    dubins_ratio=0.0,
+                    fallback_reason=hybrid_fail_reason,
+                    fallback_details=f"{hybrid_fail_reason}:1",
+                    debug_trace=f"hybrid_astar:{hybrid_fail_reason}",
+                ),
+            )
+
     if astar_path is None or astar_length is None:
         astar_path, astar_length = astar_planner.plan((start_pose[0], start_pose[1]), (goal_pose[0], goal_pose[1]))
 
@@ -790,7 +850,7 @@ def build_dubins_hybrid_path(
         )
 
     smoothing_margin = max(
-        float(getattr(cfg, "dubins_collision_margin", 0.0)),
+        collision_margin,
         float(getattr(cfg, "vehicle_radius", 0.0)) + float(getattr(cfg, "safety_margin", 0.0)),
     )
     if getattr(cfg, "astar_smooth_before_dubins", True):
@@ -801,7 +861,7 @@ def build_dubins_hybrid_path(
         base_path = astar_path
     base_len = _polyline_length(base_path)
 
-    if not getattr(cfg, "use_dubins_hybrid", False):
+    if not use_dubins_hybrid:
         return (
             base_path,
             base_len,

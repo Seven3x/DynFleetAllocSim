@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 from .config import SimulationConfig
-from .cost_estimator import goal_heading_candidates, heading_to_point, wrap_to_pi
+from .cost_estimator import goal_heading_candidates, heading_to_point, prioritize_goal_heading_candidates, wrap_to_pi
 from .dubins_path import DubinsHybridMeta, build_dubins_hybrid_path
 from .entities import Task, Vehicle
 from .path_postprocess import maybe_buffer_initial_turn_path
@@ -85,6 +85,13 @@ def _segment_corrected_time(
         tolerance_rad=cfg.goal_heading_tolerance_rad,
         num_samples=cfg.goal_heading_num_samples,
     )
+    if bool(getattr(cfg, "use_hybrid_astar", False)):
+        headings = prioritize_goal_heading_candidates(
+            headings=headings,
+            current_heading=start_heading,
+            target_heading=target_heading,
+            limit=int(getattr(cfg, "hybrid_astar_heading_candidate_limit", 2)),
+        )
     turn_penalty = max(0.0, float(getattr(cfg, "goal_heading_turn_penalty", 0.0)))
     dpsi_limit = max(0.0, float(getattr(cfg, "goal_heading_max_dpsi_rad", 0.0)))
     dpsi_slack = max(0.0, float(getattr(cfg, "goal_heading_max_dpsi_slack_rad", 0.0)))

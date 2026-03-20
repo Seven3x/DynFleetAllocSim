@@ -8,6 +8,7 @@ from .cost_estimator import (
     fast_cost_estimate_from_state,
     goal_heading_candidates,
     heading_to_point,
+    prioritize_goal_heading_candidates,
     wrap_to_pi,
 )
 from .debug import debug_log
@@ -671,6 +672,13 @@ class AllocationEngine:
                     tolerance_rad=self.cfg.goal_heading_tolerance_rad,
                     num_samples=self.cfg.goal_heading_num_samples,
                 )
+                if bool(getattr(self.cfg, "use_hybrid_astar", False)):
+                    headings = prioritize_goal_heading_candidates(
+                        headings=headings,
+                        current_heading=cur_heading,
+                        target_heading=heading_to_point(cur, task.position),
+                        limit=int(getattr(self.cfg, "hybrid_astar_heading_candidate_limit", 2)),
+                    )
                 best_path: List[Tuple[float, float]] = []
                 best_len = float("inf")
                 best_score = float("inf")

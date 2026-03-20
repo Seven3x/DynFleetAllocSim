@@ -61,7 +61,13 @@ class TestDubinsPath(unittest.TestCase):
             self.assertGreaterEqual(found[2], 0.0)
 
     def test_hybrid_path_preserves_endpoints(self) -> None:
-        cfg = replace(DEFAULT_CONFIG, use_dubins_hybrid=True, dubins_sample_step=0.8, dubins_collision_margin=1.8)
+        cfg = replace(
+            DEFAULT_CONFIG,
+            use_dubins_hybrid=True,
+            use_hybrid_astar=False,
+            dubins_sample_step=0.8,
+            dubins_collision_margin=1.8,
+        )
         start = (12.0, 14.0, 0.2)
         goal = (85.0, 76.0, 1.0)
 
@@ -82,10 +88,37 @@ class TestDubinsPath(unittest.TestCase):
         self.assertAlmostEqual(points[-1][1], goal[1], places=6)
         self.assertGreaterEqual(meta.sample_count, len(points))
 
+    def test_hybrid_astar_primary_mode_returns_feasible_path(self) -> None:
+        cfg = replace(
+            DEFAULT_CONFIG,
+            use_dubins_hybrid=True,
+            use_hybrid_astar=True,
+            hybrid_astar_fallback_to_legacy=False,
+            hybrid_astar_step_size=1.0,
+            hybrid_astar_max_expansions=30000,
+        )
+        start = (12.0, 14.0, 0.2)
+        goal = (85.0, 76.0, 1.0)
+
+        points, length, meta = build_dubins_hybrid_path(
+            world=self.world,
+            cfg=cfg,
+            start_pose=start,
+            goal_pose=goal,
+            astar_planner=self.planner,
+            turn_radius=12.0,
+        )
+
+        self.assertGreater(len(points), 2)
+        self.assertTrue(math.isfinite(length))
+        self.assertFalse(meta.used_fallback)
+        self.assertEqual(meta.debug_trace, "hybrid_astar:ok")
+
     def test_hybrid_fallback_to_astar_when_collision_too_strict(self) -> None:
         cfg = replace(
             DEFAULT_CONFIG,
             use_dubins_hybrid=True,
+            use_hybrid_astar=False,
             astar_smooth_before_dubins=False,
             dubins_sample_step=0.8,
             dubins_collision_margin=40.0,
@@ -114,6 +147,7 @@ class TestDubinsPath(unittest.TestCase):
         cfg = replace(
             DEFAULT_CONFIG,
             use_dubins_hybrid=True,
+            use_hybrid_astar=False,
             astar_smooth_before_dubins=False,
             dubins_sample_step=0.8,
             dubins_collision_margin=40.0,
@@ -142,7 +176,12 @@ class TestDubinsPath(unittest.TestCase):
         self.assertGreater(len(raw_path), 2)
         self.assertTrue(math.isfinite(raw_len))
 
-        cfg = replace(DEFAULT_CONFIG, use_dubins_hybrid=False, astar_smooth_before_dubins=True)
+        cfg = replace(
+            DEFAULT_CONFIG,
+            use_dubins_hybrid=False,
+            use_hybrid_astar=False,
+            astar_smooth_before_dubins=True,
+        )
         points, length, meta = build_dubins_hybrid_path(
             world=self.world,
             cfg=cfg,
@@ -165,7 +204,12 @@ class TestDubinsPath(unittest.TestCase):
         two_point = [(start[0], start[1]), (goal[0], goal[1])]
         line_len = math.hypot(goal[0] - start[0], goal[1] - start[1])
 
-        cfg = replace(DEFAULT_CONFIG, use_dubins_hybrid=True, astar_smooth_before_dubins=True)
+        cfg = replace(
+            DEFAULT_CONFIG,
+            use_dubins_hybrid=True,
+            use_hybrid_astar=False,
+            astar_smooth_before_dubins=True,
+        )
         points, length, meta = build_dubins_hybrid_path(
             world=self.world,
             cfg=cfg,
@@ -186,6 +230,7 @@ class TestDubinsPath(unittest.TestCase):
         cfg = replace(
             DEFAULT_CONFIG,
             use_dubins_hybrid=True,
+            use_hybrid_astar=False,
             astar_smooth_before_dubins=False,
             dubins_fallback_to_astar=True,
             dubins_collision_margin=1.8,
@@ -219,6 +264,7 @@ class TestDubinsPath(unittest.TestCase):
         cfg = replace(
             DEFAULT_CONFIG,
             use_dubins_hybrid=True,
+            use_hybrid_astar=False,
             goal_heading_tolerance_rad=0.9,
             goal_heading_num_samples=5,
             goal_heading_max_dpsi_rad=1.05,
@@ -297,6 +343,7 @@ class TestDubinsPath(unittest.TestCase):
             DEFAULT_CONFIG,
             seed=0,
             use_dubins_hybrid=True,
+            use_hybrid_astar=False,
             dubins_fallback_to_astar=True,
             dubins_force_mode=False,
         )
@@ -323,6 +370,7 @@ class TestDubinsPath(unittest.TestCase):
             DEFAULT_CONFIG,
             seed=7,
             use_dubins_hybrid=True,
+            use_hybrid_astar=False,
             dubins_fallback_to_astar=True,
             dubins_force_mode=False,
         )

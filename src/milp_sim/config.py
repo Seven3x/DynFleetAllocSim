@@ -51,6 +51,24 @@ class SimulationConfig:
     astar_connect_diagonal: bool = True
     # Pre-smooth A* polyline by line-of-sight shortcut before Dubins/fillet.
     astar_smooth_before_dubins: bool = True
+    # Use Hybrid A* (x, y, yaw state) as the primary heading-constrained planner.
+    use_hybrid_astar: bool = True
+    # If Hybrid A* fails, fall back to legacy A* + Dubins/fillet pipeline.
+    hybrid_astar_fallback_to_legacy: bool = True
+    # Performance defaults tuned for repeated online/verification calls.
+    hybrid_astar_step_size: float = 1.2
+    hybrid_astar_heading_bins: int = 48
+    hybrid_astar_max_expansions: int = 12000
+    hybrid_astar_goal_pos_tolerance: float = 2.0
+    hybrid_astar_goal_heading_tolerance_rad: float = 1.0
+    hybrid_astar_allow_reverse: bool = False
+    hybrid_astar_reverse_penalty: float = 1.6
+    hybrid_astar_heuristic_weight: float = 1.15
+    # Limit how many terminal-heading candidates are fully planned in Hybrid A* mode.
+    hybrid_astar_heading_candidate_limit: int = 2
+
+    # Offline GUI: auto comparison computes two extra full allocations and can be slow.
+    offline_enable_comparison: bool = True
 
     # Hybrid trajectory: A* skeleton + Dubins segments
     use_dubins_hybrid: bool = True
@@ -116,6 +134,22 @@ class SimulationConfig:
             raise ValueError("online_new_task_replan_batch_size must be >= 1")
         if float(self.committed_prefix_time_weight) < 0.0:
             raise ValueError("committed_prefix_time_weight must be >= 0")
+        if float(self.hybrid_astar_step_size) <= 0.0:
+            raise ValueError("hybrid_astar_step_size must be > 0")
+        if int(self.hybrid_astar_heading_bins) < 8:
+            raise ValueError("hybrid_astar_heading_bins must be >= 8")
+        if int(self.hybrid_astar_max_expansions) < 1000:
+            raise ValueError("hybrid_astar_max_expansions must be >= 1000")
+        if float(self.hybrid_astar_goal_pos_tolerance) <= 0.0:
+            raise ValueError("hybrid_astar_goal_pos_tolerance must be > 0")
+        if float(self.hybrid_astar_goal_heading_tolerance_rad) <= 0.0:
+            raise ValueError("hybrid_astar_goal_heading_tolerance_rad must be > 0")
+        if float(self.hybrid_astar_reverse_penalty) < 1.0:
+            raise ValueError("hybrid_astar_reverse_penalty must be >= 1")
+        if float(self.hybrid_astar_heuristic_weight) <= 0.0:
+            raise ValueError("hybrid_astar_heuristic_weight must be > 0")
+        if int(self.hybrid_astar_heading_candidate_limit) < 1:
+            raise ValueError("hybrid_astar_heading_candidate_limit must be >= 1")
 
 
 DEFAULT_CONFIG = SimulationConfig()

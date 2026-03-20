@@ -100,6 +100,45 @@ def goal_heading_candidates(
     return uniq
 
 
+def prioritize_goal_heading_candidates(
+    headings: List[float],
+    current_heading: float,
+    target_heading: float,
+    limit: int,
+) -> List[float]:
+    if not headings:
+        return []
+
+    n = max(1, int(limit))
+    if len(headings) <= n:
+        return list(headings)
+
+    def d_to_target(h: float) -> float:
+        return abs(wrap_to_pi(h - target_heading))
+
+    def d_to_current(h: float) -> float:
+        return abs(wrap_to_pi(h - current_heading))
+
+    center = min(headings, key=d_to_target)
+    smooth = min(headings, key=d_to_current)
+    ranked = sorted(
+        headings,
+        key=lambda h: (
+            d_to_target(h) + 0.35 * d_to_current(h),
+            d_to_target(h),
+            d_to_current(h),
+        ),
+    )
+
+    out: List[float] = []
+    for h in (center, smooth, *ranked):
+        if all(abs(wrap_to_pi(h - v)) > 1e-4 for v in out):
+            out.append(h)
+        if len(out) >= n:
+            break
+    return out
+
+
 def corridor_density(
     world: WorldMap,
     src: Tuple[float, float],

@@ -16,7 +16,7 @@ from shapely.geometry import LineString, Point, Polygon
 
 from .auction_core import AllocationEngine, AllocationResult, EventLog
 from .config import DEFAULT_CONFIG, SimulationConfig
-from .cost_estimator import goal_heading_candidates, heading_to_point, wrap_to_pi
+from .cost_estimator import goal_heading_candidates, heading_to_point, prioritize_goal_heading_candidates, wrap_to_pi
 from .debug import debug_log
 from .dubins_path import build_dubins_hybrid_path
 from .dynamic_events import generate_new_task
@@ -755,6 +755,13 @@ class SimulationSession:
             tolerance_rad=self.cfg.goal_heading_tolerance_rad,
             num_samples=self.cfg.goal_heading_num_samples,
         )
+        if bool(getattr(self.cfg, "use_hybrid_astar", False)):
+            headings = prioritize_goal_heading_candidates(
+                headings=headings,
+                current_heading=v.current_heading,
+                target_heading=heading_to_point(v.current_pos, task.position),
+                limit=int(getattr(self.cfg, "hybrid_astar_heading_candidate_limit", 2)),
+            )
         best_path: list[tuple[float, float]] = []
         best_length = float("inf")
         best_score = float("inf")
@@ -2194,6 +2201,32 @@ class OfflineSession:
         return self._comparison_results_cache
 
     def draw_comparison_on_axes(self, ax_with, ax_without) -> None:
+        if not bool(getattr(self.cfg, "offline_enable_comparison", False)):
+            self._session.draw_on_axis(ax_with, render_state=None)
+            ax_without.clear()
+            ax_without.set_axis_off()
+            ax_without.text(
+                0.5,
+                0.58,
+                "Offline Comparison Disabled",
+                ha="center",
+                va="center",
+                fontsize=12,
+                color="#0f172a",
+                transform=ax_without.transAxes,
+            )
+            ax_without.text(
+                0.5,
+                0.42,
+                "Set cfg.offline_enable_comparison=True to enable",
+                ha="center",
+                va="center",
+                fontsize=10,
+                color="#374151",
+                transform=ax_without.transAxes,
+            )
+            return
+
         with_result, without_result = self.comparison_results()
         summary = self.comparison_summary()
 
