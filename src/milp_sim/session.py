@@ -141,11 +141,21 @@ class SimulationSession:
         self._frame_cursor: int = -1
         self.max_frame_history = 800
         self._offline_result_cache: AllocationResult | None = None
+        self._offline_reallocation_pending = False
 
         self._reset_core()
 
     def _invalidate_offline_result_cache(self) -> None:
         self._offline_result_cache = None
+
+    def _mark_offline_reallocation_pending(self) -> None:
+        if self.online_enabled:
+            return
+        self._offline_reallocation_pending = True
+        self._invalidate_offline_result_cache()
+
+    def offline_reallocation_pending(self) -> bool:
+        return bool(self._offline_reallocation_pending)
 
     def _reset_core(self) -> None:
         debug_log("SimulationSession._reset_core start")
@@ -223,6 +233,7 @@ class SimulationSession:
         self._frame_cursor = -1
         self._recorded_user_actions = []
         self._user_action_counter = 0
+        self._offline_reallocation_pending = False
         debug_log("SimulationSession._reset_core complete")
 
     def reset(self, replay_last_actions: bool = False) -> None:
@@ -1330,6 +1341,9 @@ class SimulationSession:
         if action.action_type == "remove_obstacle":
             self.remove_obstacle(obstacle_idx=int(payload["obstacle_idx"]))
             return
+        if action.action_type == "offline_reallocate":
+            self.reallocate_offline()
+            return
         raise ValueError(f"unsupported user action type: {action.action_type}")
 
     def _replay_user_actions(self, actions: list[UserActionRecord]) -> None:
@@ -1469,6 +1483,43 @@ class SimulationSession:
         self._rebuild_planner()
         return poly
 
+    def reallocate_offline(self) -> AllocationResult:
+        self._assert_ready()
+        assert self.engine is not None
+        if self.online_enabled:
+            raise ValueError("offline reallocation is unavailable in online mode")
+
+        canceled_task_ids = [t.id for t in self.engine.tasks if t.status == "canceled"]
+        completed_task_ids = [t.id for t in self.engine.tasks if t.status == "completed"]
+
+        self.step += 1
+        self._invalidate_offline_result_cache()
+        # Full offline re-allocation: discard all current assignments and auction from scratch.
+        self.engine.reset()
+
+        for tid in canceled_task_ids:
+            self.engine.cancel_task(task_id=tid, step=self.step)
+        for tid in completed_task_ids:
+            task = self.engine.tasks_by_id.get(tid)
+            if task is None:
+                continue
+            task.status = "completed"
+            task.assigned_vehicle = None
+            base = self.engine.records.get(tid)
+            next_version = (base.version + 1) if base is not None else 1
+            self.engine.records[tid] = TaskRecord(
+                task_id=tid,
+                winner=None,
+                bid=float("inf"),
+                status="completed",
+                version=next_version,
+            )
+
+        self.engine.allocate_until_stable(phase=f"session:manual_reallocate@{self.step}")
+        self._offline_result_cache = self.engine.finalize()
+        self._offline_reallocation_pending = False
+        return self._offline_result_cache
+
     def add_obstacle_polygon(self, points: list[tuple[float, float]]) -> Polygon:
         self._assert_ready()
         ctx = self._capture_user_action_context()
@@ -1491,30 +1542,17 @@ class SimulationSession:
         assert self.artifacts is not None
         assert self.engine is not None
 
-        prev_obstacle_count = len(self.artifacts.world.obstacles)
-        prev_planner = self.engine.planner
         self._push_undo_state()
-        checked_result: AllocationResult | None = None
 
         self.artifacts.world.add_obstacle(poly)
         self._rebuild_planner()
-        try:
-            checked_result = self.engine.finalize()
-        except Exception as exc:
-            self.artifacts.world.obstacles = self.artifacts.world.obstacles[:prev_obstacle_count]
-            self.artifacts.world.invalidate_cache()
-            self.engine.planner = prev_planner
-            self.artifacts.planner = prev_planner
-            if self._undo_stack:
-                self._undo_stack.pop()
-            raise ValueError(f"obstacle makes current routes infeasible: {exc}") from exc
+        self._mark_offline_reallocation_pending()
 
         self._record_user_action(
             "add_obstacle",
             {"points": [(float(x), float(y)) for x, y in points]},
             ctx,
         )
-        self._offline_result_cache = checked_result
         return poly
 
     def remove_obstacle(self, obstacle_idx: int) -> None:
@@ -1537,10 +1575,9 @@ class SimulationSession:
             return
 
         self._push_undo_state()
-        self._invalidate_offline_result_cache()
         self.artifacts.world.remove_obstacle(idx)
         self._rebuild_planner()
-        self.engine.allocate_until_stable(phase=f"session:remove_obstacle@{self.step}")
+        self._mark_offline_reallocation_pending()
         self._record_user_action("remove_obstacle", {"obstacle_idx": idx}, ctx)
 
     def list_obstacles(self) -> list[tuple[int, float]]:
@@ -1575,10 +1612,9 @@ class SimulationSession:
             return task
 
         self._push_undo_state()
-        self._invalidate_offline_result_cache()
         self.step += 1
         self.engine.add_dynamic_task(task=task, step=self.step)
-        self.engine.allocate_until_stable(phase=f"session:add@{self.step}")
+        self._mark_offline_reallocation_pending()
         self._record_user_action(
             "add_task",
             {"x": float(task.position[0]), "y": float(task.position[1]), "demand": int(task.demand), "task_id": int(task.id)},
@@ -1629,7 +1665,6 @@ class SimulationSession:
             return moved
 
         self._push_undo_state()
-        self._invalidate_offline_result_cache()
         self.step += 1
 
         owner = task.assigned_vehicle
@@ -1666,7 +1701,7 @@ class SimulationSession:
                 message=f"moved task T{tid} from {old_pos} to {p}",
             )
         )
-        self.engine.allocate_until_stable(phase=f"session:move@{self.step}")
+        self._mark_offline_reallocation_pending()
         self._record_user_action(
             "move_task",
             {
@@ -1708,10 +1743,9 @@ class SimulationSession:
             return task
 
         self._push_undo_state()
-        self._invalidate_offline_result_cache()
         self.step += 1
         self.engine.add_dynamic_task(task=task, step=self.step)
-        self.engine.allocate_until_stable(phase=f"session:add_random@{self.step}")
+        self._mark_offline_reallocation_pending()
         self._record_user_action(
             "add_random_task",
             {"x": float(task.position[0]), "y": float(task.position[1]), "demand": int(task.demand), "task_id": int(task.id)},
@@ -1732,10 +1766,9 @@ class SimulationSession:
             return
 
         self._push_undo_state()
-        self._invalidate_offline_result_cache()
         self.step += 1
         self.engine.cancel_task(task_id=tid, step=self.step)
-        self.engine.allocate_until_stable(phase=f"session:cancel@{self.step}")
+        self._mark_offline_reallocation_pending()
         self._record_user_action("cancel_task", {"task_id": tid}, ctx)
 
     def result(self) -> AllocationResult:
@@ -1818,6 +1851,8 @@ class SimulationSession:
             return f"add_obstacle vertices={len(payload['points'])}"
         if action.action_type == "remove_obstacle":
             return f"remove_obstacle idx={payload['obstacle_idx']}"
+        if action.action_type == "offline_reallocate":
+            return "offline_reallocate"
         return action.action_type
 
     def format_user_action_history_text(self, n: int = 12) -> str:
@@ -1847,6 +1882,25 @@ class SimulationSession:
         assert self.engine is not None
 
         if not self.online_enabled:
+            if self._offline_reallocation_pending:
+                lines = [
+                    "-" * 72,
+                    (
+                        f"step={self.step} total_tasks={len(self.engine.tasks)} "
+                        f"status={self.status_counts()}"
+                    ),
+                    "offline_reallocation_pending=True (click Re-auction Now)",
+                ]
+                for v in self.engine.vehicles:
+                    seq = ",".join(f"T{tid}" for tid in v.task_sequence) if v.task_sequence else "(none)"
+                    lines.append(
+                        f"V{v.id}: remain={v.remaining_capacity}/{v.capacity} "
+                        f"tasks=[{seq}]"
+                    )
+                lines.append("system_total_time=(pending)")
+                lines.append("-" * 72)
+                return "\n".join(lines)
+
             result = self.result()
             lines = [
                 "-" * 72,
@@ -1898,7 +1952,10 @@ class SimulationSession:
 
     def format_logs_text(self, n: int = 8) -> str:
         ver, coord = self.recent_logs(n=n)
-        lines = ["Verification logs:"]
+        lines = []
+        if not self.online_enabled and self._offline_reallocation_pending:
+            lines.append("Offline edits pending. Click Re-auction Now to recompute allocation.")
+        lines.append("Verification logs:")
         for item in ver:
             fallback = item.dubins_fallback_details if item.dubins_used_fallback else "-"
             lines.append(
@@ -2058,11 +2115,17 @@ class SimulationSession:
             path = self.output_dir / f"snapshot_{self._timestamp()}_step_{self.step}.png"
 
         if not self.online_enabled:
-            result = self.result()
+            if self._offline_reallocation_pending:
+                vehicles = self.engine.vehicles
+                tasks = self.engine.tasks
+            else:
+                result = self.result()
+                vehicles = result.vehicles
+                tasks = result.tasks
             plot_final_scene(
                 world=self.artifacts.world,
-                vehicles=result.vehicles,
-                tasks=result.tasks,
+                vehicles=vehicles,
+                tasks=tasks,
                 save_path=path,
                 dpi=self.cfg.figure_dpi,
                 fig_size=self.cfg.figure_size,
@@ -2176,6 +2239,8 @@ class OfflineSession:
             session._apply_user_action_record(copy.deepcopy(action))
 
     def _build_comparison_summary(self) -> OfflineComparisonSummary:
+        if self._session.offline_reallocation_pending():
+            raise ValueError("offline edits pending; run re-allocation first")
         actions = self._current_offline_actions()
         t0 = time.perf_counter()
         with_verify = SimulationSession(replace(self.cfg, enable_bid_verification=True))
@@ -2213,11 +2278,15 @@ class OfflineSession:
         )
 
     def comparison_summary(self) -> OfflineComparisonSummary:
+        if self._session.offline_reallocation_pending():
+            raise ValueError("offline edits pending; run re-allocation first")
         if self._comparison_cache is None:
             self._comparison_cache = self._build_comparison_summary()
         return self._comparison_cache
 
     def comparison_results(self) -> tuple[AllocationResult, AllocationResult]:
+        if self._session.offline_reallocation_pending():
+            raise ValueError("offline edits pending; run re-allocation first")
         if self._comparison_results_cache is None:
             self._comparison_cache = self._build_comparison_summary()
         assert self._comparison_results_cache is not None
@@ -2242,6 +2311,32 @@ class OfflineSession:
                 0.5,
                 0.42,
                 "Set cfg.offline_enable_comparison=True to enable",
+                ha="center",
+                va="center",
+                fontsize=10,
+                color="#374151",
+                transform=ax_without.transAxes,
+            )
+            return
+
+        if self._session.offline_reallocation_pending():
+            self._session.draw_on_axis(ax_with, render_state=None)
+            ax_without.clear()
+            ax_without.set_axis_off()
+            ax_without.text(
+                0.5,
+                0.56,
+                "Comparison Paused",
+                ha="center",
+                va="center",
+                fontsize=12,
+                color="#0f172a",
+                transform=ax_without.transAxes,
+            )
+            ax_without.text(
+                0.5,
+                0.42,
+                "Click Re-auction Now to recompute",
                 ha="center",
                 va="center",
                 fontsize=10,
@@ -2293,6 +2388,8 @@ class OfflineSession:
         )
 
     def format_comparison_text(self) -> str:
+        if self._session.offline_reallocation_pending():
+            return "Offline Comparison:\n  pending edits; click Re-auction Now to recompute."
         summary = self.comparison_summary()
         lines = ["Offline Comparison:"]
         for variant in (summary.with_verification, summary.without_verification):
@@ -2357,6 +2454,16 @@ class OfflineSession:
     def cancel_task(self, task_id: int) -> None:
         self._session.cancel_task(task_id=task_id)
         self._invalidate_comparison_cache()
+
+    def reallocate_now(self) -> AllocationResult:
+        result = self._session.reallocate_offline()
+        ctx = self._session._capture_user_action_context()
+        self._session._record_user_action("offline_reallocate", {}, ctx)
+        self._invalidate_comparison_cache()
+        return result
+
+    def has_pending_reallocation(self) -> bool:
+        return self._session.offline_reallocation_pending()
 
     def result(self) -> AllocationResult:
         return self._session.result()

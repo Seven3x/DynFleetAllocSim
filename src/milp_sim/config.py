@@ -54,6 +54,9 @@ class SimulationConfig:
     bid_verification_enable_initial_turn_buffer: bool = False
     # When False, bid verification only rejects infeasible paths (not cost-gap underestimation).
     bid_verification_reject_on_cost_gap: bool = True
+    # When True, bidding directly uses verification-style corrected cost (c_tilde)
+    # as c_hat, while still allowing verification stage to be disabled.
+    bid_use_verification_cost_estimate: bool = False
 
     astar_resolution: float = 1.0
     astar_connect_diagonal: bool = True

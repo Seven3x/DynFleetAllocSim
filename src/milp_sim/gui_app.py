@@ -276,6 +276,7 @@ class _BaseGuiApp:
         if self.enable_offline_tools:
             ttk.Button(top, text="Reset + Replay Last Ops", command=self._on_reset_replay).pack(fill="x", pady=3)
             ttk.Button(top, text="Undo Last Action", command=self._on_undo).pack(fill="x", pady=3)
+            ttk.Button(top, text="Re-auction Now", command=self._on_reallocate_offline).pack(fill="x", pady=3)
         ttk.Button(top, text="Save Snapshot", command=self._on_save_snapshot).pack(fill="x", pady=3)
         ttk.Button(top, text="Export Logs", command=self._on_export_logs).pack(fill="x", pady=3)
 
@@ -384,7 +385,7 @@ class _BaseGuiApp:
         )
         ttk.Button(
             random_frame,
-            text="Add Random + Replan" if self.enable_online_runtime else "Add Random + Re-auction",
+            text="Add Random + Replan" if self.enable_online_runtime else "Add Random Task",
             command=self._on_add_random,
         ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         random_frame.columnconfigure(1, weight=1)
@@ -398,7 +399,7 @@ class _BaseGuiApp:
         )
         ttk.Button(
             cancel_frame,
-            text="Cancel + Replan" if self.enable_online_runtime else "Cancel + Re-auction",
+            text="Cancel + Replan" if self.enable_online_runtime else "Cancel Task",
             command=self._on_cancel_task,
         ).grid(
             row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0)
@@ -935,6 +936,27 @@ class _BaseGuiApp:
         except Exception as exc:
             messagebox.showerror("Export Error", str(exc))
 
+    def _has_pending_offline_reallocation(self) -> bool:
+        checker = getattr(self.session, "has_pending_reallocation", None)
+        return bool(callable(checker) and checker())
+
+    def _on_reallocate_offline(self) -> None:
+        if self.enable_online_runtime:
+            return
+        try:
+            action = getattr(self.session, "reallocate_now", None)
+            if not callable(action):
+                raise RuntimeError("offline session does not support manual re-auction")
+            result = action()
+            self._refresh_all()
+            self.last_action_var.set("Offline re-auction completed")
+            messagebox.showinfo(
+                "Re-auction Completed",
+                f"System total time: {result.system_total_time:.3f}",
+            )
+        except Exception as exc:
+            messagebox.showerror("Re-auction Error", str(exc))
+
     def _on_start_online(self) -> None:
         try:
             self.session.start_online()
@@ -1002,7 +1024,10 @@ class _BaseGuiApp:
             demand = self._parse_optional_int(self.random_demand_var.get())
             task = self.session.add_random_task(demand=demand)
             self._refresh_all()
-            self.last_action_var.set(f"Random task added: T{task.id}")
+            if not self.enable_online_runtime and self._has_pending_offline_reallocation():
+                self.last_action_var.set(f"Random task added: T{task.id} (pending re-auction)")
+            else:
+                self.last_action_var.set(f"Random task added: T{task.id}")
             messagebox.showinfo(
                 "Random Task Added",
                 f"Added T{task.id} at ({task.position[0]:.2f}, {task.position[1]:.2f}) demand={task.demand}",
@@ -1015,7 +1040,10 @@ class _BaseGuiApp:
             task_id = self._parse_required_int(self.cancel_task_id_var.get(), "task_id")
             self.session.cancel_task(task_id=task_id)
             self._refresh_all()
-            self.last_action_var.set(f"Task canceled: T{task_id}")
+            if not self.enable_online_runtime and self._has_pending_offline_reallocation():
+                self.last_action_var.set(f"Task canceled: T{task_id} (pending re-auction)")
+            else:
+                self.last_action_var.set(f"Task canceled: T{task_id}")
             messagebox.showinfo("Task Canceled", f"Canceled T{task_id}")
         except Exception as exc:
             messagebox.showerror("Cancel Error", str(exc))
@@ -1044,9 +1072,10 @@ class _BaseGuiApp:
                 task = self.session.add_task(x=x, y=y, demand=demand, task_id=task_id)
                 if task_id is not None:
                     self.add_task_id_var.set("")
-                self.last_action_var.set(
-                    f"Task added by click: T{task.id} ({task.position[0]:.2f}, {task.position[1]:.2f})"
-                )
+                label = f"Task added by click: T{task.id} ({task.position[0]:.2f}, {task.position[1]:.2f})"
+                if not self.enable_online_runtime and self._has_pending_offline_reallocation():
+                    label += " (pending re-auction)"
+                self.last_action_var.set(label)
                 self._refresh_all()
             except Exception as exc:
                 messagebox.showerror("Task Click Add Error", str(exc))
@@ -1070,7 +1099,10 @@ class _BaseGuiApp:
                 return
             try:
                 self.session.cancel_task(task_id=task_id)
-                self.last_action_var.set(f"Task deleted by right click: T{task_id}")
+                if not self.enable_online_runtime and self._has_pending_offline_reallocation():
+                    self.last_action_var.set(f"Task deleted by right click: T{task_id} (pending re-auction)")
+                else:
+                    self.last_action_var.set(f"Task deleted by right click: T{task_id}")
                 self._refresh_all()
             except Exception as exc:
                 messagebox.showerror("Task Delete Error", str(exc))
@@ -1137,9 +1169,10 @@ class _BaseGuiApp:
 
         try:
             moved = self.session.move_task(task_id=task_id, x=target[0], y=target[1])
-            self.last_action_var.set(
-                f"Task moved: T{task_id} -> ({moved.position[0]:.2f}, {moved.position[1]:.2f})"
-            )
+            label = f"Task moved: T{task_id} -> ({moved.position[0]:.2f}, {moved.position[1]:.2f})"
+            if not self.enable_online_runtime and self._has_pending_offline_reallocation():
+                label += " (pending re-auction)"
+            self.last_action_var.set(label)
             self._refresh_all()
         except Exception as exc:
             messagebox.showerror("Task Move Error", str(exc))
@@ -1182,11 +1215,17 @@ class _BaseGuiApp:
             self.obstacle_draw_mode = False
             self.obstacle_mode_var.set("OFF")
             self.obstacle_point_count_var.set("0")
-            self.last_action_var.set(f"Obstacle applied (area={polygon.area:.2f})")
+            if not self.enable_online_runtime and self._has_pending_offline_reallocation():
+                self.last_action_var.set(f"Obstacle applied (area={polygon.area:.2f}, pending re-auction)")
+            else:
+                self.last_action_var.set(f"Obstacle applied (area={polygon.area:.2f})")
             self._refresh_all()
             messagebox.showinfo(
                 "Obstacle Added",
-                f"Added obstacle polygon, area={polygon.area:.2f}. Planner rebuilt.",
+                (
+                    f"Added obstacle polygon, area={polygon.area:.2f}. "
+                    + ("Click Re-auction Now to recompute allocation." if not self.enable_online_runtime else "")
+                ),
             )
         except Exception as exc:
             messagebox.showerror("Obstacle Error", str(exc))
@@ -1198,7 +1237,10 @@ class _BaseGuiApp:
                 raise ValueError("no obstacle index selected")
             idx = int(v)
             self.session.remove_obstacle(obstacle_idx=idx)
-            self.last_action_var.set(f"Obstacle removed: idx={idx}")
+            if not self.enable_online_runtime and self._has_pending_offline_reallocation():
+                self.last_action_var.set(f"Obstacle removed: idx={idx} (pending re-auction)")
+            else:
+                self.last_action_var.set(f"Obstacle removed: idx={idx}")
             self._refresh_all()
         except Exception as exc:
             messagebox.showerror("Obstacle Remove Error", str(exc))
