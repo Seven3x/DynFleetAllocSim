@@ -126,6 +126,113 @@ def solve_dubins_word(word: str, alpha: float, beta: float, d: float) -> Optiona
     return solver(alpha, beta, d)
 
 
+_DUBINSMANEUVER_CTRL_WORDS: Dict[str, Tuple[str, ...]] = {
+    "L": ("LSL", "LSR", "LRL"),
+    "LS": ("LSL", "LSR"),
+    "R": ("RSR", "RSL", "RLR"),
+    "RS": ("RSR", "RSL"),
+    "*-L": ("LSL", "RSR", "LSR", "RSL", "LRL"),
+    "*-R": ("LSL", "RSR", "LSR", "RSL", "RLR"),
+    "S": ("LSL", "RSR", "LSR", "RSL"),
+    "*": DUBINS_WORDS,
+}
+
+
+def _dubinsmaneuver_words(ctrl_dir: str) -> Tuple[str, ...]:
+    token = str(ctrl_dir).strip().upper() if ctrl_dir is not None else "*"
+    if not token:
+        token = "*"
+    return _DUBINSMANEUVER_CTRL_WORDS.get(token, DUBINS_WORDS)
+
+
+def _generate_dubinsmaneuver_local_course(
+    params: Tuple[float, float, float],
+    word: str,
+    turn_radius: float,
+) -> List[Point2D]:
+    x = 0.0
+    y = 0.0
+    yaw = 0.0
+    points: List[Point2D] = [(0.0, 0.0)]
+    step = math.radians(6.0)
+
+    for mode, seg_len_norm in zip(word, params):
+        seg_len = abs(seg_len_norm)
+        progressed = 0.0
+        while progressed < max(0.0, seg_len - step):
+            dl = step
+            x += dl * turn_radius * math.cos(yaw)
+            y += dl * turn_radius * math.sin(yaw)
+            if mode == "L":
+                yaw += dl
+            elif mode == "R":
+                yaw -= dl
+            points.append((x, y))
+            progressed += dl
+
+        dl = max(0.0, seg_len - progressed)
+        x += dl * turn_radius * math.cos(yaw)
+        y += dl * turn_radius * math.sin(yaw)
+        if mode == "L":
+            yaw += dl
+        elif mode == "R":
+            yaw -= dl
+        points.append((x, y))
+
+    return points
+
+
+def _build_dubinsmaneuver2d_candidate(
+    start_pose: Pose2D,
+    goal_pose: Pose2D,
+    turn_radius: float,
+    ctrl_dir: str,
+) -> Optional[Tuple[str, Tuple[float, float, float], List[Point2D]]]:
+    sx, sy, syaw = start_pose
+    gx, gy, gyaw = goal_pose
+    dx = gx - sx
+    dy = gy - sy
+
+    radius = max(float(turn_radius), 1e-9)
+    d = math.hypot(dx, dy) / radius
+    theta = _mod2pi(math.atan2(dy, dx))
+    alpha = _mod2pi(syaw - theta)
+    beta = _mod2pi(gyaw - theta)
+
+    best_word: Optional[str] = None
+    best_params: Optional[Tuple[float, float, float]] = None
+    best_cost = float("inf")
+    for word in _dubinsmaneuver_words(ctrl_dir):
+        out = solve_dubins_word(word, alpha=alpha, beta=beta, d=d)
+        if out is None:
+            continue
+        t, p, q = out
+        cost = radius * (abs(t) + abs(p) + abs(q))
+        if cost < best_cost:
+            best_cost = cost
+            best_word = word
+            best_params = (t, p, q)
+
+    if best_word is None or best_params is None:
+        return None
+
+    local_points = _generate_dubinsmaneuver_local_course(best_params, best_word, radius)
+    c = math.cos(syaw)
+    s = math.sin(syaw)
+    global_points: List[Point2D] = []
+    for lx, ly in local_points:
+        gx = c * lx - s * ly + sx
+        gy = s * lx + c * ly + sy
+        global_points.append((gx, gy))
+
+    points = _dedupe_points(global_points)
+    if len(points) < 2:
+        return None
+    points[0] = (float(sx), float(sy))
+    points[-1] = (float(goal_pose[0]), float(goal_pose[1]))
+    return best_word, best_params, points
+
+
 def _build_shortest_dubins_local(
     start_pose: Pose2D,
     goal_pose: Pose2D,
@@ -490,6 +597,7 @@ def build_rsplan_connector(
 
 def _try_dubins_connector(
     *,
+    cfg,
     start_pose: Pose2D,
     goal_pose: Pose2D,
     turn_radius: float,
@@ -497,6 +605,19 @@ def _try_dubins_connector(
     world: WorldMap,
     margin: float,
 ) -> Tuple[List[Point2D], float, str]:
+    if bool(getattr(cfg, "prioritize_dubinsmaneuver2d", True)):
+        ctrl_dir = str(getattr(cfg, "dubinsmaneuver_ctrl_dir", "*"))
+        legacy_candidate = _build_dubinsmaneuver2d_candidate(
+            start_pose=start_pose,
+            goal_pose=goal_pose,
+            turn_radius=turn_radius,
+            ctrl_dir=ctrl_dir,
+        )
+        if legacy_candidate is not None:
+            _, _, legacy_points = legacy_candidate
+            if _polyline_collision_free(legacy_points, world=world, margin=margin):
+                return legacy_points, _polyline_length(legacy_points), "connector_dubinsmaneuver2d_success"
+
     dubins_sol = _build_shortest_dubins_local(start_pose=start_pose, goal_pose=goal_pose, turn_radius=turn_radius)
     if dubins_sol is not None:
         word, params = dubins_sol
@@ -640,6 +761,7 @@ def build_segment_connector_path(
     bbox_padding = float(getattr(cfg, "connector_local_bbox_padding", 4.0))
     allow_reverse = bool(getattr(cfg, "hybrid_astar_allow_reverse", False))
     internal_position_only = bool(getattr(cfg, "connector_internal_waypoints_position_only", True))
+    prefer_legacy_dubins = bool(getattr(cfg, "prioritize_dubinsmaneuver2d", True))
     plain_astar_ok = bool(getattr(cfg, "connector_use_plain_astar_fallback", True)) and bool(
         getattr(cfg, "dubins_fallback_to_astar", True)
     )
@@ -698,6 +820,33 @@ def build_segment_connector_path(
                     debug_parts=debug_parts + [tag],
                 )
             event_counts["connector_heading_reject" if tag == "connector_heading_reject" else "connector_collision_reject"] += 1
+
+        if prefer_legacy_dubins and bool(getattr(cfg, "connector_use_dubins", True)):
+            points, length, tag = _try_dubins_connector(
+                cfg=cfg,
+                start_pose=start_pose,
+                goal_pose=goal_pose,
+                turn_radius=turn_radius,
+                sample_step=float(getattr(cfg, "dubins_sample_step", 0.5)),
+                world=world,
+                margin=collision_margin,
+            )
+            if points and math.isfinite(length):
+                if _connector_detour_too_large(candidate_length=length, reference_length=reference_length, cfg=cfg):
+                    event_counts["connector_heading_reject"] += 1
+                    debug_parts.append("connector_dubins_detour_reject")
+                else:
+                    event_counts["connector_dubins_success"] += 1
+                    success_counts["dubins_like"] += 1
+                    return points, length, _finalize_connector_meta(
+                        points=points,
+                        length=length,
+                        success_counts=success_counts,
+                        event_counts=event_counts,
+                        plain_astar_count=0,
+                        debug_parts=debug_parts + [tag],
+                    )
+            event_counts["connector_collision_reject"] += 1
 
         rsplan_failed = False
         if allow_reverse and use_rsplan_connector:
@@ -771,8 +920,9 @@ def build_segment_connector_path(
             if getattr(diag, "reason", "") == "collision_on_connector":
                 event_counts["connector_collision_reject"] += 1
 
-        if use_custom_connector and bool(getattr(cfg, "connector_use_dubins", True)):
+        if use_custom_connector and bool(getattr(cfg, "connector_use_dubins", True)) and (not prefer_legacy_dubins):
             points, length, tag = _try_dubins_connector(
+                cfg=cfg,
                 start_pose=start_pose,
                 goal_pose=goal_pose,
                 turn_radius=turn_radius,
@@ -851,6 +1001,35 @@ def build_segment_connector_path(
                 debug_parts.append(f"span{idx}:{tag}")
             else:
                 event_counts["connector_heading_reject" if tag == "connector_heading_reject" else "connector_collision_reject"] += 1
+
+        if (
+            (not accepted_points)
+            and (not span_position_only)
+            and prefer_legacy_dubins
+            and bool(getattr(cfg, "connector_use_dubins", True))
+        ):
+            points, length, tag = _try_dubins_connector(
+                cfg=cfg,
+                start_pose=current_pose,
+                goal_pose=span_goal,
+                turn_radius=turn_radius,
+                sample_step=float(getattr(cfg, "dubins_sample_step", 0.5)),
+                world=world,
+                margin=collision_margin,
+            )
+            if points and math.isfinite(length):
+                if _connector_detour_too_large(candidate_length=length, reference_length=span_reference_length, cfg=cfg):
+                    event_counts["connector_heading_reject"] += 1
+                    debug_parts.append(f"span{idx}:connector_dubins_detour_reject")
+                else:
+                    accepted_points = points
+                    accepted_length = length
+                    accepted_heading = span_goal[2]
+                    success_counts["dubins_like"] += 1
+                    event_counts["connector_dubins_success"] += 1
+                    debug_parts.append(f"span{idx}:{tag}")
+            else:
+                event_counts["connector_collision_reject"] += 1
 
         rsplan_failed = False
         if (
@@ -952,8 +1131,10 @@ def build_segment_connector_path(
             and (not span_position_only)
             and use_custom_connector
             and bool(getattr(cfg, "connector_use_dubins", True))
+            and (not prefer_legacy_dubins)
         ):
             points, length, tag = _try_dubins_connector(
+                cfg=cfg,
                 start_pose=current_pose,
                 goal_pose=span_goal,
                 turn_radius=turn_radius,
@@ -1877,6 +2058,49 @@ def build_dubins_hybrid_path(
         debug_trace = "direct:start"
         if legacy_debug_prefix:
             debug_trace = f"{legacy_debug_prefix};{debug_trace}"
+        if bool(getattr(cfg, "prioritize_dubinsmaneuver2d", True)):
+            ctrl_dir = str(getattr(cfg, "dubinsmaneuver_ctrl_dir", "*"))
+            legacy_candidate = _build_dubinsmaneuver2d_candidate(
+                start_pose=start_pose,
+                goal_pose=goal_pose,
+                turn_radius=turn_radius,
+                ctrl_dir=ctrl_dir,
+            )
+            if legacy_candidate is not None:
+                legacy_word, _, legacy_points = legacy_candidate
+                if force_mode or _polyline_collision_free(
+                    legacy_points,
+                    world=world,
+                    margin=cfg.dubins_collision_margin,
+                ):
+                    debug_trace = (
+                        f"{legacy_debug_prefix};direct:dubinsmaneuver2d:{legacy_word}:ok"
+                        if legacy_debug_prefix
+                        else f"direct:dubinsmaneuver2d:{legacy_word}:ok"
+                    )
+                    dubins_len = _polyline_length(legacy_points)
+                    straight_len = math.hypot(goal_pose[0] - start_pose[0], goal_pose[1] - start_pose[1])
+                    added_curve = max(0.0, dubins_len - straight_len)
+                    ratio = 0.0 if dubins_len <= 1e-9 else max(0.0, min(1.0, added_curve / dubins_len))
+                    return _finalize_legacy_return(
+                        legacy_points,
+                        dubins_len,
+                        DubinsHybridMeta(
+                            used_fallback=False,
+                            fallback_segments=0,
+                            dubins_segments=1,
+                            sample_count=len(legacy_points),
+                            dubins_ratio=ratio,
+                            debug_trace=debug_trace,
+                        ),
+                    )
+                direct_reason = "direct_collision"
+                debug_trace = (
+                    f"{legacy_debug_prefix};direct:dubinsmaneuver2d:{legacy_word}:collision"
+                    if legacy_debug_prefix
+                    else f"direct:dubinsmaneuver2d:{legacy_word}:collision"
+                )
+
         dubins_sol = _build_shortest_dubins_local(start_pose=start_pose, goal_pose=goal_pose, turn_radius=turn_radius)
         if dubins_sol is not None:
             word, params = dubins_sol

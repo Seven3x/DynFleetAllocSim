@@ -33,8 +33,8 @@ class SimulationConfig:
 
     vehicle_speed_min: float = 3.5
     vehicle_speed_max: float = 6.0
-    vehicle_omega_min: float = 3.5
-    vehicle_omega_max: float = 6.5
+    vehicle_omega_min: float = 45.0
+    vehicle_omega_max: float = 48.5
     vehicle_capacity_min: int = 14
     vehicle_capacity_max: int = 20
 
@@ -44,12 +44,12 @@ class SimulationConfig:
     lambda_psi: float = 0.05
     lambda_rho: float = 0.20
     corridor_width: float = 8.0
-    verify_epsilon: float = 0.25
+    verify_epsilon: float = 0.4
     enable_bid_verification: bool = True
     # Bid verification runs in lightweight mode by default so ranking is stable
     # and less sensitive to local trajectory beautification details.
     bid_verification_use_next_task_heading: bool = False
-    bid_verification_use_dubins_hybrid: bool = True
+    bid_verification_use_dubins_hybrid: bool = False
     bid_verification_enable_connector_first: bool = False
     bid_verification_enable_initial_turn_buffer: bool = False
     # When False, bid verification only rejects infeasible paths (not cost-gap underestimation).
@@ -122,6 +122,12 @@ class SimulationConfig:
     connector_use_straight_first: bool = True
     connector_use_reeds_shepp: bool = True
     connector_use_dubins: bool = True
+    # Prefer the legacy-style Dubins maneuver solver (mirrors dubinsmaneuver2d.py)
+    # before other non-straight local connector methods.
+    prioritize_dubinsmaneuver2d: bool = True
+    # Candidate family filter used by the legacy-style Dubins maneuver solver.
+    # Supported values: "*", "L", "LS", "R", "RS", "*-L", "*-R", "S".
+    dubinsmaneuver_ctrl_dir: str = "*"
     connector_use_hybrid_local_rescue: bool = True
     connector_use_plain_astar_fallback: bool = True
     # Prefer rsplan Reeds-Shepp connector for terminal pose-to-pose local links.
@@ -172,7 +178,7 @@ class SimulationConfig:
     # Number of heading samples in the soft window (>=1).
     goal_heading_num_samples: int = 7
     # Candidate score penalty on initial heading change (rad-weighted by turn radius).
-    goal_heading_turn_penalty: float = 0.35
+    goal_heading_turn_penalty: float = 0.6
     # Hard limit on initial heading change when selecting goal-heading candidates.
     goal_heading_max_dpsi_rad: float = 1.18
     # Small slack above dpsi hard limit to avoid rejecting near-threshold good candidates.

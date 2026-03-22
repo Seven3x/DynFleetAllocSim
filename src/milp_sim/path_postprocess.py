@@ -41,6 +41,90 @@ def _dedupe_points(points: List[Point2D]) -> List[Point2D]:
     return out
 
 
+def _unit(vec: Point2D) -> Point2D | None:
+    norm = math.hypot(vec[0], vec[1])
+    if norm <= 1e-9:
+        return None
+    return (vec[0] / norm, vec[1] / norm)
+
+
+def _circle_center_from_three_points(p1: Point2D, p2: Point2D, p3: Point2D) -> tuple[Point2D, float] | None:
+    x1, y1 = p1
+    x2, y2 = p2
+    x3, y3 = p3
+
+    det = 2.0 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2))
+    if abs(det) <= 1e-9:
+        return None
+
+    s1 = x1 * x1 + y1 * y1
+    s2 = x2 * x2 + y2 * y2
+    s3 = x3 * x3 + y3 * y3
+
+    ux = (s1 * (y2 - y3) + s2 * (y3 - y1) + s3 * (y1 - y2)) / det
+    uy = (s1 * (x3 - x2) + s2 * (x1 - x3) + s3 * (x2 - x1)) / det
+    r = math.hypot(x1 - ux, y1 - uy)
+    if not math.isfinite(r) or r <= 1e-9:
+        return None
+    return (ux, uy), r
+
+
+def _ccw_delta(a: float, b: float) -> float:
+    return (b - a) % (2.0 * math.pi)
+
+
+def _sample_arc(
+    center: Point2D,
+    radius: float,
+    a0: float,
+    a1: float,
+    *,
+    ccw: bool,
+    max_step: float,
+) -> List[Point2D]:
+    total = _ccw_delta(a0, a1) if ccw else _ccw_delta(a1, a0)
+    arc_len = radius * total
+    n = max(1, int(math.ceil(arc_len / max(max_step, 1e-3))))
+    out: List[Point2D] = []
+    for k in range(n + 1):
+        t = k / n
+        ang = a0 + total * t if ccw else a0 - total * t
+        out.append((center[0] + radius * math.cos(ang), center[1] + radius * math.sin(ang)))
+    return out
+
+
+def _sample_arc_through_waypoint(
+    start: Point2D,
+    waypoint: Point2D,
+    end: Point2D,
+    *,
+    max_step: float,
+) -> List[Point2D] | None:
+    circle = _circle_center_from_three_points(start, waypoint, end)
+    if circle is None:
+        return None
+    center, radius = circle
+    a_start = math.atan2(start[1] - center[1], start[0] - center[0])
+    a_mid = math.atan2(waypoint[1] - center[1], waypoint[0] - center[0])
+    a_end = math.atan2(end[1] - center[1], end[0] - center[0])
+
+    ccw_ok = _ccw_delta(a_start, a_mid) <= _ccw_delta(a_start, a_end) + 1e-9
+    cw_ok = _ccw_delta(a_end, a_mid) <= _ccw_delta(a_end, a_start) + 1e-9
+    if not ccw_ok and not cw_ok:
+        return None
+
+    if ccw_ok and (not cw_ok or _ccw_delta(a_start, a_end) <= _ccw_delta(a_end, a_start)):
+        first = _sample_arc(center, radius, a_start, a_mid, ccw=True, max_step=max_step)
+        second = _sample_arc(center, radius, a_mid, a_end, ccw=True, max_step=max_step)
+    else:
+        first = _sample_arc(center, radius, a_start, a_mid, ccw=False, max_step=max_step)
+        second = _sample_arc(center, radius, a_mid, a_end, ccw=False, max_step=max_step)
+
+    if not first or not second:
+        return None
+    return _dedupe_points(first + second[1:])
+
+
 def segment_is_clear(world: WorldMap, start: Point2D, end: Point2D, margin: float) -> bool:
     return polyline_is_clear(world, [start, end], margin=margin)
 
@@ -251,6 +335,80 @@ def maybe_buffer_initial_turn_path(
         return full_path, full_length
 
     return path, length
+
+
+def smooth_task_joint_path(
+    world: WorldMap,
+    cfg: SimulationConfig,
+    points: List[Point2D],
+    task_waypoint_indices: List[int],
+    *,
+    turn_radius: float,
+) -> List[Point2D]:
+    out = _dedupe_points(points)
+    if len(out) < 3 or not task_waypoint_indices:
+        return out
+
+    max_step = max(
+        0.05,
+        float(
+            getattr(
+                cfg,
+                "online_path_sample_step",
+                min(0.25, float(getattr(cfg, "dubins_sample_step", 0.5))),
+            )
+        ),
+    )
+    clearance = max(
+        float(getattr(cfg, "dubins_collision_margin", 0.0)),
+        float(getattr(cfg, "vehicle_radius", 0.0)) + float(getattr(cfg, "safety_margin", 0.0)),
+    )
+    # Keep this local and conservative: smooth only meaningful corners and never clip obstacles.
+    min_turn = math.radians(20.0)
+    base_cut = max(0.4, min(2.0, 0.9 * max(turn_radius, 1e-6)))
+
+    for idx in sorted(set(task_waypoint_indices), reverse=True):
+        if idx <= 0 or idx >= len(out) - 1:
+            continue
+
+        prev_pt = out[idx - 1]
+        cur_pt = out[idx]
+        next_pt = out[idx + 1]
+
+        in_vec = (cur_pt[0] - prev_pt[0], cur_pt[1] - prev_pt[1])
+        out_vec = (next_pt[0] - cur_pt[0], next_pt[1] - cur_pt[1])
+        in_len = math.hypot(in_vec[0], in_vec[1])
+        out_len = math.hypot(out_vec[0], out_vec[1])
+        if in_len <= 1e-6 or out_len <= 1e-6:
+            continue
+
+        in_dir = _unit(in_vec)
+        out_dir = _unit(out_vec)
+        if in_dir is None or out_dir is None:
+            continue
+
+        dot = max(-1.0, min(1.0, in_dir[0] * out_dir[0] + in_dir[1] * out_dir[1]))
+        turn = math.acos(dot)
+        if turn < min_turn:
+            continue
+
+        cut = min(base_cut, 0.45 * in_len, 0.45 * out_len)
+        if cut <= max_step:
+            continue
+
+        arc_start = (cur_pt[0] - in_dir[0] * cut, cur_pt[1] - in_dir[1] * cut)
+        arc_end = (cur_pt[0] + out_dir[0] * cut, cur_pt[1] + out_dir[1] * cut)
+        arc_pts = _sample_arc_through_waypoint(arc_start, cur_pt, arc_end, max_step=max_step)
+        if arc_pts is None or len(arc_pts) < 3:
+            continue
+
+        local_candidate = [prev_pt] + arc_pts + [next_pt]
+        if not polyline_is_clear(world, local_candidate, margin=clearance):
+            continue
+
+        out = out[: idx - 1] + local_candidate + out[idx + 2 :]
+
+    return _dedupe_points(out)
 
 
 def resample_path(points: List[Point2D], max_step: float) -> List[Point2D]:

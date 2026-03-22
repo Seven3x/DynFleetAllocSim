@@ -360,6 +360,48 @@ class TestDubinsPath(unittest.TestCase):
         self.assertEqual(meta.connector_type, "rsplan")
         self.assertIn("connector_rsplan_success", meta.debug_trace)
 
+    def test_connector_first_prioritizes_dubinsmaneuver2d_before_rsplan(self) -> None:
+        cfg = replace(
+            DEFAULT_CONFIG,
+            use_dubins_hybrid=True,
+            use_hybrid_astar=True,
+            enable_connector_first_planner=True,
+            connector_use_straight_first=False,
+            connector_use_reeds_shepp=False,
+            connector_use_dubins=True,
+            connector_use_hybrid_local_rescue=False,
+            connector_use_plain_astar_fallback=False,
+            hybrid_astar_allow_reverse=True,
+            hybrid_astar_fallback_to_legacy=False,
+            use_rsplan_connector=True,
+            prioritize_dubinsmaneuver2d=True,
+        )
+        start = (12.0, 14.0, 0.0)
+        goal = (28.0, 18.0, 0.2)
+        fake_path = [(12.0, 14.0), (20.0, 16.0), (28.0, 18.0)]
+
+        with patch(
+            "milp_sim.dubins_path._try_dubins_connector",
+            return_value=(fake_path, 16.5, "connector_dubinsmaneuver2d_success"),
+        ) as mock_dubins, patch(
+            "milp_sim.dubins_path.build_rsplan_connector",
+            side_effect=AssertionError("rsplan should not be used before prioritized dubins"),
+        ):
+            points, length, meta = build_dubins_hybrid_path(
+                world=self.world,
+                cfg=cfg,
+                start_pose=start,
+                goal_pose=goal,
+                astar_planner=self.planner,
+                turn_radius=8.0,
+            )
+
+        self.assertTrue(mock_dubins.called)
+        self.assertEqual(points, fake_path)
+        self.assertAlmostEqual(length, 16.5, places=6)
+        self.assertEqual(meta.connector_type, "dubins_like")
+        self.assertIn("connector_dubinsmaneuver2d_success", meta.debug_trace)
+
     def test_connector_first_prefers_straight_in_open_space(self) -> None:
         cfg = replace(
             DEFAULT_CONFIG,

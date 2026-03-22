@@ -16,7 +16,7 @@ from .entities import Task, Vehicle
 from .hybrid_heading_selector import select_best_heading_path
 from .map_utils import WorldMap
 from .neighbor_coordination import CoordinationLog, TaskRecord, build_neighbors, run_coordination
-from .path_postprocess import maybe_buffer_initial_turn_path, resample_path
+from .path_postprocess import maybe_buffer_initial_turn_path, resample_path, smooth_task_joint_path
 from .planner_astar import AStarPlanner
 from .verification import VerificationResult, verify_bid
 
@@ -736,6 +736,7 @@ class AllocationEngine:
             v.route_length = 0.0
             cur = v.start_pos
             cur_heading = v.heading
+            task_waypoint_indices: List[int] = []
 
             for idx, tid in enumerate(v.task_sequence):
                 task = self.tasks_by_id[tid]
@@ -827,11 +828,21 @@ class AllocationEngine:
 
                 if len(path) > 1:
                     v.route_points.extend(path[1:])
+                task_waypoint_indices.append(len(v.route_points) - 1)
                 v.route_length += length
                 cur = task.position
                 # Keep segment handoff consistent with the actual geometric tail direction
                 # to avoid visual U-turn spikes at task joints.
                 cur_heading = _terminal_heading_from_path(path, best_goal_heading)
+
+            if len(v.route_points) >= 3 and len(task_waypoint_indices) >= 2:
+                v.route_points = smooth_task_joint_path(
+                    world=self.world,
+                    cfg=self.cfg,
+                    points=v.route_points,
+                    task_waypoint_indices=task_waypoint_indices,
+                    turn_radius=v.speed / max(v.max_omega, 1e-6),
+                )
 
 
 def run_static_auction(

@@ -16,9 +16,9 @@
     ]
   },
   "vehicles": [
-    {"id": 0, "start": [8.0, 8.0], "heading": 0.0, "speed": 5.0, "max_omega": 1.0, "capacity": 20},
-    {"id": 1, "start": [8.0, 22.0], "heading": 0.0, "speed": 5.0, "max_omega": 1.0, "capacity": 20},
-    {"id": 2, "start": [8.0, 34.0], "heading": 0.0, "speed": 5.0, "max_omega": 1.0, "capacity": 20}
+    {"id": 0, "start": [8.0, 8.0], "heading": 0.0, "speed": 5.0, "max_omega": 3.0, "capacity": 20},
+    {"id": 1, "start": [8.0, 22.0], "heading": 0.0, "speed": 5.0, "max_omega": 3.0, "capacity": 20},
+    {"id": 2, "start": [8.0, 34.0], "heading": 0.0, "speed": 5.0, "max_omega": 3.0, "capacity": 20}
   ],
   "tasks": [
     {"id": 0, "position": [20.0, 82.0], "demand": 1},

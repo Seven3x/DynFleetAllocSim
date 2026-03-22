@@ -69,6 +69,22 @@ PYTHONPATH=src python -m milp_sim.main --interactive
 PYTHONPATH=src python -m milp_sim.main --gui
 ```
 
+### 3.3.1 离线校对差异增强场景（5 车 50 任务）
+新增场景文件：`examples/scenario_offline_5v50_corridor.json`
+
+特点：
+- 5 台车辆
+- 50 个任务点
+- 9 个蛇形通道障碍（更容易放大快速估计与高精度校对差异）
+
+运行方式：
+
+```bash
+./run_offline_gui.sh --scenario-file examples/scenario_offline_5v50_corridor.json
+# 或
+PYTHONPATH=src python -m milp_sim.main --gui --scenario-file examples/scenario_offline_5v50_corridor.json
+```
+
 ### 3.4 前缀路程代价对比分配实验
 该实验固定一个手工场景，对比两种拍卖代价：
 - `incremental_only`：只看当前末端到候选任务的 A* 路径代价
