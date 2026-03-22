@@ -1,5 +1,6 @@
 import math
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from shapely.geometry import Point
@@ -104,6 +105,39 @@ class TestOnlineRuntime(unittest.TestCase):
         self.assertGreater(self.session.sim_time, 0.0)
         moved = any(before[k] != after[k] for k in before)
         self.assertTrue(moved)
+
+    def test_zero_prefix_bid_starts_from_active_task_endpoint_when_available(self) -> None:
+        self.session.start_online()
+        assert self.session.engine is not None
+
+        engine = self.session.engine
+        vehicle = engine.vehicles[0]
+        self.assertIsNotNone(vehicle.active_task_id)
+        assert vehicle.active_task_id is not None
+
+        active_task = engine.tasks_by_id[vehicle.active_task_id]
+        active_task.status = "in_progress"
+        vehicle.current_pos = (active_task.position[0] - 5.0, active_task.position[1] - 5.0)
+        vehicle.current_heading = -0.75
+        vehicle.active_goal_heading = 1.23
+
+        candidate = Task(
+            id=-999,
+            position=(active_task.position[0] + 8.0, active_task.position[1] + 3.0),
+            demand=1,
+            status="withdrawn",
+        )
+
+        with patch(
+            "milp_sim.auction_core.fast_cost_estimate_from_state",
+            return_value=SimpleNamespace(estimated_time=7.0),
+        ) as mocked:
+            cost = engine._estimate_task_cost(vehicle=vehicle, task=candidate)
+
+        self.assertAlmostEqual(cost, 7.0)
+        kwargs = mocked.call_args.kwargs
+        self.assertEqual(kwargs["current_pos"], active_task.position)
+        self.assertAlmostEqual(kwargs["current_heading"], 1.23)
 
     def test_in_progress_and_completed_states_exist(self) -> None:
         self.session.start_online()

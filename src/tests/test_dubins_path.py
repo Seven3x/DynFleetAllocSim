@@ -631,6 +631,48 @@ class TestDubinsPath(unittest.TestCase):
         self.assertEqual(result.dubins_fallback_details, "")
         self.assertLess(result.c_tilde, 25.0)
 
+    def test_verify_bid_zero_prefix_starts_from_active_task_endpoint(self) -> None:
+        cfg = replace(DEFAULT_CONFIG, committed_prefix_time_weight=0.0)
+        active_task = Task(id=10, position=(30.0, 40.0), demand=1, status="in_progress")
+        candidate_task = Task(id=11, position=(80.0, 82.0), demand=1, status="withdrawn")
+        vehicle = Vehicle(
+            id=0,
+            start_pos=(12.0, 14.0),
+            heading=0.0,
+            speed=5.0,
+            max_omega=0.5,
+            capacity=10,
+            remaining_capacity=10,
+            current_pos=(12.0, 14.0),
+            current_heading=0.2,
+            active_task_id=active_task.id,
+            active_goal_heading=0.9,
+        )
+        segment_calls = []
+
+        def fake_segment_corrected_time(**kwargs):
+            segment_calls.append((kwargs["start_pos"], kwargs["start_heading"], kwargs["task"].id))
+            return 5.0, 2.0, 1.1, None, ""
+
+        with patch("milp_sim.verification._segment_corrected_time", side_effect=fake_segment_corrected_time):
+            result = verify_bid(
+                vehicle=vehicle,
+                task=candidate_task,
+                c_hat=2.0,
+                cfg=cfg,
+                planner=self.planner,
+                tasks_by_id={
+                    active_task.id: active_task,
+                    candidate_task.id: candidate_task,
+                },
+            )
+
+        self.assertTrue(result.passed)
+        self.assertEqual(len(segment_calls), 1)
+        self.assertEqual(segment_calls[0][0], active_task.position)
+        self.assertAlmostEqual(segment_calls[0][1], 0.9)
+        self.assertEqual(segment_calls[0][2], candidate_task.id)
+
     def test_seeded_session_routes_do_not_cross_obstacles(self) -> None:
         cfg = replace(
             DEFAULT_CONFIG,

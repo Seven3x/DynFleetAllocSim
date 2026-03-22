@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -21,6 +22,15 @@ from .verification import VerificationResult, verify_bid
 
 
 AUCTIONABLE_STATES = {"unassigned", "withdrawn"}
+
+
+def _terminal_heading_from_path(path: List[Tuple[float, float]], fallback: float) -> float:
+    for i in range(len(path) - 1, 0, -1):
+        dx = path[i][0] - path[i - 1][0]
+        dy = path[i][1] - path[i - 1][1]
+        if abs(dx) > 1e-9 or abs(dy) > 1e-9:
+            return math.atan2(dy, dx)
+    return fallback
 
 
 @dataclass
@@ -371,12 +381,30 @@ class AllocationEngine:
 
         return total_time, frontier_pos, frontier_heading
 
+    def _estimate_suffix_only_frontier(self, vehicle: Vehicle) -> Tuple[Tuple[float, float], float]:
+        frontier_pos = vehicle.current_pos
+        frontier_heading = vehicle.current_heading
+
+        active_tid = vehicle.active_task_id
+        if active_tid is None:
+            return frontier_pos, frontier_heading
+
+        active_task = self.tasks_by_id.get(active_tid)
+        if active_task is None or active_task.status not in {"locked", "in_progress"}:
+            return frontier_pos, frontier_heading
+
+        frontier_pos = active_task.position
+        if vehicle.active_goal_heading is not None and math.isfinite(float(vehicle.active_goal_heading)):
+            frontier_heading = float(vehicle.active_goal_heading)
+        else:
+            frontier_heading = heading_to_point(vehicle.current_pos, active_task.position)
+        return frontier_pos, frontier_heading
+
     def _estimate_task_cost(self, vehicle: Vehicle, task: Task) -> float:
         prefix_weight = max(0.0, float(getattr(self.cfg, "committed_prefix_time_weight", 1.0)))
         if prefix_weight <= 1e-12:
             prefix_time = 0.0
-            frontier_pos = vehicle.current_pos
-            frontier_heading = vehicle.current_heading
+            frontier_pos, frontier_heading = self._estimate_suffix_only_frontier(vehicle)
         else:
             prefix_time, frontier_pos, frontier_heading = self._estimate_committed_prefix_time_and_frontier(
                 vehicle=vehicle,
@@ -801,7 +829,9 @@ class AllocationEngine:
                     v.route_points.extend(path[1:])
                 v.route_length += length
                 cur = task.position
-                cur_heading = best_goal_heading
+                # Keep segment handoff consistent with the actual geometric tail direction
+                # to avoid visual U-turn spikes at task joints.
+                cur_heading = _terminal_heading_from_path(path, best_goal_heading)
 
 
 def run_static_auction(

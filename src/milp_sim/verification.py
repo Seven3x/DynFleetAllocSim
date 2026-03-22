@@ -74,6 +74,32 @@ def _committed_prefix_task_ids(
     return out
 
 
+def _suffix_only_start_state(
+    vehicle: Vehicle,
+    tasks_by_id: Dict[int, Task] | None,
+) -> Tuple[Tuple[float, float], float]:
+    cur_pos = vehicle.current_pos
+    cur_heading = vehicle.current_heading
+
+    if tasks_by_id is None:
+        return cur_pos, cur_heading
+
+    active_tid = vehicle.active_task_id
+    if active_tid is None:
+        return cur_pos, cur_heading
+
+    active_task = tasks_by_id.get(active_tid)
+    if active_task is None or active_task.status not in {"locked", "in_progress"}:
+        return cur_pos, cur_heading
+
+    cur_pos = active_task.position
+    if vehicle.active_goal_heading is not None and math.isfinite(float(vehicle.active_goal_heading)):
+        cur_heading = float(vehicle.active_goal_heading)
+    else:
+        cur_heading = heading_to_point(vehicle.current_pos, active_task.position)
+    return cur_pos, cur_heading
+
+
 def _segment_corrected_time(
     vehicle: Vehicle,
     task: Task,
@@ -252,11 +278,14 @@ def verify_bid(
 ) -> VerificationResult:
     path_length_total = 0.0
     c_tilde_total = 0.0
-    cur_pos = vehicle.current_pos
-    cur_heading = vehicle.current_heading
     fallback_parts: List[str] = []
     debug_parts: List[str] = []
     prefix_weight = max(0.0, float(getattr(cfg, "committed_prefix_time_weight", 1.0)))
+    if prefix_weight <= 1e-12:
+        cur_pos, cur_heading = _suffix_only_start_state(vehicle=vehicle, tasks_by_id=tasks_by_id)
+    else:
+        cur_pos = vehicle.current_pos
+        cur_heading = vehicle.current_heading
 
     prefix_ids: List[int] = []
     if tasks_by_id is not None and prefix_weight > 1e-12:

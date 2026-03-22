@@ -882,12 +882,22 @@ class SimulationSession:
 
         path[0] = v.current_pos
         path[-1] = task.position
+        terminal_heading = self._terminal_heading_from_path(path, best_goal_heading)
         v.route_points = path
         v.route_length = length
-        v.active_goal_heading = best_goal_heading
+        v.active_goal_heading = terminal_heading
         v.path_cursor = 0
         v.distance_to_next_waypoint = self._distance_to_next_waypoint(v)
         v.is_moving = len(path) >= 2
+
+    @staticmethod
+    def _terminal_heading_from_path(points: list[tuple[float, float]], fallback: float) -> float:
+        for i in range(len(points) - 1, 0, -1):
+            dx = points[i][0] - points[i - 1][0]
+            dy = points[i][1] - points[i - 1][1]
+            if abs(dx) > 1e-9 or abs(dy) > 1e-9:
+                return math.atan2(dy, dx)
+        return fallback
 
     def _remaining_route_points(self, v: Vehicle) -> list[tuple[float, float]]:
         if len(v.route_points) < 2:
