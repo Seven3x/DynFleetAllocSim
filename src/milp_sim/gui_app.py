@@ -81,6 +81,7 @@ class _BaseGuiApp:
         self.comparison_canvas = None
         self.compare_ax_with = None
         self.compare_ax_without = None
+        self.compare_ax_without_verify_cost = None
         self.secondary_ax = None
 
         self._build_layout()
@@ -424,12 +425,14 @@ class _BaseGuiApp:
             self.figure = plt.Figure(figsize=(8, 8), dpi=130)
             self.ax = self.figure.add_subplot(111)
             self.secondary_ax = None
+            self.compare_ax_without_verify_cost = None
             self.figure.subplots_adjust(left=0.05, right=0.985, bottom=0.05, top=0.96)
         else:
-            self.figure = plt.Figure(figsize=(12, 6.4), dpi=130)
-            self.ax = self.figure.add_subplot(121)
-            self.secondary_ax = self.figure.add_subplot(122)
-            self.figure.subplots_adjust(left=0.04, right=0.985, bottom=0.05, top=0.94, wspace=0.08)
+            self.figure = plt.Figure(figsize=(17.2, 6.4), dpi=130)
+            self.ax = self.figure.add_subplot(131)
+            self.secondary_ax = self.figure.add_subplot(132)
+            self.compare_ax_without_verify_cost = self.figure.add_subplot(133)
+            self.figure.subplots_adjust(left=0.03, right=0.99, bottom=0.05, top=0.94, wspace=0.08)
         self.canvas = FigureCanvasTkAgg(self.figure, master=parent)
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
         self.canvas.mpl_connect("button_press_event", self._on_canvas_press)
@@ -458,6 +461,8 @@ class _BaseGuiApp:
         axes = [self.ax]
         if self.secondary_ax is not None:
             axes.append(self.secondary_ax)
+        if self.compare_ax_without_verify_cost is not None:
+            axes.append(self.compare_ax_without_verify_cost)
         return axes
 
     def _event_axis(self, event):
@@ -543,7 +548,11 @@ class _BaseGuiApp:
     def _refresh_map(self) -> None:
         if not self.enable_online_runtime:
             assert self.secondary_ax is not None
-            self.session.draw_comparison_on_axes(self.ax, self.secondary_ax)
+            self.session.draw_comparison_on_axes(
+                self.ax,
+                self.secondary_ax,
+                self.compare_ax_without_verify_cost,
+            )
             axes = self._plot_axes()
             if self.dragging_task_id is not None and self.drag_preview_pos is not None:
                 x, y = self.drag_preview_pos
@@ -727,13 +736,20 @@ class _BaseGuiApp:
         if self.enable_online_runtime or self.comparison_canvas is None:
             return
         try:
-            self.session.draw_comparison_on_axes(self.compare_ax_with, self.compare_ax_without)
+            self.session.draw_comparison_on_axes(
+                self.compare_ax_with,
+                self.compare_ax_without,
+                self.compare_ax_without_verify_cost,
+            )
             self.comparison_canvas.draw_idle()
         except Exception:
             self.compare_ax_with.clear()
             self.compare_ax_without.clear()
             self.compare_ax_with.set_axis_off()
             self.compare_ax_without.set_axis_off()
+            if self.compare_ax_without_verify_cost is not None:
+                self.compare_ax_without_verify_cost.clear()
+                self.compare_ax_without_verify_cost.set_axis_off()
             self.compare_ax_with.text(
                 0.5,
                 0.5,
@@ -754,6 +770,17 @@ class _BaseGuiApp:
                 color="#374151",
                 transform=self.compare_ax_without.transAxes,
             )
+            if self.compare_ax_without_verify_cost is not None:
+                self.compare_ax_without_verify_cost.text(
+                    0.5,
+                    0.5,
+                    "Comparison unavailable",
+                    ha="center",
+                    va="center",
+                    fontsize=10,
+                    color="#374151",
+                    transform=self.compare_ax_without_verify_cost.transAxes,
+                )
             self.comparison_canvas.draw_idle()
 
     def _refresh_all(self) -> None:

@@ -106,6 +106,7 @@ class OfflineComparisonVariant:
 class OfflineComparisonSummary:
     with_verification: OfflineComparisonVariant
     without_verification: OfflineComparisonVariant
+    without_verification_verify_cost: OfflineComparisonVariant
     delta_summary: str
 
 
@@ -2183,7 +2184,7 @@ class OfflineSession:
         self.cfg = cfg
         self._session = SimulationSession(cfg)
         self._comparison_cache: OfflineComparisonSummary | None = None
-        self._comparison_results_cache: tuple[AllocationResult, AllocationResult] | None = None
+        self._comparison_results_cache: tuple[AllocationResult, AllocationResult, AllocationResult] | None = None
 
     @property
     def artifacts(self) -> SimulationArtifacts | None:
@@ -2254,26 +2255,52 @@ class OfflineSession:
         without_result = without_verify.result()
         without_compute_time_s = time.perf_counter() - t0
 
-        self._comparison_results_cache = (with_result, without_result)
+        t0 = time.perf_counter()
+        without_verify_verify_cost = SimulationSession(
+            replace(
+                self.cfg,
+                enable_bid_verification=False,
+                bid_use_verification_cost_estimate=True,
+            )
+        )
+        self._apply_actions_to_session(without_verify_verify_cost, actions)
+        without_verify_verify_cost_result = without_verify_verify_cost.result()
+        without_verify_verify_cost_compute_time_s = time.perf_counter() - t0
+
+        self._comparison_results_cache = (
+            with_result,
+            without_result,
+            without_verify_verify_cost_result,
+        )
         with_variant = self._build_variant("With Verification", with_result, with_compute_time_s)
         without_variant = self._build_variant("Without Verification", without_result, without_compute_time_s)
+        without_verify_verify_cost_variant = self._build_variant(
+            "Without Verification (Verification Cost)",
+            without_verify_verify_cost_result,
+            without_verify_verify_cost_compute_time_s,
+        )
 
         changed: list[str] = []
-        for v_with, v_without in zip(with_result.vehicles, without_result.vehicles):
+        for v_with, v_without in zip(with_result.vehicles, without_verify_verify_cost_result.vehicles):
             if list(v_with.task_sequence) != list(v_without.task_sequence):
                 changed.append(f"V{v_with.id}")
 
-        delta_time = without_variant.system_total_time - with_variant.system_total_time
+        delta_time = without_verify_verify_cost_variant.system_total_time - with_variant.system_total_time
         if changed:
             delta_summary = (
-                f"delta_total_time={delta_time:+.3f}; changed_sequences={','.join(changed)}"
+                f"delta_total_time(with_verify_cost - with_verify)={delta_time:+.3f}; "
+                f"changed_sequences={','.join(changed)}"
             )
         else:
-            delta_summary = f"delta_total_time={delta_time:+.3f}; changed_sequences=(none)"
+            delta_summary = (
+                f"delta_total_time(with_verify_cost - with_verify)={delta_time:+.3f}; "
+                "changed_sequences=(none)"
+            )
 
         return OfflineComparisonSummary(
             with_verification=with_variant,
             without_verification=without_variant,
+            without_verification_verify_cost=without_verify_verify_cost_variant,
             delta_summary=delta_summary,
         )
 
@@ -2284,7 +2311,7 @@ class OfflineSession:
             self._comparison_cache = self._build_comparison_summary()
         return self._comparison_cache
 
-    def comparison_results(self) -> tuple[AllocationResult, AllocationResult]:
+    def comparison_results(self) -> tuple[AllocationResult, AllocationResult, AllocationResult]:
         if self._session.offline_reallocation_pending():
             raise ValueError("offline edits pending; run re-allocation first")
         if self._comparison_results_cache is None:
@@ -2292,7 +2319,7 @@ class OfflineSession:
         assert self._comparison_results_cache is not None
         return self._comparison_results_cache
 
-    def draw_comparison_on_axes(self, ax_with, ax_without) -> None:
+    def draw_comparison_on_axes(self, ax_with, ax_without, ax_without_verify_cost=None) -> None:
         if not bool(getattr(self.cfg, "offline_enable_comparison", False)):
             self._session.draw_on_axis(ax_with, render_state=None)
             ax_without.clear()
@@ -2317,6 +2344,9 @@ class OfflineSession:
                 color="#374151",
                 transform=ax_without.transAxes,
             )
+            if ax_without_verify_cost is not None:
+                ax_without_verify_cost.clear()
+                ax_without_verify_cost.set_axis_off()
             return
 
         if self._session.offline_reallocation_pending():
@@ -2343,9 +2373,12 @@ class OfflineSession:
                 color="#374151",
                 transform=ax_without.transAxes,
             )
+            if ax_without_verify_cost is not None:
+                ax_without_verify_cost.clear()
+                ax_without_verify_cost.set_axis_off()
             return
 
-        with_result, without_result = self.comparison_results()
+        with_result, without_result, without_verify_cost_result = self.comparison_results()
         summary = self.comparison_summary()
 
         draw_final_scene_on_axis(
@@ -2386,13 +2419,37 @@ class OfflineSession:
             show_predicted_next_link=False,
             predicted_future_links=0,
         )
+        if ax_without_verify_cost is not None:
+            draw_final_scene_on_axis(
+                ax=ax_without_verify_cost,
+                world=self.artifacts.world,
+                vehicles=without_verify_cost_result.vehicles,
+                tasks=without_verify_cost_result.tasks,
+                title=(
+                    "Without Verification (Verification Cost) | "
+                    f"total={summary.without_verification_verify_cost.system_total_time:.3f} | "
+                    f"compute={summary.without_verification_verify_cost.compute_time_s:.3f}s"
+                ),
+                show_task_meta=False,
+                show_vehicle_sequences=False,
+                task_font_size=7,
+                vehicle_font_size=8,
+                label_box=True,
+                curve_width=1.5,
+                show_predicted_next_link=False,
+                predicted_future_links=0,
+            )
 
     def format_comparison_text(self) -> str:
         if self._session.offline_reallocation_pending():
             return "Offline Comparison:\n  pending edits; click Re-auction Now to recompute."
         summary = self.comparison_summary()
         lines = ["Offline Comparison:"]
-        for variant in (summary.with_verification, summary.without_verification):
+        for variant in (
+            summary.with_verification,
+            summary.without_verification,
+            summary.without_verification_verify_cost,
+        ):
             lines.append(f"  {variant.label}")
             lines.append(
                 "    "

@@ -401,6 +401,17 @@ class AllocationEngine:
         return frontier_pos, frontier_heading
 
     def _estimate_task_cost(self, vehicle: Vehicle, task: Task) -> float:
+        if bool(getattr(self.cfg, "bid_use_verification_cost_estimate", False)):
+            verify_like = verify_bid(
+                vehicle=vehicle,
+                task=task,
+                c_hat=0.0,
+                cfg=self.cfg,
+                planner=self.planner,
+                tasks_by_id=self.tasks_by_id,
+            )
+            return verify_like.c_tilde
+
         prefix_weight = max(0.0, float(getattr(self.cfg, "committed_prefix_time_weight", 1.0)))
         if prefix_weight <= 1e-12:
             prefix_time = 0.0
