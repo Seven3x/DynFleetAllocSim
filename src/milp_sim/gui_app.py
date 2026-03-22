@@ -428,11 +428,12 @@ class _BaseGuiApp:
             self.compare_ax_without_verify_cost = None
             self.figure.subplots_adjust(left=0.05, right=0.985, bottom=0.05, top=0.96)
         else:
-            self.figure = plt.Figure(figsize=(17.2, 6.4), dpi=130)
-            self.ax = self.figure.add_subplot(131)
-            self.secondary_ax = self.figure.add_subplot(132)
-            self.compare_ax_without_verify_cost = self.figure.add_subplot(133)
-            self.figure.subplots_adjust(left=0.03, right=0.99, bottom=0.05, top=0.94, wspace=0.08)
+            self.figure = plt.Figure(figsize=(12.6, 9.2), dpi=130)
+            grid = self.figure.add_gridspec(2, 2, height_ratios=(1.0, 1.12), wspace=0.08, hspace=0.16)
+            self.ax = self.figure.add_subplot(grid[0, 0])
+            self.secondary_ax = self.figure.add_subplot(grid[0, 1])
+            self.compare_ax_without_verify_cost = self.figure.add_subplot(grid[1, :])
+            self.figure.subplots_adjust(left=0.04, right=0.985, bottom=0.045, top=0.955)
         self.canvas = FigureCanvasTkAgg(self.figure, master=parent)
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
         self.canvas.mpl_connect("button_press_event", self._on_canvas_press)

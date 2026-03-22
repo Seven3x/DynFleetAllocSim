@@ -266,7 +266,15 @@ class AllocationEngine:
             f"pending={sum(1 for t in self.tasks if t.status in AUCTIONABLE_STATES)}"
         )
         guard = 0
+        max_rounds = int(getattr(self.cfg, "auction_max_rounds", 0))
         while self._has_pending_auction_tasks():
+            if max_rounds > 0 and guard >= max_rounds:
+                debug_log(
+                    f"allocate_until_stable early-stop phase={phase} "
+                    f"guard={guard} max_rounds={max_rounds} "
+                    f"pending={sum(1 for t in self.tasks if t.status in AUCTIONABLE_STATES)}"
+                )
+                break
             guard += 1
             if guard == 1 or guard % 25 == 0:
                 debug_log(

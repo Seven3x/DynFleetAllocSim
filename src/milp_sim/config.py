@@ -210,6 +210,8 @@ class SimulationConfig:
     # Weight applied to already-committed prefix execution time during bidding/verification.
     # Set to 0 to ignore prefix cost entirely and skip prefix estimation calls.
     committed_prefix_time_weight: float = 0.0
+    # Auction loop cap: <=0 means unlimited (until stable), >0 means stop after N rounds.
+    auction_max_rounds: int = 0
     online_task_reach_tolerance: float = 0.25
     # Number of future tasks kept/visualized beyond the current in-progress task.
     online_future_task_horizon: int = 3
@@ -229,6 +231,8 @@ class SimulationConfig:
             raise ValueError("online_new_task_replan_batch_size must be >= 1")
         if float(self.committed_prefix_time_weight) < 0.0:
             raise ValueError("committed_prefix_time_weight must be >= 0")
+        if int(self.auction_max_rounds) < 0:
+            raise ValueError("auction_max_rounds must be >= 0")
         if float(self.hybrid_astar_step_size) <= 0.0:
             raise ValueError("hybrid_astar_step_size must be > 0")
         if int(self.hybrid_astar_heading_bins) < 8:
