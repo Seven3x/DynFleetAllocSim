@@ -4,6 +4,7 @@ import copy
 import math
 import os
 import re
+import time
 from collections import Counter
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -94,6 +95,7 @@ class UserActionRecord:
 class OfflineComparisonVariant:
     label: str
     system_total_time: float
+    compute_time_s: float
     auction_rounds: int
     verification_checks: int
     verification_failures: int
@@ -2152,7 +2154,7 @@ class OfflineSession:
         return copy.deepcopy(self._session._recorded_user_actions)
 
     @staticmethod
-    def _build_variant(label: str, result: AllocationResult) -> OfflineComparisonVariant:
+    def _build_variant(label: str, result: AllocationResult, compute_time_s: float) -> OfflineComparisonVariant:
         vehicle_summaries: list[str] = []
         for v in result.vehicles:
             seq = ",".join(f"T{tid}" for tid in v.task_sequence) if v.task_sequence else "(none)"
@@ -2161,6 +2163,7 @@ class OfflineSession:
         return OfflineComparisonVariant(
             label=label,
             system_total_time=float(result.system_total_time),
+            compute_time_s=float(compute_time_s),
             auction_rounds=len(result.auction_logs),
             verification_checks=len(result.verification_logs),
             verification_failures=failures,
@@ -2174,17 +2177,21 @@ class OfflineSession:
 
     def _build_comparison_summary(self) -> OfflineComparisonSummary:
         actions = self._current_offline_actions()
+        t0 = time.perf_counter()
         with_verify = SimulationSession(replace(self.cfg, enable_bid_verification=True))
-        without_verify = SimulationSession(replace(self.cfg, enable_bid_verification=False))
-
         self._apply_actions_to_session(with_verify, actions)
-        self._apply_actions_to_session(without_verify, actions)
-
         with_result = with_verify.result()
+        with_compute_time_s = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        without_verify = SimulationSession(replace(self.cfg, enable_bid_verification=False))
+        self._apply_actions_to_session(without_verify, actions)
         without_result = without_verify.result()
+        without_compute_time_s = time.perf_counter() - t0
+
         self._comparison_results_cache = (with_result, without_result)
-        with_variant = self._build_variant("With Verification", with_result)
-        without_variant = self._build_variant("Without Verification", without_result)
+        with_variant = self._build_variant("With Verification", with_result, with_compute_time_s)
+        without_variant = self._build_variant("Without Verification", without_result, without_compute_time_s)
 
         changed: list[str] = []
         for v_with, v_without in zip(with_result.vehicles, without_result.vehicles):
@@ -2251,7 +2258,11 @@ class OfflineSession:
             world=self.artifacts.world,
             vehicles=with_result.vehicles,
             tasks=with_result.tasks,
-            title=f"With Verification | total={summary.with_verification.system_total_time:.3f}",
+            title=(
+                "With Verification | "
+                f"total={summary.with_verification.system_total_time:.3f} | "
+                f"compute={summary.with_verification.compute_time_s:.3f}s"
+            ),
             show_task_meta=False,
             show_vehicle_sequences=False,
             task_font_size=7,
@@ -2266,7 +2277,11 @@ class OfflineSession:
             world=self.artifacts.world,
             vehicles=without_result.vehicles,
             tasks=without_result.tasks,
-            title=f"Without Verification | total={summary.without_verification.system_total_time:.3f}",
+            title=(
+                "Without Verification | "
+                f"total={summary.without_verification.system_total_time:.3f} | "
+                f"compute={summary.without_verification.compute_time_s:.3f}s"
+            ),
             show_task_meta=False,
             show_vehicle_sequences=False,
             task_font_size=7,
@@ -2285,6 +2300,7 @@ class OfflineSession:
             lines.append(
                 "    "
                 f"system_total_time={variant.system_total_time:.3f} "
+                f"compute_time={variant.compute_time_s:.3f}s "
                 f"auction_rounds={variant.auction_rounds} "
                 f"verification_checks={variant.verification_checks} "
                 f"verification_failures={variant.verification_failures}"
