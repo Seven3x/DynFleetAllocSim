@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import math
 import os
 import re
@@ -30,6 +31,8 @@ from .neighbor_coordination import TaskRecord
 from .planner_astar import AStarPlanner
 from .simulator import SimulationArtifacts, build_static_scenario
 from .visualization import draw_final_scene_on_axis, plot_final_scene
+
+TASK_OPERATION_ACTION_TYPES = {"add_task", "add_random_task", "cancel_task", "move_task"}
 
 
 @dataclass
@@ -1378,6 +1381,142 @@ class SimulationSession:
             raise ValueError("no recorded user actions to replay")
         self.reset(replay_last_actions=True)
 
+    def export_task_ops_json(self, filename: str | None = None) -> Path:
+        actions = [action for action in self.replayable_user_actions() if action.action_type in TASK_OPERATION_ACTION_TYPES]
+        if not actions:
+            raise ValueError("no task point operations recorded")
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        if filename:
+            path = self.output_dir / filename
+        else:
+            path = self.output_dir / f"task_ops_{self._timestamp()}.json"
+
+        payload = {
+            "schema_version": 1,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "session": {
+                "scenario_file": None if self.cfg.scenario_file is None else str(self.cfg.scenario_file),
+                "seed": int(self.cfg.seed),
+                "online_dt": float(self.online_dt),
+                "replan_period_s": float(self.replan_period_s),
+            },
+            "operations": [
+                {
+                    "action_id": int(action.action_id),
+                    "action_type": str(action.action_type),
+                    "online": bool(action.online),
+                    "frame_idx": None if action.frame_idx is None else int(action.frame_idx),
+                    "sim_time": None if action.sim_time is None else float(action.sim_time),
+                    "step": int(action.step),
+                    "online_dt": None if action.online_dt is None else float(action.online_dt),
+                    "replan_period_s": None if action.replan_period_s is None else float(action.replan_period_s),
+                    "payload": copy.deepcopy(action.payload),
+                }
+                for action in actions
+            ],
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
+
+    def replay_task_ops_json(self, path: str | Path, reset_first: bool = True) -> int:
+        source = Path(path)
+        if not source.exists():
+            raise FileNotFoundError(f"task ops json not found: {source}")
+        if not source.is_file():
+            raise ValueError(f"task ops path is not a file: {source}")
+
+        loaded = json.loads(source.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise ValueError("task ops json root must be an object")
+
+        raw_ops = loaded.get("operations")
+        if not isinstance(raw_ops, list):
+            raise ValueError("task ops json must contain operations[]")
+
+        session_defaults = loaded.get("session")
+        if session_defaults is None:
+            session_defaults = {}
+        if not isinstance(session_defaults, dict):
+            raise ValueError("task ops json session must be an object when provided")
+        default_online_dt = (
+            float(session_defaults["online_dt"]) if "online_dt" in session_defaults else float(self.online_dt)
+        )
+        default_replan_period_s = (
+            float(session_defaults["replan_period_s"])
+            if "replan_period_s" in session_defaults
+            else float(self.replan_period_s)
+        )
+
+        actions: list[UserActionRecord] = []
+        for idx, raw in enumerate(raw_ops):
+            if not isinstance(raw, dict):
+                raise ValueError(f"operations[{idx}] must be an object")
+
+            action_type = str(raw.get("action_type", "")).strip()
+            if action_type not in TASK_OPERATION_ACTION_TYPES:
+                raise ValueError(
+                    f"operations[{idx}].action_type unsupported: {action_type!r}; "
+                    f"only {sorted(TASK_OPERATION_ACTION_TYPES)} are allowed"
+                )
+
+            payload = raw.get("payload")
+            if not isinstance(payload, dict):
+                raise ValueError(f"operations[{idx}].payload must be an object")
+            if action_type in {"add_task", "add_random_task"}:
+                required = {"x", "y", "demand", "task_id"}
+            elif action_type == "cancel_task":
+                required = {"task_id"}
+            else:  # move_task
+                required = {"task_id", "x", "y"}
+            missing = [key for key in sorted(required) if key not in payload]
+            if missing:
+                raise ValueError(f"operations[{idx}].payload missing keys: {missing}")
+
+            online = bool(raw.get("online", True))
+            frame_idx_raw = raw.get("frame_idx")
+            frame_idx = None if frame_idx_raw is None else int(frame_idx_raw)
+
+            online_dt_raw = raw.get("online_dt")
+            online_dt = (None if online_dt_raw is None else float(online_dt_raw)) if online else None
+            if online and online_dt is None:
+                online_dt = default_online_dt
+
+            replan_raw = raw.get("replan_period_s")
+            replan_period_s = (None if replan_raw is None else float(replan_raw)) if online else None
+            if online and replan_period_s is None:
+                replan_period_s = default_replan_period_s
+
+            sim_time_raw = raw.get("sim_time")
+            if sim_time_raw is not None:
+                sim_time = float(sim_time_raw)
+            elif online and frame_idx is not None and online_dt is not None:
+                sim_time = float(frame_idx) * float(online_dt)
+            else:
+                sim_time = None
+
+            actions.append(
+                UserActionRecord(
+                    action_id=int(raw.get("action_id", idx + 1)),
+                    action_type=action_type,
+                    online=online,
+                    frame_idx=frame_idx,
+                    sim_time=sim_time,
+                    step=int(raw.get("step", self.step)),
+                    online_dt=online_dt,
+                    replan_period_s=replan_period_s,
+                    payload=copy.deepcopy(payload),
+                )
+            )
+
+        if not actions:
+            raise ValueError("task ops json has no operations")
+
+        if reset_first:
+            self.reset()
+        self._replay_user_actions(actions)
+        return len(actions)
+
     def _next_task_id(self) -> int:
         self._assert_ready()
         assert self.engine is not None
@@ -2571,6 +2710,14 @@ class OfflineSession:
     def export_logs(self, prefix: str | None = None) -> tuple[Path, Path, Path]:
         return self._session.export_logs(prefix=prefix)
 
+    def export_task_ops_json(self, filename: str | None = None) -> Path:
+        return self._session.export_task_ops_json(filename=filename)
+
+    def replay_task_ops_json(self, path: str | Path, reset_first: bool = True) -> int:
+        count = self._session.replay_task_ops_json(path=path, reset_first=reset_first)
+        self._invalidate_comparison_cache()
+        return count
+
 
 class OnlineSession:
     def __init__(self, cfg: SimulationConfig = DEFAULT_CONFIG) -> None:
@@ -2734,3 +2881,9 @@ class OnlineSession:
 
     def export_logs(self, prefix: str | None = None) -> tuple[Path, Path, Path]:
         return self._session.export_logs(prefix=prefix)
+
+    def export_task_ops_json(self, filename: str | None = None) -> Path:
+        return self._session.export_task_ops_json(filename=filename)
+
+    def replay_task_ops_json(self, path: str | Path, reset_first: bool = True) -> int:
+        return self._session.replay_task_ops_json(path=path, reset_first=reset_first)

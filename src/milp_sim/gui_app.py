@@ -5,7 +5,7 @@ import os
 import time
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
@@ -49,6 +49,8 @@ class _BaseGuiApp:
         self.log_count_var = tk.StringVar(value="8")
         self.add_demand_var = tk.StringVar(value="2")
         self.add_task_id_var = tk.StringVar(value="")
+        self.add_x_var = tk.StringVar(value="")
+        self.add_y_var = tk.StringVar(value="")
         self.random_demand_var = tk.StringVar(value="")
         self.cancel_task_id_var = tk.StringVar(value="")
         self.obstacle_point_count_var = tk.StringVar(value="0")
@@ -280,6 +282,8 @@ class _BaseGuiApp:
             ttk.Button(top, text="Re-auction Now", command=self._on_reallocate_offline).pack(fill="x", pady=3)
         ttk.Button(top, text="Save Snapshot", command=self._on_save_snapshot).pack(fill="x", pady=3)
         ttk.Button(top, text="Export Logs", command=self._on_export_logs).pack(fill="x", pady=3)
+        ttk.Button(top, text="Export Task Ops JSON", command=self._on_export_task_ops_json).pack(fill="x", pady=3)
+        ttk.Button(top, text="Replay Task Ops JSON", command=self._on_replay_task_ops_json).pack(fill="x", pady=3)
 
         if self.enable_online_runtime:
             online_frame = ttk.LabelFrame(parent, text="Online Runtime", padding=8)
@@ -371,9 +375,20 @@ class _BaseGuiApp:
         ttk.Label(add_frame, text="task_id(opt)").grid(row=2, column=0, sticky="w")
         ttk.Entry(add_frame, textvariable=self.add_task_id_var, width=12).grid(row=2, column=1, sticky="ew")
 
+        ttk.Label(add_frame, text="x").grid(row=3, column=0, sticky="w")
+        ttk.Entry(add_frame, textvariable=self.add_x_var, width=12).grid(row=3, column=1, sticky="ew")
+
+        ttk.Label(add_frame, text="y").grid(row=4, column=0, sticky="w")
+        ttk.Entry(add_frame, textvariable=self.add_y_var, width=12).grid(row=4, column=1, sticky="ew")
+
         ttk.Button(add_frame, text="Start/Stop Click Add", command=self._on_toggle_task_click).grid(
-            row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0)
+            row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0)
         )
+        ttk.Button(
+            add_frame,
+            text="Add At Coord + Replan" if self.enable_online_runtime else "Add At Coord",
+            command=self._on_add_at_coord,
+        ).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(5, 0))
 
         add_frame.columnconfigure(1, weight=1)
 
@@ -545,6 +560,13 @@ class _BaseGuiApp:
         if not v:
             raise ValueError(f"{name} is required")
         return int(v)
+
+    @staticmethod
+    def _parse_required_float(value: str, name: str) -> float:
+        v = value.strip()
+        if not v:
+            raise ValueError(f"{name} is required")
+        return float(v)
 
     def _refresh_map(self) -> None:
         if not self.enable_online_runtime:
@@ -964,6 +986,43 @@ class _BaseGuiApp:
         except Exception as exc:
             messagebox.showerror("Export Error", str(exc))
 
+    def _on_export_task_ops_json(self) -> None:
+        try:
+            path = self.session.export_task_ops_json()
+            self._refresh_all()
+            self.last_action_var.set(f"Task ops exported: {path.name}")
+            messagebox.showinfo("Task Ops Exported", f"Saved to:\n{path}")
+        except Exception as exc:
+            messagebox.showerror("Task Ops Export Error", str(exc))
+
+    def _on_replay_task_ops_json(self) -> None:
+        source = filedialog.askopenfilename(
+            title="Select Task Ops JSON",
+            initialdir="outputs",
+            filetypes=(("JSON files", "*.json"), ("All files", "*.*")),
+        )
+        if not source:
+            return
+        try:
+            replayed = self.session.replay_task_ops_json(path=source, reset_first=True)
+            self._map_view_state = None
+            self.obstacle_points = []
+            self.obstacle_draw_mode = False
+            self.task_click_mode = False
+            self.dragging_task_id = None
+            self.drag_origin_pos = None
+            self.drag_preview_pos = None
+            self.obstacle_mode_var.set("OFF")
+            self.obstacle_point_count_var.set("0")
+            self.task_mode_var.set("OFF")
+            if self.enable_online_runtime:
+                self._reset_online_render_clock()
+            self.last_action_var.set(f"Task ops replayed: {replayed}")
+            self._refresh_all()
+            messagebox.showinfo("Task Ops Replayed", f"Replayed {replayed} operations from:\n{source}")
+        except Exception as exc:
+            messagebox.showerror("Task Ops Replay Error", str(exc))
+
     def _has_pending_offline_reallocation(self) -> bool:
         checker = getattr(self.session, "has_pending_reallocation", None)
         return bool(callable(checker) and checker())
@@ -1062,6 +1121,27 @@ class _BaseGuiApp:
             )
         except Exception as exc:
             messagebox.showerror("Add Random Error", str(exc))
+
+    def _on_add_at_coord(self) -> None:
+        try:
+            x = self._parse_required_float(self.add_x_var.get(), "x")
+            y = self._parse_required_float(self.add_y_var.get(), "y")
+            demand = self._parse_required_int(self.add_demand_var.get(), "demand")
+            task_id = self._parse_optional_int(self.add_task_id_var.get())
+            task = self.session.add_task(x=x, y=y, demand=demand, task_id=task_id)
+            if task_id is not None:
+                self.add_task_id_var.set("")
+            self._refresh_all()
+            if not self.enable_online_runtime and self._has_pending_offline_reallocation():
+                self.last_action_var.set(f"Task added by coord: T{task.id} (pending re-auction)")
+            else:
+                self.last_action_var.set(f"Task added by coord: T{task.id}")
+            messagebox.showinfo(
+                "Task Added",
+                f"Added T{task.id} at ({task.position[0]:.2f}, {task.position[1]:.2f}) demand={task.demand}",
+            )
+        except Exception as exc:
+            messagebox.showerror("Add Task Error", str(exc))
 
     def _on_cancel_task(self) -> None:
         try:

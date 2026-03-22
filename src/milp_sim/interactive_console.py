@@ -19,6 +19,8 @@ def _print_help() -> None:
     print("  undo                              Undo last mutating action")
     print("  plot [filename]                   Save current figure to outputs/")
     print("  export_logs [prefix]              Export coordination/verification/big auction logs")
+    print("  export_task_ops [filename]        Export add/cancel/move task ops to JSON")
+    print("  replay_task_ops <json_file>       Reset and replay task ops from JSON")
     print("  logs [n]                          Show last n verification/coordination logs")
     print("  ops [n]                           Show replayable user action history")
     print("  online_start [dt] [period]        Start online runtime")
@@ -64,6 +66,14 @@ class InteractiveConsole:
     def _export_logs(self, prefix: str | None) -> None:
         coord_path, verify_path, big_path = self.session.export_logs(prefix=prefix)
         print(f"saved logs: {coord_path} , {verify_path} , {big_path}")
+
+    def _export_task_ops(self, filename: str | None) -> None:
+        path = self.session.export_task_ops_json(filename=filename)
+        print(f"saved task ops json: {path}")
+
+    def _replay_task_ops(self, path: str) -> None:
+        count = self.session.replay_task_ops_json(path=path, reset_first=True)
+        print(f"replayed {count} task ops from: {path}")
 
     def _logs(self, n: int) -> None:
         print(self.session.format_logs_text(n=n))
@@ -115,6 +125,12 @@ class InteractiveConsole:
                 self._plot(filename=tokens[1] if len(tokens) > 1 else None)
             elif cmd == "export_logs":
                 self._export_logs(prefix=tokens[1] if len(tokens) > 1 else None)
+            elif cmd == "export_task_ops":
+                self._export_task_ops(filename=tokens[1] if len(tokens) > 1 else None)
+            elif cmd == "replay_task_ops":
+                if len(tokens) != 2:
+                    raise ValueError("usage: replay_task_ops <json_file>")
+                self._replay_task_ops(path=tokens[1])
             elif cmd == "logs":
                 n = int(tokens[1]) if len(tokens) > 1 else 5
                 self._logs(n=n)

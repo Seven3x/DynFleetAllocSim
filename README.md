@@ -85,6 +85,15 @@ PYTHONPATH=src python -m milp_sim.main --gui
 PYTHONPATH=src python -m milp_sim.main --gui --scenario-file examples/scenario_offline_5v50_corridor.json
 ```
 
+### 3.3.2 在线 GUI 读取场景文件
+在线模式现在同样支持通过场景文件启动（脚本默认读取 `examples/scenario_verification_demo.json`）：
+
+```bash
+./run_online_gui.sh --scenario-file examples/scenario_offline_5v50_corridor.json
+# 或
+PYTHONPATH=src python -m milp_sim.main --gui-online --scenario-file examples/scenario_offline_5v50_corridor.json
+```
+
 ### 3.4 前缀路程代价对比分配实验
 该实验固定一个手工场景，对比两种拍卖代价：
 - `incremental_only`：只看当前末端到候选任务的 A* 路径代价
@@ -160,16 +169,26 @@ python -m milp_sim.assignment_cost_experiment --seed 7
   - 将当前状态保存到 `outputs/`
 - `export_logs [prefix]`
   - 导出校对/协商日志到 `outputs/`
+- `export_task_ops [filename]`
+  - 导出任务点操作（新增/删除/移动）的可回放 JSON 到 `outputs/`
+- `replay_task_ops <json_file>`
+  - 读取 JSON，重置当前会话并按记录帧/时间回放任务点操作
 - `logs [n]`
   - 打印最近 `n` 条校对/协商日志
 - `quit` / `exit`
 
 ## 5. GUI 功能
 - 左侧控制区：初始化/重置、Undo、保存快照、导出日志
+- 左侧控制区支持任务操作脚本：
+  - `Export Task Ops JSON`：导出本次会话中任务点新增/删除/移动操作（含 frame_idx/sim_time）
+  - `Replay Task Ops JSON`：读取 JSON 并重置后回放，用于复现实验操作
 - 新增任务（点击地图）：
   - 在 Add Task 区输入 `demand`、`task_id(可选)`
   - 点 `Start/Stop Click Add` 开启点击模式
   - 在地图上点击即添加任务并自动再分配
+- 新增任务（输入坐标）：
+  - 在 Add Task 区输入 `x`、`y`、`demand`（`task_id` 可选）
+  - 点击 `Add At Coord`（在线模式按钮为 `Add At Coord + Replan`）
 - 随机任务：可选 demand
 - 取消任务：输入 task_id
 - 多边形障碍绘制：
