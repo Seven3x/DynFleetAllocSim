@@ -1462,6 +1462,10 @@ class SimulationSession:
         if action.action_type == "remove_obstacle":
             self.remove_obstacle(obstacle_idx=int(payload["obstacle_idx"]))
             return
+        if action.action_type == "update_obstacle":
+            points = [(float(x), float(y)) for x, y in payload["points"]]
+            self.replace_obstacle_polygon(obstacle_idx=int(payload["obstacle_idx"]), points=points)
+            return
         if action.action_type == "offline_reallocate":
             self.reallocate_offline()
             return
@@ -1754,7 +1758,12 @@ class SimulationSession:
         self.engine.corrected_bid_cache.clear()
         self.engine.force_accept_pairs.clear()
 
-    def _validate_obstacle_polygon(self, points: list[tuple[float, float]]) -> Polygon:
+    def _validate_obstacle_polygon(
+        self,
+        points: list[tuple[float, float]],
+        *,
+        allow_intersections_with_existing: bool = False,
+    ) -> Polygon:
         self._assert_ready()
         assert self.artifacts is not None
         assert self.engine is not None
@@ -1771,7 +1780,9 @@ class SimulationSession:
             raise ValueError("polygon must be fully inside map boundary")
         if poly.intersects(self.artifacts.world.depot_polygon):
             raise ValueError("polygon intersects depot area")
-        if any(poly.intersects(obs) for obs in self.artifacts.world.obstacles):
+        if (not allow_intersections_with_existing) and any(
+            poly.intersects(obs) for obs in self.artifacts.world.obstacles
+        ):
             raise ValueError("polygon intersects existing obstacle")
 
         inflated = poly.buffer(self.cfg.vehicle_radius + self.cfg.safety_margin)
@@ -1886,6 +1897,55 @@ class SimulationSession:
         self._rebuild_planner()
         self._mark_offline_reallocation_pending()
         self._record_user_action("remove_obstacle", {"obstacle_idx": idx}, ctx)
+
+    def replace_obstacle_polygon(self, obstacle_idx: int, points: list[tuple[float, float]]) -> Polygon:
+        self._assert_ready()
+        assert self.artifacts is not None
+        ctx = self._capture_user_action_context()
+
+        idx = int(obstacle_idx)
+        if idx < 0 or idx >= len(self.artifacts.world.obstacles):
+            raise ValueError(f"invalid obstacle index: {idx}")
+        if self.online_enabled:
+            raise ValueError("obstacle replacement is only supported in offline mode")
+
+        self._push_undo_state()
+
+        previous_poly = self.artifacts.world.remove_obstacle(idx)
+        try:
+            poly = self._validate_obstacle_polygon(
+                points,
+                allow_intersections_with_existing=True,
+            )
+        except Exception:
+            self.artifacts.world.obstacles.insert(idx, previous_poly)
+            self.artifacts.world.invalidate_cache()
+            raise
+
+        self.artifacts.world.obstacles.insert(idx, poly)
+        self.artifacts.world.invalidate_cache()
+        self._rebuild_planner()
+        self._mark_offline_reallocation_pending()
+        self._record_user_action(
+            "update_obstacle",
+            {"obstacle_idx": idx, "points": [(float(x), float(y)) for x, y in points]},
+            ctx,
+        )
+        return poly
+
+    def obstacle_vertices(self, obstacle_idx: int) -> list[tuple[float, float]]:
+        self._assert_ready()
+        assert self.artifacts is not None
+        idx = int(obstacle_idx)
+        if idx < 0 or idx >= len(self.artifacts.world.obstacles):
+            raise ValueError(f"invalid obstacle index: {idx}")
+        coords = list(self.artifacts.world.obstacles[idx].exterior.coords)
+        if len(coords) >= 2:
+            x0, y0 = coords[0]
+            x1, y1 = coords[-1]
+            if abs(float(x0) - float(x1)) <= 1e-9 and abs(float(y0) - float(y1)) <= 1e-9:
+                coords = coords[:-1]
+        return [(float(x), float(y)) for x, y in coords]
 
     def list_obstacles(self) -> list[tuple[int, float]]:
         self._assert_ready()
@@ -2158,6 +2218,8 @@ class SimulationSession:
             return f"add_obstacle vertices={len(payload['points'])}"
         if action.action_type == "remove_obstacle":
             return f"remove_obstacle idx={payload['obstacle_idx']}"
+        if action.action_type == "update_obstacle":
+            return f"update_obstacle idx={payload['obstacle_idx']} vertices={len(payload['points'])}"
         if action.action_type == "offline_reallocate":
             return "offline_reallocate"
         return action.action_type
@@ -2415,11 +2477,71 @@ class SimulationSession:
         return datetime.now().strftime("%Y%m%d_%H%M%S")
 
     @staticmethod
-    def _polygon_to_json_points(poly: Polygon) -> list[list[float]]:
+    def _polygon_to_points(poly: Polygon) -> list[list[float]]:
         coords = list(poly.exterior.coords)
         if len(coords) >= 2:
-            coords = coords[:-1]
+            x0, y0 = coords[0]
+            x1, y1 = coords[-1]
+            if abs(float(x0) - float(x1)) <= 1e-9 and abs(float(y0) - float(y1)) <= 1e-9:
+                coords = coords[:-1]
         return [[float(x), float(y)] for x, y in coords]
+
+    def save_scenario_json(self, path: str | Path | None = None) -> Path:
+        self._assert_ready()
+        assert self.artifacts is not None
+        assert self.engine is not None
+
+        if path is None:
+            if self.cfg.scenario_file:
+                src = Path(self.cfg.scenario_file)
+                target = src if src.suffix.lower() == ".json" else src.with_suffix(".json")
+            else:
+                self.output_dir.mkdir(parents=True, exist_ok=True)
+                target = self.output_dir / f"scenario_{self._timestamp()}.json"
+        else:
+            target = Path(path)
+
+        if target.suffix.lower() != ".json":
+            raise ValueError("scenario output path must end with .json")
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        tasks: list[dict[str, Any]] = []
+        for task in sorted(self.engine.tasks, key=lambda t: t.id):
+            if task.status == "canceled":
+                continue
+            tasks.append(
+                {
+                    "id": int(task.id),
+                    "position": [float(task.position[0]), float(task.position[1])],
+                    "demand": int(task.demand),
+                }
+            )
+
+        vehicles: list[dict[str, Any]] = []
+        for vehicle in sorted(self.engine.vehicles, key=lambda v: v.id):
+            vehicles.append(
+                {
+                    "id": int(vehicle.id),
+                    "start": [float(vehicle.start_pos[0]), float(vehicle.start_pos[1])],
+                    "heading": float(vehicle.heading),
+                    "speed": float(vehicle.speed),
+                    "max_omega": float(vehicle.max_omega),
+                    "capacity": int(vehicle.capacity),
+                }
+            )
+
+        payload: dict[str, Any] = {
+            "world": {
+                "width": float(self.artifacts.world.width),
+                "height": float(self.artifacts.world.height),
+                "depot_polygon": self._polygon_to_points(self.artifacts.world.depot_polygon),
+                "obstacles": [self._polygon_to_points(poly) for poly in self.artifacts.world.obstacles],
+            },
+            "vehicles": vehicles,
+            "tasks": tasks,
+        }
+        target.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return target.resolve()
 
     def save_snapshot(self, filename: str | None = None) -> Path:
         self._assert_ready()
@@ -2882,6 +3004,14 @@ class OfflineSession:
         self._session.remove_obstacle(obstacle_idx=obstacle_idx)
         self._invalidate_comparison_cache()
 
+    def replace_obstacle_polygon(self, obstacle_idx: int, points: list[tuple[float, float]]) -> Polygon:
+        poly = self._session.replace_obstacle_polygon(obstacle_idx=obstacle_idx, points=points)
+        self._invalidate_comparison_cache()
+        return poly
+
+    def obstacle_vertices(self, obstacle_idx: int) -> list[tuple[float, float]]:
+        return self._session.obstacle_vertices(obstacle_idx=obstacle_idx)
+
     def list_obstacles(self) -> list[tuple[int, float]]:
         return self._session.list_obstacles()
 
@@ -2960,18 +3090,8 @@ class OfflineSession:
     def save_snapshot(self, filename: str | None = None) -> Path:
         return self._session.save_snapshot(filename=filename)
 
-    def export_scenario_json(
-        self,
-        filename: str | None = None,
-        *,
-        include_completed: bool = False,
-        include_canceled: bool = False,
-    ) -> Path:
-        return self._session.export_scenario_json(
-            filename=filename,
-            include_completed=include_completed,
-            include_canceled=include_canceled,
-        )
+    def save_scenario_json(self, path: str | Path | None = None) -> Path:
+        return self._session.save_scenario_json(path=path)
 
     def export_logs(self, prefix: str | None = None) -> tuple[Path, Path, Path]:
         return self._session.export_logs(prefix=prefix)
@@ -3061,6 +3181,13 @@ class OnlineSession:
         self._ensure_runtime_ready()
         self._session.remove_obstacle(obstacle_idx=obstacle_idx)
 
+    def replace_obstacle_polygon(self, obstacle_idx: int, points: list[tuple[float, float]]) -> Polygon:
+        self._ensure_runtime_ready()
+        return self._session.replace_obstacle_polygon(obstacle_idx=obstacle_idx, points=points)
+
+    def obstacle_vertices(self, obstacle_idx: int) -> list[tuple[float, float]]:
+        return self._session.obstacle_vertices(obstacle_idx=obstacle_idx)
+
     def list_obstacles(self) -> list[tuple[int, float]]:
         return self._session.list_obstacles()
 
@@ -3145,18 +3272,8 @@ class OnlineSession:
     def save_snapshot(self, filename: str | None = None) -> Path:
         return self._session.save_snapshot(filename=filename)
 
-    def export_scenario_json(
-        self,
-        filename: str | None = None,
-        *,
-        include_completed: bool = False,
-        include_canceled: bool = False,
-    ) -> Path:
-        return self._session.export_scenario_json(
-            filename=filename,
-            include_completed=include_completed,
-            include_canceled=include_canceled,
-        )
+    def save_scenario_json(self, path: str | Path | None = None) -> Path:
+        return self._session.save_scenario_json(path=path)
 
     def export_logs(self, prefix: str | None = None) -> tuple[Path, Path, Path]:
         return self._session.export_logs(prefix=prefix)

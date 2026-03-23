@@ -5,6 +5,7 @@ import os
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
@@ -12,6 +13,7 @@ os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from shapely.geometry import Point
 
 from .config import DEFAULT_CONFIG, SimulationConfig
 from .session import OfflineSession, OnlineSession
@@ -32,6 +34,7 @@ class _BaseGuiApp:
         self.enable_online_runtime = enable_online_runtime
         self.enable_offline_tools = enable_offline_tools
         self.obstacle_draw_mode = False
+        self.obstacle_remove_click_mode = False
         self.obstacle_points: list[tuple[float, float]] = []
         self.task_click_mode = False
         self.dragging_task_id: int | None = None
@@ -55,6 +58,7 @@ class _BaseGuiApp:
         self.cancel_task_id_var = tk.StringVar(value="")
         self.obstacle_point_count_var = tk.StringVar(value="0")
         self.obstacle_mode_var = tk.StringVar(value="OFF")
+        self.obstacle_remove_mode_var = tk.StringVar(value="OFF")
         self.task_mode_var = tk.StringVar(value="OFF")
         self.last_action_var = tk.StringVar(value="Ready")
         self.online_state_var = tk.StringVar(value="OFF")
@@ -85,6 +89,11 @@ class _BaseGuiApp:
         self.compare_ax_without = None
         self.compare_ax_without_verify_cost = None
         self.secondary_ax = None
+        self._scenario_json_path: Path | None = None
+        if self.cfg.scenario_file:
+            source_path = Path(self.cfg.scenario_file)
+            if source_path.suffix.lower() == ".json":
+                self._scenario_json_path = source_path
 
         self._build_layout()
         self._refresh_all()
@@ -281,7 +290,9 @@ class _BaseGuiApp:
             ttk.Button(top, text="Undo Last Action", command=self._on_undo).pack(fill="x", pady=3)
             ttk.Button(top, text="Re-auction Now", command=self._on_reallocate_offline).pack(fill="x", pady=3)
         ttk.Button(top, text="Save Snapshot", command=self._on_save_snapshot).pack(fill="x", pady=3)
-        ttk.Button(top, text="Save Scenario JSON", command=self._on_save_scenario_json).pack(fill="x", pady=3)
+        if self.enable_offline_tools:
+            ttk.Button(top, text="Save Scenario JSON", command=self._on_save_scenario_json).pack(fill="x", pady=3)
+            ttk.Button(top, text="Save Scenario As...", command=self._on_save_scenario_json_as).pack(fill="x", pady=3)
         ttk.Button(top, text="Export Logs", command=self._on_export_logs).pack(fill="x", pady=3)
         ttk.Button(top, text="Export Task Ops JSON", command=self._on_export_task_ops_json).pack(fill="x", pady=3)
         ttk.Button(top, text="Load Task Ops JSON", command=self._on_replay_task_ops_json).pack(fill="x", pady=3)
@@ -344,12 +355,18 @@ class _BaseGuiApp:
         ttk.Button(obstacle_frame, text="Clear Points", command=self._on_obstacle_clear).grid(
             row=3, column=1, sticky="ew", pady=(5, 0)
         )
+        ttk.Label(obstacle_frame, text="click remove").grid(row=4, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(obstacle_frame, textvariable=self.obstacle_remove_mode_var).grid(row=4, column=1, sticky="w", pady=(6, 0))
+        if self.enable_offline_tools:
+            ttk.Button(obstacle_frame, text="Start/Stop Click Remove", command=self._on_toggle_obstacle_remove_click).grid(
+                row=5, column=0, columnspan=2, sticky="ew", pady=(5, 0)
+            )
         ttk.Button(
             obstacle_frame,
             text="Apply Obstacle",
             command=self._on_apply_obstacle,
-        ).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(5, 0))
-        ttk.Label(obstacle_frame, text="remove idx").grid(row=5, column=0, sticky="w", pady=(6, 0))
+        ).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(5, 0))
+        ttk.Label(obstacle_frame, text="remove idx").grid(row=7, column=0, sticky="w", pady=(6, 0))
         self.obstacle_remove_combo = ttk.Combobox(
             obstacle_frame,
             textvariable=self.obstacle_remove_var,
@@ -357,10 +374,14 @@ class _BaseGuiApp:
             state="readonly",
             width=12,
         )
-        self.obstacle_remove_combo.grid(row=5, column=1, sticky="ew", pady=(6, 0))
+        self.obstacle_remove_combo.grid(row=7, column=1, sticky="ew", pady=(6, 0))
         ttk.Button(obstacle_frame, text="Remove Obstacle", command=self._on_remove_obstacle).grid(
-            row=6, column=0, columnspan=2, sticky="ew", pady=(5, 0)
+            row=8, column=0, columnspan=2, sticky="ew", pady=(5, 0)
         )
+        if self.enable_offline_tools:
+            ttk.Button(obstacle_frame, text="Replace Obstacle", command=self._on_replace_obstacle).grid(
+                row=9, column=0, columnspan=2, sticky="ew", pady=(5, 0)
+            )
         obstacle_frame.columnconfigure(0, weight=1)
         obstacle_frame.columnconfigure(1, weight=1)
 
@@ -621,6 +642,20 @@ class _BaseGuiApp:
                         bbox=dict(boxstyle="round,pad=0.2", facecolor="#dbeafe", alpha=0.8, edgecolor="none"),
                         zorder=20,
                     )
+            if self.obstacle_remove_click_mode:
+                for axis in axes:
+                    axis.text(
+                        0.01,
+                        0.86,
+                        "Obstacle Remove Mode: ON (click obstacle to remove)",
+                        transform=axis.transAxes,
+                        ha="left",
+                        va="top",
+                        fontsize=9,
+                        color="#0f172a",
+                        bbox=dict(boxstyle="round,pad=0.2", facecolor="#fee2e2", alpha=0.9, edgecolor="none"),
+                        zorder=20,
+                    )
             if self.task_click_mode:
                 for axis in axes:
                     axis.text(
@@ -680,6 +715,19 @@ class _BaseGuiApp:
                 fontsize=9,
                 color="#0f172a",
                 bbox=dict(boxstyle="round,pad=0.2", facecolor="#dbeafe", alpha=0.8, edgecolor="none"),
+                zorder=20,
+            )
+        if self.obstacle_remove_click_mode:
+            self.ax.text(
+                0.01,
+                0.86,
+                "Obstacle Remove Mode: ON (click obstacle to remove)",
+                transform=self.ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=9,
+                color="#0f172a",
+                bbox=dict(boxstyle="round,pad=0.2", facecolor="#fee2e2", alpha=0.9, edgecolor="none"),
                 zorder=20,
             )
         if self.task_click_mode:
@@ -921,11 +969,13 @@ class _BaseGuiApp:
             self._map_view_state = None
             self.obstacle_points = []
             self.obstacle_draw_mode = False
+            self.obstacle_remove_click_mode = False
             self.task_click_mode = False
             self.dragging_task_id = None
             self.drag_origin_pos = None
             self.drag_preview_pos = None
             self.obstacle_mode_var.set("OFF")
+            self.obstacle_remove_mode_var.set("OFF")
             self.obstacle_point_count_var.set("0")
             self.task_mode_var.set("OFF")
             self.last_action_var.set("Scenario reset")
@@ -940,11 +990,13 @@ class _BaseGuiApp:
             self._map_view_state = None
             self.obstacle_points = []
             self.obstacle_draw_mode = False
+            self.obstacle_remove_click_mode = False
             self.task_click_mode = False
             self.dragging_task_id = None
             self.drag_origin_pos = None
             self.drag_preview_pos = None
             self.obstacle_mode_var.set("OFF")
+            self.obstacle_remove_mode_var.set("OFF")
             self.obstacle_point_count_var.set("0")
             self.task_mode_var.set("OFF")
             self.last_action_var.set("Scenario reset and replayed")
@@ -976,13 +1028,59 @@ class _BaseGuiApp:
             messagebox.showerror("Snapshot Error", str(exc))
 
     def _on_save_scenario_json(self) -> None:
+        saver = getattr(self.session, "save_scenario_json", None)
+        if not callable(saver):
+            messagebox.showerror("Save Scenario Error", "Current session does not support scenario JSON export.")
+            return
+
+        if self._scenario_json_path is None:
+            self._on_save_scenario_json_as()
+            return
+
         try:
-            path = self.session.export_scenario_json()
+            path = saver(path=self._scenario_json_path)
+            self._scenario_json_path = Path(path)
             self._refresh_all()
             self.last_action_var.set(f"Scenario saved: {path.name}")
-            messagebox.showinfo("Scenario Saved", f"Saved to:\n{path}")
+            messagebox.showinfo("Scenario Saved", f"Saved scenario JSON to:\n{path}")
         except Exception as exc:
-            messagebox.showerror("Scenario Save Error", str(exc))
+            messagebox.showerror("Save Scenario Error", str(exc))
+
+    def _on_save_scenario_json_as(self) -> None:
+        saver = getattr(self.session, "save_scenario_json", None)
+        if not callable(saver):
+            messagebox.showerror("Save Scenario Error", "Current session does not support scenario JSON export.")
+            return
+
+        if self._scenario_json_path is not None:
+            initial_dir = str(self._scenario_json_path.parent)
+            initial_name = self._scenario_json_path.name
+        elif self.cfg.scenario_file:
+            src = Path(self.cfg.scenario_file)
+            initial_dir = str(src.parent if str(src.parent) else Path.cwd())
+            initial_name = f"{src.stem}.json"
+        else:
+            initial_dir = "examples"
+            initial_name = "scenario_offline_saved.json"
+
+        dest = filedialog.asksaveasfilename(
+            title="Save Scenario JSON As",
+            initialdir=initial_dir,
+            initialfile=initial_name,
+            defaultextension=".json",
+            filetypes=(("JSON files", "*.json"), ("All files", "*.*")),
+        )
+        if not dest:
+            return
+
+        try:
+            path = saver(path=dest)
+            self._scenario_json_path = Path(path)
+            self._refresh_all()
+            self.last_action_var.set(f"Scenario saved as: {path.name}")
+            messagebox.showinfo("Scenario Saved", f"Saved scenario JSON to:\n{path}")
+        except Exception as exc:
+            messagebox.showerror("Save Scenario Error", str(exc))
 
     def _on_export_logs(self) -> None:
         try:
@@ -1018,11 +1116,13 @@ class _BaseGuiApp:
             self._map_view_state = None
             self.obstacle_points = []
             self.obstacle_draw_mode = False
+            self.obstacle_remove_click_mode = False
             self.task_click_mode = False
             self.dragging_task_id = None
             self.drag_origin_pos = None
             self.drag_preview_pos = None
             self.obstacle_mode_var.set("OFF")
+            self.obstacle_remove_mode_var.set("OFF")
             self.obstacle_point_count_var.set("0")
             self.task_mode_var.set("OFF")
             if self.enable_online_runtime:
@@ -1032,6 +1132,32 @@ class _BaseGuiApp:
             messagebox.showinfo("Task Ops Loaded", f"Loaded {replayed} operations for playback from:\n{source}")
         except Exception as exc:
             messagebox.showerror("Task Ops Replay Error", str(exc))
+
+    def _pick_obstacle_idx_near(self, x: float, y: float, axis=None, ratio: float = 0.02) -> int | None:
+        artifacts = getattr(self.session, "artifacts", None)
+        if artifacts is None:
+            return None
+        obstacles = list(getattr(artifacts.world, "obstacles", []))
+        if not obstacles:
+            return None
+
+        plot_axis = axis or self.ax
+        x_min, x_max = plot_axis.get_xlim()
+        y_min, y_max = plot_axis.get_ylim()
+        tol = ratio * max(abs(x_max - x_min), abs(y_max - y_min))
+        pt = Point(float(x), float(y))
+
+        best: tuple[float, float, int] | None = None
+        for idx, obs in enumerate(obstacles):
+            dist = float(obs.distance(pt))
+            inside = bool(obs.buffer(1e-9).contains(pt))
+            if (not inside) and dist > tol:
+                continue
+            score = 0.0 if inside else dist
+            candidate = (score, float(obs.area), idx)
+            if best is None or candidate < best:
+                best = candidate
+        return None if best is None else int(best[2])
 
     def _has_pending_offline_reallocation(self) -> bool:
         checker = getattr(self.session, "has_pending_reallocation", None)
@@ -1183,6 +1309,23 @@ class _BaseGuiApp:
             self._refresh_map()
             return
 
+        if self.obstacle_remove_click_mode:
+            idx = self._pick_obstacle_idx_near(x, y, axis=axis)
+            if idx is None:
+                self.last_action_var.set("No obstacle near click point")
+                self._refresh_map()
+                return
+            try:
+                self.session.remove_obstacle(obstacle_idx=idx)
+                if not self.enable_online_runtime and self._has_pending_offline_reallocation():
+                    self.last_action_var.set(f"Obstacle removed by click: idx={idx} (pending re-auction)")
+                else:
+                    self.last_action_var.set(f"Obstacle removed by click: idx={idx}")
+                self._refresh_all()
+            except Exception as exc:
+                messagebox.showerror("Obstacle Click Remove Error", str(exc))
+            return
+
         if self.task_click_mode:
             try:
                 demand = self._parse_required_int(self.add_demand_var.get(), "demand")
@@ -1229,7 +1372,7 @@ class _BaseGuiApp:
         if button != 1:
             return
 
-        if self.obstacle_draw_mode or self.task_click_mode:
+        if self.obstacle_draw_mode or self.obstacle_remove_click_mode or self.task_click_mode:
             self._on_canvas_click(event)
             return
 
@@ -1300,6 +1443,9 @@ class _BaseGuiApp:
         if not self.obstacle_draw_mode and self.task_click_mode:
             self.task_click_mode = False
             self.task_mode_var.set("OFF")
+        if not self.obstacle_draw_mode and self.obstacle_remove_click_mode:
+            self.obstacle_remove_click_mode = False
+            self.obstacle_remove_mode_var.set("OFF")
         self.obstacle_draw_mode = not self.obstacle_draw_mode
         self.obstacle_mode_var.set("ON" if self.obstacle_draw_mode else "OFF")
         self.last_action_var.set(f"Obstacle draw mode: {self.obstacle_mode_var.get()}")
@@ -1309,9 +1455,24 @@ class _BaseGuiApp:
         if not self.task_click_mode and self.obstacle_draw_mode:
             self.obstacle_draw_mode = False
             self.obstacle_mode_var.set("OFF")
+        if not self.task_click_mode and self.obstacle_remove_click_mode:
+            self.obstacle_remove_click_mode = False
+            self.obstacle_remove_mode_var.set("OFF")
         self.task_click_mode = not self.task_click_mode
         self.task_mode_var.set("ON" if self.task_click_mode else "OFF")
         self.last_action_var.set(f"Task click mode: {self.task_mode_var.get()}")
+        self._refresh_map()
+
+    def _on_toggle_obstacle_remove_click(self) -> None:
+        if not self.obstacle_remove_click_mode and self.obstacle_draw_mode:
+            self.obstacle_draw_mode = False
+            self.obstacle_mode_var.set("OFF")
+        if not self.obstacle_remove_click_mode and self.task_click_mode:
+            self.task_click_mode = False
+            self.task_mode_var.set("OFF")
+        self.obstacle_remove_click_mode = not self.obstacle_remove_click_mode
+        self.obstacle_remove_mode_var.set("ON" if self.obstacle_remove_click_mode else "OFF")
+        self.last_action_var.set(f"Obstacle click remove mode: {self.obstacle_remove_mode_var.get()}")
         self._refresh_map()
 
     def _on_obstacle_undo(self) -> None:
@@ -1362,6 +1523,37 @@ class _BaseGuiApp:
             self._refresh_all()
         except Exception as exc:
             messagebox.showerror("Obstacle Remove Error", str(exc))
+
+    def _on_replace_obstacle(self) -> None:
+        try:
+            v = self.obstacle_remove_var.get().strip()
+            if not v:
+                raise ValueError("no obstacle index selected")
+            if len(self.obstacle_points) < 3:
+                raise ValueError("draw at least 3 points for replacement obstacle")
+            idx = int(v)
+            replacer = getattr(self.session, "replace_obstacle_polygon", None)
+            if not callable(replacer):
+                raise RuntimeError("current session does not support obstacle replacement")
+            poly = replacer(obstacle_idx=idx, points=self.obstacle_points)
+            self.obstacle_points = []
+            self.obstacle_draw_mode = False
+            self.obstacle_mode_var.set("OFF")
+            self.obstacle_point_count_var.set("0")
+            if not self.enable_online_runtime and self._has_pending_offline_reallocation():
+                self.last_action_var.set(f"Obstacle replaced: idx={idx} (pending re-auction)")
+            else:
+                self.last_action_var.set(f"Obstacle replaced: idx={idx}")
+            self._refresh_all()
+            messagebox.showinfo(
+                "Obstacle Replaced",
+                (
+                    f"Replaced obstacle idx={idx}, area={poly.area:.2f}. "
+                    + ("Click Re-auction Now to recompute allocation." if not self.enable_online_runtime else "")
+                ),
+            )
+        except Exception as exc:
+            messagebox.showerror("Obstacle Replace Error", str(exc))
 
     def run(self) -> None:
         self.root.mainloop()
