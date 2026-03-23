@@ -76,6 +76,7 @@ class OnlineFrameState:
     pending_new_task_replan_count: int
     pending_events: list[OnlineEvent]
     event_history: list[OnlineEvent]
+    pending_task_ops_playback: list[UserActionRecord]
     last_replan_reason: str
     last_event_message: str
     rng_state: dict[str, Any]
@@ -139,6 +140,7 @@ class SimulationSession:
         self._event_id_counter = 0
         self.pending_events: list[OnlineEvent] = []
         self.event_history: list[OnlineEvent] = []
+        self._pending_task_ops_playback: list[UserActionRecord] = []
         self.last_replan_reason = ""
         self.last_event_message = ""
         self._frame_history: list[OnlineFrameState] = []
@@ -231,6 +233,7 @@ class SimulationSession:
         self.pending_new_task_replan_count = 0
         self.pending_events.clear()
         self.event_history.clear()
+        self._pending_task_ops_playback.clear()
         self.last_replan_reason = ""
         self.last_event_message = ""
         self._frame_history.clear()
@@ -339,11 +342,15 @@ class SimulationSession:
             self.start_online(dt=self.online_dt, replan_period_s=self.replan_period_s)
 
         if n == 0:
+            if self._play_next_task_ops_frame():
+                return self.runtime_snapshot()
             self._process_due_events_and_replan()
             self._capture_frame()
             return self.runtime_snapshot()
 
         for _ in range(n):
+            if self._play_next_task_ops_frame():
+                continue
             self._process_due_events_and_replan()
             self._advance_vehicles(self.online_dt)
             self.sim_time += self.online_dt
@@ -425,6 +432,7 @@ class SimulationSession:
             pending_new_task_replan_count=int(self.pending_new_task_replan_count),
             pending_events=copy.deepcopy(self.pending_events),
             event_history=copy.deepcopy(self.event_history),
+            pending_task_ops_playback=copy.deepcopy(self._pending_task_ops_playback),
             last_replan_reason=str(self.last_replan_reason),
             last_event_message=str(self.last_event_message),
             rng_state=copy.deepcopy(self.rng.bit_generator.state),
@@ -439,6 +447,7 @@ class SimulationSession:
         self.pending_new_task_replan_count = int(frame.pending_new_task_replan_count)
         self.pending_events = copy.deepcopy(frame.pending_events)
         self.event_history = copy.deepcopy(frame.event_history)
+        self._pending_task_ops_playback = copy.deepcopy(frame.pending_task_ops_playback)
         self.last_replan_reason = str(frame.last_replan_reason)
         self.last_event_message = str(frame.last_event_message)
         self.rng.bit_generator.state = copy.deepcopy(frame.rng_state)
@@ -1355,6 +1364,70 @@ class SimulationSession:
             )
         )
 
+    def _task_ops_action_is_due(self, action: UserActionRecord) -> bool:
+        if action.frame_idx is not None:
+            current_frame = self._current_frame_index()
+            current_frame = 0 if current_frame is None else int(current_frame)
+            return current_frame >= int(action.frame_idx)
+        if action.sim_time is not None:
+            return self.sim_time + 1e-9 >= float(action.sim_time)
+        return True
+
+    def _schedule_task_ops_action_for_playback(self, action: UserActionRecord) -> None:
+        if not action.online:
+            raise ValueError("task ops playback only supports online actions")
+        assert self.engine is not None
+
+        payload = action.payload
+        if action.action_type in {"add_task", "add_random_task"}:
+            task = Task(
+                id=int(payload["task_id"]),
+                position=(float(payload["x"]), float(payload["y"])),
+                demand=int(payload["demand"]),
+                status="unassigned",
+            )
+            self.schedule_event(at_time=self.sim_time, event_type="add_task", payload={"task": task})
+            return
+
+        if action.action_type == "cancel_task":
+            self.schedule_event(at_time=self.sim_time, event_type="cancel_task", payload={"task_id": int(payload["task_id"])})
+            return
+
+        if action.action_type == "move_task":
+            tid = int(payload["task_id"])
+            current = self.engine.tasks_by_id.get(tid)
+            if current is None:
+                raise ValueError(f"task {tid} not found for move_task playback")
+            self.schedule_event(at_time=self.sim_time, event_type="cancel_task", payload={"task_id": tid})
+            moved = Task(
+                id=tid,
+                position=(float(payload["x"]), float(payload["y"])),
+                demand=int(payload.get("demand", current.demand)),
+                status="unassigned",
+            )
+            self.schedule_event(
+                at_time=self.sim_time,
+                event_type="add_task",
+                payload={"task": moved, "count_for_new_task_batch": False},
+            )
+            return
+
+        raise ValueError(f"unsupported task ops playback action: {action.action_type}")
+
+    def _play_next_task_ops_frame(self) -> bool:
+        if not self._pending_task_ops_playback:
+            return False
+
+        action = self._pending_task_ops_playback[0]
+        if not self._task_ops_action_is_due(action):
+            return False
+
+        self._pending_task_ops_playback.pop(0)
+        self._schedule_task_ops_action_for_playback(action)
+        self._process_due_events_and_replan()
+        self._capture_frame()
+        return True
+
     def replayable_user_actions(self) -> list[UserActionRecord]:
         source = self._recorded_user_actions if self._recorded_user_actions else self._last_recorded_user_actions
         return copy.deepcopy(source)
@@ -1404,13 +1477,29 @@ class SimulationSession:
                         action.replan_period_s if action.replan_period_s is not None else self.replan_period_s
                     ),
                 )
-                target_time = 0.0 if action.sim_time is None else float(action.sim_time)
-                while self.sim_time + 1e-9 < target_time:
-                    self.tick(n=1)
-                if self.sim_time > target_time + 1e-9:
-                    raise ValueError(
-                        f"cannot replay action #{action.action_id} at past sim_time={target_time:.2f}s"
-                    )
+                # Prefer frame-accurate replay when frame index is available.
+                # This keeps online task ops playback aligned with "which frame"
+                # the action originally happened on, instead of collapsing by time.
+                if action.frame_idx is not None:
+                    target_frame = int(action.frame_idx)
+                    current_frame = self._current_frame_index()
+                    current_frame = 0 if current_frame is None else int(current_frame)
+                    while current_frame < target_frame:
+                        self.tick(n=1)
+                        updated = self._current_frame_index()
+                        current_frame = 0 if updated is None else int(updated)
+                    if current_frame > target_frame:
+                        raise ValueError(
+                            f"cannot replay action #{action.action_id} at past frame_idx={target_frame}"
+                        )
+                else:
+                    target_time = 0.0 if action.sim_time is None else float(action.sim_time)
+                    while self.sim_time + 1e-9 < target_time:
+                        self.tick(n=1)
+                    if self.sim_time > target_time + 1e-9:
+                        raise ValueError(
+                            f"cannot replay action #{action.action_id} at past sim_time={target_time:.2f}s"
+                        )
             elif self.online_enabled:
                 raise ValueError("cannot replay offline action after online runtime has started")
 
@@ -1558,7 +1647,41 @@ class SimulationSession:
 
         if reset_first:
             self.reset()
-        self._replay_user_actions(actions)
+        self._pending_task_ops_playback = []
+
+        any_online = any(action.online for action in actions)
+        if not any_online:
+            self._replay_user_actions(actions)
+            self._recorded_user_actions = copy.deepcopy(actions)
+            self._user_action_counter = max(action.action_id for action in actions)
+            return len(actions)
+
+        online_started = False
+        online_actions: list[UserActionRecord] = []
+        for action in actions:
+            if action.online:
+                online_started = True
+                online_actions.append(copy.deepcopy(action))
+                continue
+            if online_started:
+                raise ValueError("cannot replay offline action after online runtime has started")
+            self._apply_user_action_record(action)
+
+        first_online = online_actions[0]
+        self.start_online(
+            dt=first_online.online_dt if first_online.online_dt is not None else self.online_dt,
+            replan_period_s=(
+                first_online.replan_period_s
+                if first_online.replan_period_s is not None
+                else self.replan_period_s
+            ),
+        )
+        self.pause_online()
+        self._pending_task_ops_playback = online_actions
+        if 0 <= self._frame_cursor < len(self._frame_history):
+            self._frame_history[self._frame_cursor] = self._snapshot_frame()
+        self._recorded_user_actions = copy.deepcopy(actions)
+        self._user_action_counter = max(action.action_id for action in actions)
         return len(actions)
 
     def _next_task_id(self) -> int:
@@ -2291,6 +2414,13 @@ class SimulationSession:
     def _timestamp() -> str:
         return datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    @staticmethod
+    def _polygon_to_json_points(poly: Polygon) -> list[list[float]]:
+        coords = list(poly.exterior.coords)
+        if len(coords) >= 2:
+            coords = coords[:-1]
+        return [[float(x), float(y)] for x, y in coords]
+
     def save_snapshot(self, filename: str | None = None) -> Path:
         self._assert_ready()
         assert self.artifacts is not None
@@ -2327,6 +2457,81 @@ class SimulationSession:
         fig.tight_layout()
         fig.savefig(path)
         plt.close(fig)
+        return path
+
+    def export_scenario_json(
+        self,
+        filename: str | None = None,
+        *,
+        include_completed: bool = False,
+        include_canceled: bool = False,
+    ) -> Path:
+        self._assert_ready()
+        assert self.artifacts is not None
+        assert self.engine is not None
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        if filename:
+            path = self.output_dir / filename
+        else:
+            path = self.output_dir / f"scenario_snapshot_{self._timestamp()}_step_{self.step}.json"
+
+        world = self.artifacts.world
+        vehicles_payload: list[dict[str, Any]] = []
+        for v in sorted(self.engine.vehicles, key=lambda x: x.id):
+            if self.online_enabled:
+                start = (float(v.current_pos[0]), float(v.current_pos[1]))
+                heading = float(v.current_heading)
+            else:
+                start = (float(v.start_pos[0]), float(v.start_pos[1]))
+                heading = float(v.heading)
+
+            row: dict[str, Any] = {
+                "id": int(v.id),
+                "start": [start[0], start[1]],
+                "heading": heading,
+                "speed": float(v.speed),
+                "max_omega": float(v.max_omega),
+                "capacity": int(v.capacity),
+            }
+            if self.online_enabled:
+                row["snapshot_remaining_capacity"] = int(v.remaining_capacity)
+                row["snapshot_active_task_id"] = None if v.active_task_id is None else int(v.active_task_id)
+            vehicles_payload.append(row)
+
+        tasks_payload: list[dict[str, Any]] = []
+        for t in sorted(self.engine.tasks, key=lambda x: x.id):
+            if t.status == "completed" and not include_completed:
+                continue
+            if t.status == "canceled" and not include_canceled:
+                continue
+            tasks_payload.append(
+                {
+                    "id": int(t.id),
+                    "position": [float(t.position[0]), float(t.position[1])],
+                    "demand": int(t.demand),
+                }
+            )
+
+        payload: dict[str, Any] = {
+            "world": {
+                "width": float(world.width),
+                "height": float(world.height),
+                "depot_polygon": self._polygon_to_json_points(world.depot_polygon),
+                "obstacles": [self._polygon_to_json_points(obs) for obs in world.obstacles],
+            },
+            "vehicles": vehicles_payload,
+            "tasks": tasks_payload,
+            "meta": {
+                "saved_at": datetime.now().isoformat(timespec="seconds"),
+                "saved_from_online_runtime": bool(self.online_enabled),
+                "sim_time": (float(self.sim_time) if self.online_enabled else None),
+                "step": int(self.step),
+                "include_completed": bool(include_completed),
+                "include_canceled": bool(include_canceled),
+            },
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return path
 
     def export_logs(self, prefix: str | None = None) -> tuple[Path, Path, Path]:
@@ -2755,6 +2960,19 @@ class OfflineSession:
     def save_snapshot(self, filename: str | None = None) -> Path:
         return self._session.save_snapshot(filename=filename)
 
+    def export_scenario_json(
+        self,
+        filename: str | None = None,
+        *,
+        include_completed: bool = False,
+        include_canceled: bool = False,
+    ) -> Path:
+        return self._session.export_scenario_json(
+            filename=filename,
+            include_completed=include_completed,
+            include_canceled=include_canceled,
+        )
+
     def export_logs(self, prefix: str | None = None) -> tuple[Path, Path, Path]:
         return self._session.export_logs(prefix=prefix)
 
@@ -2926,6 +3144,19 @@ class OnlineSession:
 
     def save_snapshot(self, filename: str | None = None) -> Path:
         return self._session.save_snapshot(filename=filename)
+
+    def export_scenario_json(
+        self,
+        filename: str | None = None,
+        *,
+        include_completed: bool = False,
+        include_canceled: bool = False,
+    ) -> Path:
+        return self._session.export_scenario_json(
+            filename=filename,
+            include_completed=include_completed,
+            include_canceled=include_canceled,
+        )
 
     def export_logs(self, prefix: str | None = None) -> tuple[Path, Path, Path]:
         return self._session.export_logs(prefix=prefix)

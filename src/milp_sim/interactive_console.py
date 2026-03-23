@@ -18,9 +18,10 @@ def _print_help() -> None:
     print("  reset_replay                      Reset and replay last recorded user actions")
     print("  undo                              Undo last mutating action")
     print("  plot [filename]                   Save current figure to outputs/")
+    print("  export_scenario [filename]        Export current scene to scenario JSON")
     print("  export_logs [prefix]              Export coordination/verification/big auction logs")
     print("  export_task_ops [filename]        Export add/cancel/move task ops to JSON")
-    print("  replay_task_ops <json_file>       Reset and replay task ops from JSON")
+    print("  replay_task_ops <json_file>       Reset and load task ops JSON for frame-based playback")
     print("  logs [n]                          Show last n verification/coordination logs")
     print("  ops [n]                           Show replayable user action history")
     print("  online_start [dt] [period]        Start online runtime")
@@ -67,13 +68,17 @@ class InteractiveConsole:
         coord_path, verify_path, big_path = self.session.export_logs(prefix=prefix)
         print(f"saved logs: {coord_path} , {verify_path} , {big_path}")
 
+    def _export_scenario(self, filename: str | None) -> None:
+        path = self.session.export_scenario_json(filename=filename)
+        print(f"saved scenario json: {path}")
+
     def _export_task_ops(self, filename: str | None) -> None:
         path = self.session.export_task_ops_json(filename=filename)
         print(f"saved task ops json: {path}")
 
     def _replay_task_ops(self, path: str) -> None:
         count = self.session.replay_task_ops_json(path=path, reset_first=True)
-        print(f"replayed {count} task ops from: {path}")
+        print(f"loaded {count} task ops for playback from: {path}")
 
     def _logs(self, n: int) -> None:
         print(self.session.format_logs_text(n=n))
@@ -123,6 +128,8 @@ class InteractiveConsole:
                 print("undo done")
             elif cmd == "plot":
                 self._plot(filename=tokens[1] if len(tokens) > 1 else None)
+            elif cmd == "export_scenario":
+                self._export_scenario(filename=tokens[1] if len(tokens) > 1 else None)
             elif cmd == "export_logs":
                 self._export_logs(prefix=tokens[1] if len(tokens) > 1 else None)
             elif cmd == "export_task_ops":

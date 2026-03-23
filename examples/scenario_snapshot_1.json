@@ -1,0 +1,174 @@
+{
+  "world": {
+    "width": 80.0,
+    "height": 60.0,
+    "depot_polygon": [
+      [
+        4.0,
+        4.0
+      ],
+      [
+        20.0,
+        4.0
+      ],
+      [
+        20.0,
+        20.0
+      ],
+      [
+        4.0,
+        20.0
+      ]
+    ],
+    "obstacles": [
+      [
+        [
+          24.0,
+          24.0
+        ],
+        [
+          30.0,
+          24.0
+        ],
+        [
+          30.0,
+          56.0
+        ],
+        [
+          24.0,
+          56.0
+        ]
+      ],
+      [
+        [
+          44.0,
+          0.0
+        ],
+        [
+          50.0,
+          0.0
+        ],
+        [
+          50.0,
+          30.0
+        ],
+        [
+          44.0,
+          30.0
+        ]
+      ],
+      [
+        [
+          58.0,
+          28.0
+        ],
+        [
+          64.0,
+          28.0
+        ],
+        [
+          64.0,
+          58.0
+        ],
+        [
+          58.0,
+          58.0
+        ]
+      ]
+    ]
+  },
+  "vehicles": [
+    {
+      "id": 0,
+      "start": [
+        8.0,
+        8.0
+      ],
+      "heading": 0.0,
+      "speed": 5.0,
+      "max_omega": 3.0,
+      "capacity": 25,
+      "snapshot_remaining_capacity": 0,
+      "snapshot_active_task_id": 0
+    },
+    {
+      "id": 1,
+      "start": [
+        8.0,
+        16.0
+      ],
+      "heading": 0.0,
+      "speed": 5.0,
+      "max_omega": 3.0,
+      "capacity": 25,
+      "snapshot_remaining_capacity": 1,
+      "snapshot_active_task_id": 1
+    }
+  ],
+  "tasks": [
+    {
+      "id": 0,
+      "position": [
+        30.0,
+        12.0
+      ],
+      "demand": 1
+    },
+    {
+      "id": 1,
+      "position": [
+        38.0,
+        40.0
+      ],
+      "demand": 1
+    },
+    {
+      "id": 2,
+      "position": [
+        55.0,
+        20.0
+      ],
+      "demand": 2
+    },
+    {
+      "id": 3,
+      "position": [
+        66.0,
+        46.0
+      ],
+      "demand": 2
+    },
+    {
+      "id": 4,
+      "position": [
+        44.0,
+        50.0
+      ],
+      "demand": 2
+    },
+    {
+      "id": 5,
+      "position": [
+        40.0,
+        25.0
+      ],
+      "demand": 2
+    },
+    {
+      "id": 6,
+      "position": [
+        40.0,
+        15.0
+      ],
+      "demand": 1
+    }
+  ],
+  "meta": {
+    "saved_at": "2026-03-23T16:09:26",
+    "saved_from_online_runtime": true,
+    "sim_time": 0.0,
+    "step": 10000,
+    "include_completed": false,
+    "include_canceled": false
+  }
+}

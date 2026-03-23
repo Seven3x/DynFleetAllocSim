@@ -1,5 +1,8 @@
+import json
 import math
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -413,6 +416,78 @@ class TestOnlineRuntime(unittest.TestCase):
         self.assertGreater(len(out), len(path))
         max_seg = max(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(out, out[1:]))
         self.assertLessEqual(max_seg, 0.25 + 1e-9)
+
+    def test_replay_task_ops_json_loads_online_ops_for_frame_based_playback(self) -> None:
+        assert self.session.engine is not None
+        base_tasks = len(self.session.engine.tasks)
+
+        points = []
+        for point in self._iter_free_points():
+            points.append(point)
+            if len(points) == 2:
+                break
+        self.assertEqual(len(points), 2)
+
+        payload = {
+            "schema_version": 1,
+            "session": {
+                "online_dt": 0.5,
+                "replan_period_s": 2.0,
+            },
+            "operations": [
+                {
+                    "action_id": 1,
+                    "action_type": "add_task",
+                    "online": True,
+                    "frame_idx": 0,
+                    "payload": {
+                        "x": points[0][0],
+                        "y": points[0][1],
+                        "demand": 1,
+                        "task_id": self.session._next_task_id(),
+                    },
+                },
+                {
+                    "action_id": 2,
+                    "action_type": "add_task",
+                    "online": True,
+                    "frame_idx": 2,
+                    "payload": {
+                        "x": points[1][0],
+                        "y": points[1][1],
+                        "demand": 1,
+                        "task_id": self.session._next_task_id() + 1,
+                    },
+                },
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "task_ops.json"
+            source.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            count = self.session.replay_task_ops_json(path=source, reset_first=True)
+
+        self.assertEqual(count, 2)
+        self.assertTrue(self.session.online_enabled)
+        self.assertFalse(self.session.online_running)
+        self.assertEqual(self.session.sim_time, 0.0)
+        self.assertEqual(len(self.session.engine.tasks), base_tasks)
+        self.assertEqual(len(self.session._pending_task_ops_playback), 2)
+
+        self.session.tick(n=1)
+        self.assertEqual(self.session.sim_time, 0.0)
+        self.assertEqual(len(self.session.engine.tasks), base_tasks + 1)
+        self.assertEqual(len(self.session._pending_task_ops_playback), 1)
+
+        self.session.tick(n=1)
+        self.assertAlmostEqual(self.session.sim_time, 0.5, places=6)
+        self.assertEqual(len(self.session.engine.tasks), base_tasks + 1)
+        self.assertEqual(len(self.session._pending_task_ops_playback), 1)
+
+        self.session.tick(n=1)
+        self.assertAlmostEqual(self.session.sim_time, 0.5, places=6)
+        self.assertEqual(len(self.session.engine.tasks), base_tasks + 2)
+        self.assertEqual(len(self.session._pending_task_ops_playback), 0)
 
     def test_reset_replay_restores_online_task_and_obstacle_actions(self) -> None:
         assert self.session.artifacts is not None

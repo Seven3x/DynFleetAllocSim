@@ -281,9 +281,10 @@ class _BaseGuiApp:
             ttk.Button(top, text="Undo Last Action", command=self._on_undo).pack(fill="x", pady=3)
             ttk.Button(top, text="Re-auction Now", command=self._on_reallocate_offline).pack(fill="x", pady=3)
         ttk.Button(top, text="Save Snapshot", command=self._on_save_snapshot).pack(fill="x", pady=3)
+        ttk.Button(top, text="Save Scenario JSON", command=self._on_save_scenario_json).pack(fill="x", pady=3)
         ttk.Button(top, text="Export Logs", command=self._on_export_logs).pack(fill="x", pady=3)
         ttk.Button(top, text="Export Task Ops JSON", command=self._on_export_task_ops_json).pack(fill="x", pady=3)
-        ttk.Button(top, text="Replay Task Ops JSON", command=self._on_replay_task_ops_json).pack(fill="x", pady=3)
+        ttk.Button(top, text="Load Task Ops JSON", command=self._on_replay_task_ops_json).pack(fill="x", pady=3)
 
         if self.enable_online_runtime:
             online_frame = ttk.LabelFrame(parent, text="Online Runtime", padding=8)
@@ -974,6 +975,15 @@ class _BaseGuiApp:
         except Exception as exc:
             messagebox.showerror("Snapshot Error", str(exc))
 
+    def _on_save_scenario_json(self) -> None:
+        try:
+            path = self.session.export_scenario_json()
+            self._refresh_all()
+            self.last_action_var.set(f"Scenario saved: {path.name}")
+            messagebox.showinfo("Scenario Saved", f"Saved to:\n{path}")
+        except Exception as exc:
+            messagebox.showerror("Scenario Save Error", str(exc))
+
     def _on_export_logs(self) -> None:
         try:
             coord, verify, big = self.session.export_logs()
@@ -1017,9 +1027,9 @@ class _BaseGuiApp:
             self.task_mode_var.set("OFF")
             if self.enable_online_runtime:
                 self._reset_online_render_clock()
-            self.last_action_var.set(f"Task ops replayed: {replayed}")
+            self.last_action_var.set(f"Task ops loaded: {replayed}")
             self._refresh_all()
-            messagebox.showinfo("Task Ops Replayed", f"Replayed {replayed} operations from:\n{source}")
+            messagebox.showinfo("Task Ops Loaded", f"Loaded {replayed} operations for playback from:\n{source}")
         except Exception as exc:
             messagebox.showerror("Task Ops Replay Error", str(exc))
 

@@ -62,7 +62,7 @@ class SimulationConfig:
     astar_connect_diagonal: bool = True
     # Force pure A* planning path (with shortcut line-of-sight smoothing),
     # bypassing Dubins/connector/Hybrid-A* trajectory generation.
-    force_astar_only: bool = True
+    force_astar_only: bool = False
     # Pre-smooth A* polyline by line-of-sight shortcut before Dubins/fillet.
     astar_smooth_before_dubins: bool = True
     # Use Hybrid A* (x, y, yaw state) as the primary heading-constrained planner.
@@ -201,7 +201,7 @@ class SimulationConfig:
 
     # Online runtime simulation
     online_dt: float = 0.5
-    online_replan_period_s: float = 2.5
+    online_replan_period_s: float = 4
     # Buffer task-switching turns when the first heading change is too abrupt.
     online_max_initial_turn_rad: float = math.pi / 4.0
     # Runtime-only resampling step for following planned polylines more smoothly.
