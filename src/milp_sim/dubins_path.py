@@ -1776,10 +1776,62 @@ def build_dubins_hybrid_path(
     astar_length: Optional[float] = None,
 ) -> Tuple[List[Point2D], float, DubinsHybridMeta]:
     force_mode = bool(getattr(cfg, "dubins_force_mode", False))
+    force_astar_only = bool(getattr(cfg, "force_astar_only", False))
     use_dubins_hybrid = bool(getattr(cfg, "use_dubins_hybrid", False))
     collision_margin = float(getattr(cfg, "dubins_collision_margin", 0.0))
     legacy_debug_prefix = ""
     legacy_reason_detail = ""
+
+    if force_astar_only:
+        if astar_path is None or astar_length is None:
+            astar_path, astar_length = astar_planner.plan((start_pose[0], start_pose[1]), (goal_pose[0], goal_pose[1]))
+        if not astar_path or astar_length == float("inf"):
+            return (
+                [],
+                float("inf"),
+                DubinsHybridMeta(
+                    used_fallback=True,
+                    fallback_segments=0,
+                    dubins_segments=0,
+                    sample_count=0,
+                    dubins_ratio=0.0,
+                    fallback_reason="astar_unreachable",
+                    fallback_details="astar_unreachable:1",
+                    debug_trace="astar_only:unreachable",
+                ),
+            )
+
+        smoothing_margin = max(
+            collision_margin,
+            float(getattr(cfg, "vehicle_radius", 0.0)) + float(getattr(cfg, "safety_margin", 0.0)),
+        )
+        if bool(getattr(cfg, "astar_smooth_before_dubins", True)):
+            base_path = _shortcut_smooth_path(astar_path, world=world, margin=smoothing_margin)
+            if not _polyline_collision_free(base_path, world=world, margin=smoothing_margin):
+                base_path = astar_path
+                trace = "astar_only:raw_astar"
+            else:
+                trace = "astar_only:shortcut"
+        else:
+            base_path = astar_path
+            trace = "astar_only:raw_astar"
+
+        if base_path:
+            base_path[0] = (start_pose[0], start_pose[1])
+            base_path[-1] = (goal_pose[0], goal_pose[1])
+        base_len = _polyline_length(base_path)
+        return (
+            base_path,
+            base_len,
+            DubinsHybridMeta(
+                used_fallback=False,
+                fallback_segments=0,
+                dubins_segments=0,
+                sample_count=len(base_path),
+                dubins_ratio=0.0,
+                debug_trace=trace,
+            ),
+        )
 
     if use_dubins_hybrid and bool(getattr(cfg, "enable_connector_first_planner", True)) and not force_mode:
         connector_points, connector_len, connector_meta = build_segment_connector_path(

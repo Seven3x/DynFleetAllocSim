@@ -131,8 +131,12 @@ def _segment_corrected_time(
     turn_radius = vehicle.speed / max(vehicle.max_omega, 1e-6)
     target_heading = heading_to_point(start_pos, task.position)
     use_dubins_hybrid = bool(getattr(cfg, "use_dubins_hybrid", False))
+    if bool(getattr(cfg, "force_astar_only", False)):
+        use_dubins_hybrid = False
     if is_bid_mode:
         use_dubins_hybrid = bool(getattr(cfg, "bid_verification_use_dubins_hybrid", False))
+        if bool(getattr(cfg, "force_astar_only", False)):
+            use_dubins_hybrid = False
     if not use_dubins_hybrid:
         delta_heading = abs(wrap_to_pi(target_heading - start_heading))
         corrected_length = astar_len + cfg.lambda_psi * turn_radius * delta_heading

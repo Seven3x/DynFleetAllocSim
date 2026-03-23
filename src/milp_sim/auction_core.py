@@ -749,6 +749,7 @@ class AllocationEngine:
         )
 
     def _build_routes_and_time(self) -> None:
+        force_astar_only = bool(getattr(self.cfg, "force_astar_only", False))
         for v in self.vehicles:
             self._recompute_vehicle_state(v)
             v.route_points = [v.start_pos]
@@ -764,38 +765,52 @@ class AllocationEngine:
                 if idx + 1 < len(v.task_sequence):
                     nxt_task = self.tasks_by_id[v.task_sequence[idx + 1]]
                     next_task_pos = nxt_task.position
-                all_headings = goal_heading_candidates(
-                    current_pos=cur,
-                    task_pos=task.position,
-                    next_task_pos=next_task_pos,
-                    turn_radius=turn_radius,
-                    blend_turn_radius_factor=self.cfg.goal_heading_blend_turn_radius_factor,
-                    tolerance_rad=self.cfg.goal_heading_tolerance_rad,
-                    num_samples=self.cfg.goal_heading_num_samples,
-                )
                 target_heading = heading_to_point(cur, task.position)
                 base_astar_path, base_astar_len = self.planner.plan(cur, task.position)
-                heading_sel = select_best_heading_path(
-                    cfg=self.cfg,
-                    world=self.world,
-                    planner=self.planner,
-                    start_pos=cur,
-                    start_heading=cur_heading,
-                    task_pos=task.position,
-                    target_heading=target_heading,
-                    turn_radius=turn_radius,
-                    all_headings=all_headings,
-                    astar_path=base_astar_path,
-                    astar_length=base_astar_len,
-                    build_path_fn=build_final_execution_path,
-                )
-                best_goal_heading = heading_sel.chosen_heading
-                path, length = heading_sel.chosen_path, heading_sel.chosen_length
+                if force_astar_only:
+                    path, length, astar_meta = build_final_execution_path(
+                        world=self.world,
+                        cfg=self.cfg,
+                        start_pose=(cur[0], cur[1], cur_heading),
+                        goal_pose=(task.position[0], task.position[1], target_heading),
+                        astar_planner=self.planner,
+                        turn_radius=turn_radius,
+                        astar_path=base_astar_path,
+                        astar_length=base_astar_len,
+                    )
+                    best_goal_heading = _terminal_heading_from_path(path, target_heading) if path else target_heading
+                    chosen_trace = str(getattr(astar_meta, "debug_trace", "") or "astar_only")
+                else:
+                    all_headings = goal_heading_candidates(
+                        current_pos=cur,
+                        task_pos=task.position,
+                        next_task_pos=next_task_pos,
+                        turn_radius=turn_radius,
+                        blend_turn_radius_factor=self.cfg.goal_heading_blend_turn_radius_factor,
+                        tolerance_rad=self.cfg.goal_heading_tolerance_rad,
+                        num_samples=self.cfg.goal_heading_num_samples,
+                    )
+                    heading_sel = select_best_heading_path(
+                        cfg=self.cfg,
+                        world=self.world,
+                        planner=self.planner,
+                        start_pos=cur,
+                        start_heading=cur_heading,
+                        task_pos=task.position,
+                        target_heading=target_heading,
+                        turn_radius=turn_radius,
+                        all_headings=all_headings,
+                        astar_path=base_astar_path,
+                        astar_length=base_astar_len,
+                        build_path_fn=build_final_execution_path,
+                    )
+                    best_goal_heading = heading_sel.chosen_heading
+                    path, length = heading_sel.chosen_path, heading_sel.chosen_length
+                    chosen_trace = str(getattr(heading_sel.chosen_meta, "debug_trace", "") or "-")
                 if bool(getattr(self.cfg, "plan_debug_enabled", False)):
                     target_vid = int(getattr(self.cfg, "plan_debug_vehicle_id", -1))
                     target_tid = int(getattr(self.cfg, "plan_debug_task_id", -1))
                     if (target_vid < 0 or target_vid == v.id) and (target_tid < 0 or target_tid == tid):
-                        chosen_trace = str(getattr(heading_sel.chosen_meta, "debug_trace", "") or "-")
                         internal_mode = (
                             "position_only"
                             if bool(getattr(self.cfg, "connector_internal_waypoints_position_only", True))
@@ -816,21 +831,22 @@ class AllocationEngine:
                         )
                 if not path or length == float("inf"):
                     raise RuntimeError(
-                        f"Hybrid planning failed for vehicle={v.id}, task={tid}, from={cur} to={task.position}."
+                        f"Route planning failed for vehicle={v.id}, task={tid}, from={cur} to={task.position}."
                     )
 
-                path, length = maybe_buffer_initial_turn_path(
-                    world=self.world,
-                    cfg=self.cfg,
-                    planner=self.planner,
-                    start_pos=cur,
-                    start_heading=cur_heading,
-                    task_pos=task.position,
-                    path=path,
-                    length=length,
-                    goal_heading=best_goal_heading,
-                    turn_radius=turn_radius,
-                )
+                if not force_astar_only:
+                    path, length = maybe_buffer_initial_turn_path(
+                        world=self.world,
+                        cfg=self.cfg,
+                        planner=self.planner,
+                        start_pos=cur,
+                        start_heading=cur_heading,
+                        task_pos=task.position,
+                        path=path,
+                        length=length,
+                        goal_heading=best_goal_heading,
+                        turn_radius=turn_radius,
+                    )
                 runtime_step = max(
                     0.05,
                     float(
@@ -854,7 +870,7 @@ class AllocationEngine:
                 # to avoid visual U-turn spikes at task joints.
                 cur_heading = _terminal_heading_from_path(path, best_goal_heading)
 
-            if len(v.route_points) >= 3 and len(task_waypoint_indices) >= 2:
+            if (not force_astar_only) and len(v.route_points) >= 3 and len(task_waypoint_indices) >= 2:
                 v.route_points = smooth_task_joint_path(
                     world=self.world,
                     cfg=self.cfg,

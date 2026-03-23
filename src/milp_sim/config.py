@@ -32,7 +32,7 @@ class SimulationConfig:
     safety_margin: float = 0.8
 
     vehicle_speed_min: float = 3.5
-    vehicle_speed_max: float = 6.0
+    vehicle_speed_max: float = 6.0 
     vehicle_omega_min: float = 45.0
     vehicle_omega_max: float = 48.5
     vehicle_capacity_min: int = 14
@@ -60,6 +60,9 @@ class SimulationConfig:
 
     astar_resolution: float = 1.0
     astar_connect_diagonal: bool = True
+    # Force pure A* planning path (with shortcut line-of-sight smoothing),
+    # bypassing Dubins/connector/Hybrid-A* trajectory generation.
+    force_astar_only: bool = True
     # Pre-smooth A* polyline by line-of-sight shortcut before Dubins/fillet.
     astar_smooth_before_dubins: bool = True
     # Use Hybrid A* (x, y, yaw state) as the primary heading-constrained planner.
@@ -214,7 +217,7 @@ class SimulationConfig:
     auction_max_rounds: int = 0
     online_task_reach_tolerance: float = 0.25
     # Number of future tasks kept/visualized beyond the current in-progress task.
-    online_future_task_horizon: int = 3
+    online_future_task_horizon: int = 30
     # Planner debug: dump heading-candidate scores into event logs.
     plan_debug_enabled: bool = False
     plan_debug_vehicle_id: int = 2

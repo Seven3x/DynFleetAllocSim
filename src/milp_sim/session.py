@@ -616,6 +616,21 @@ class SimulationSession:
 
         return total
 
+    def _estimate_executed_system_time(self) -> float:
+        self._assert_ready()
+        assert self.engine is not None
+
+        total = 0.0
+        for v in self.engine.vehicles:
+            points = list(getattr(v, "history_points", []) or [])
+            if len(points) < 2:
+                continue
+            dist = 0.0
+            for i in range(len(points) - 1):
+                dist += math.hypot(points[i + 1][0] - points[i][0], points[i + 1][1] - points[i][1])
+            total += dist / max(v.speed, 1e-9)
+        return total
+
     def _apply_preempt_release(self) -> bool:
         self._assert_ready()
         assert self.engine is not None
@@ -796,39 +811,67 @@ class SimulationSession:
             return
 
         turn_radius = v.speed / max(v.max_omega, 1e-6)
+        force_astar_only = bool(getattr(self.cfg, "force_astar_only", False))
         next_task_pos: tuple[float, float] | None = None
         if len(v.task_sequence) >= 2 and v.task_sequence[0] == tid:
             nxt = self.engine.tasks_by_id.get(v.task_sequence[1])
             if nxt is not None:
                 next_task_pos = nxt.position
-        all_headings = goal_heading_candidates(
-            current_pos=v.current_pos,
-            task_pos=task.position,
-            next_task_pos=next_task_pos,
-            turn_radius=turn_radius,
-            blend_turn_radius_factor=self.cfg.goal_heading_blend_turn_radius_factor,
-            tolerance_rad=self.cfg.goal_heading_tolerance_rad,
-            num_samples=self.cfg.goal_heading_num_samples,
-        )
         target_heading = heading_to_point(v.current_pos, task.position)
         base_astar_path, base_astar_len = self.artifacts.planner.plan(v.current_pos, task.position)
-        heading_sel = select_best_heading_path(
-            cfg=self.cfg,
-            world=self.artifacts.world,
-            planner=self.artifacts.planner,
-            start_pos=v.current_pos,
-            start_heading=v.current_heading,
-            task_pos=task.position,
-            target_heading=target_heading,
-            turn_radius=turn_radius,
-            all_headings=all_headings,
-            astar_path=base_astar_path,
-            astar_length=base_astar_len,
-            build_path_fn=build_final_execution_path,
+        if force_astar_only:
+            path, length, astar_meta = build_final_execution_path(
+                world=self.artifacts.world,
+                cfg=self.cfg,
+                start_pose=(v.current_pos[0], v.current_pos[1], v.current_heading),
+                goal_pose=(task.position[0], task.position[1], target_heading),
+                astar_planner=self.artifacts.planner,
+                turn_radius=turn_radius,
+                astar_path=base_astar_path,
+                astar_length=base_astar_len,
+            )
+            best_goal_heading = self._terminal_heading_from_path(path, target_heading) if path else target_heading
+            cand_meta = []
+            chosen_meta_debug = str(getattr(astar_meta, "debug_trace", "") or "astar_only")
+        else:
+            all_headings = goal_heading_candidates(
+                current_pos=v.current_pos,
+                task_pos=task.position,
+                next_task_pos=next_task_pos,
+                turn_radius=turn_radius,
+                blend_turn_radius_factor=self.cfg.goal_heading_blend_turn_radius_factor,
+                tolerance_rad=self.cfg.goal_heading_tolerance_rad,
+                num_samples=self.cfg.goal_heading_num_samples,
+            )
+            heading_sel = select_best_heading_path(
+                cfg=self.cfg,
+                world=self.artifacts.world,
+                planner=self.artifacts.planner,
+                start_pos=v.current_pos,
+                start_heading=v.current_heading,
+                task_pos=task.position,
+                target_heading=target_heading,
+                turn_radius=turn_radius,
+                all_headings=all_headings,
+                astar_path=base_astar_path,
+                astar_length=base_astar_len,
+                build_path_fn=build_final_execution_path,
+            )
+            best_goal_heading = heading_sel.chosen_heading
+            path, length = heading_sel.chosen_path, heading_sel.chosen_length
+            cand_meta = heading_sel.cand_debug
+            chosen_meta_debug = str(getattr(heading_sel.chosen_meta, "debug_trace", "") or "-")
+
+        dpsi_limit_eff = max(0.0, float(getattr(self.cfg, "goal_heading_max_dpsi_rad", 0.0))) + max(
+            0.0,
+            float(getattr(self.cfg, "goal_heading_max_dpsi_slack_rad", 0.0)),
         )
-        best_goal_heading = heading_sel.chosen_heading
-        path, length = heading_sel.chosen_path, heading_sel.chosen_length
-        cand_meta = heading_sel.cand_debug
+        best_score = length
+        if cand_meta:
+            best_score = min(
+                (cand.score for cand in cand_meta if cand.ok and math.isfinite(cand.score)),
+                default=length,
+            )
 
         if bool(getattr(self.cfg, "plan_debug_enabled", False)):
             target_vid = int(getattr(self.cfg, "plan_debug_vehicle_id", -1))
@@ -861,7 +904,7 @@ class SimulationSession:
                     f"V{v.id} T{tid} choose_h={math.degrees(best_goal_heading):.1f}deg "
                     f"choose_dpsi={chosen_dpsi:.1f} choose_len={length:.3f} choose_score={best_score:.3f} "
                     f"dpsi_limit={math.degrees(dpsi_limit_eff):.1f}deg "
-                    f"cand[{len(cand_meta)}]: " + " | ".join(parts)
+                    f"trace={chosen_meta_debug} cand[{len(cand_meta)}]: " + " | ".join(parts)
                 )
                 self.engine.event_logs.append(
                     EventLog(
@@ -876,14 +919,15 @@ class SimulationSession:
             path = [v.current_pos, task.position]
             length = math.hypot(task.position[0] - v.current_pos[0], task.position[1] - v.current_pos[1])
 
-        path, length = self._maybe_buffer_initial_turn_path(
-            v=v,
-            task=task,
-            path=path,
-            length=length,
-            goal_heading=best_goal_heading,
-            turn_radius=turn_radius,
-        )
+        if not force_astar_only:
+            path, length = self._maybe_buffer_initial_turn_path(
+                v=v,
+                task=task,
+                path=path,
+                length=length,
+                goal_heading=best_goal_heading,
+                turn_radius=turn_radius,
+            )
 
         runtime_step = max(
             0.05,
@@ -1927,7 +1971,7 @@ class SimulationSession:
             coordination_logs=self.engine.coordination_logs,
             verification_logs=self.engine.verification_logs,
             event_logs=self.engine.event_logs,
-            system_total_time=self._estimate_remaining_system_time(preempt=False),
+            system_total_time=self._estimate_executed_system_time(),
         )
 
     def status_snapshot(self) -> SessionSnapshot:
@@ -1936,7 +1980,7 @@ class SimulationSession:
                 step=self.step,
                 total_tasks=len(self.engine.tasks if self.engine else []),
                 status_counts=self.status_counts(),
-                system_total_time=self._estimate_remaining_system_time(preempt=False),
+                system_total_time=self._estimate_executed_system_time(),
             )
 
         result = self.result()
@@ -2086,7 +2130,7 @@ class SimulationSession:
                 )
             )
 
-        lines.append(f"estimated_remaining_total_time={self._estimate_remaining_system_time(preempt=False):.3f}")
+        lines.append(f"cumulative_total_time={self._estimate_executed_system_time():.3f}")
         lines.append("-" * 88)
         return "\n".join(lines)
 
@@ -2140,7 +2184,11 @@ class SimulationSession:
 
         title = "Realtime Allocation View"
         if self.online_enabled:
-            title = f"Realtime Allocation View (t={self.sim_time:.1f}s)"
+            cumulative_total_cost = self._estimate_executed_system_time()
+            title = (
+                f"Realtime Allocation View "
+                f"(t={self.sim_time:.1f}s, cumulative_total_cost={cumulative_total_cost:.3f})"
+            )
 
         draw_final_scene_on_axis(
             ax=ax,
