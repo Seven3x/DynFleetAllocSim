@@ -65,8 +65,8 @@ class SimulationConfig:
     force_astar_only: bool = False
     # Pre-smooth A* polyline by line-of-sight shortcut before Dubins/fillet.
     astar_smooth_before_dubins: bool = True
-    # Use Hybrid A* (x, y, yaw state) as the primary heading-constrained planner.
-    use_hybrid_astar: bool = True
+    # Hybrid A* path planning is disabled by default; keep the switch for compatibility.
+    use_hybrid_astar: bool = False
     # If Hybrid A* fails, fall back to legacy A* + Dubins/fillet pipeline.
     hybrid_astar_fallback_to_legacy: bool = True
     # Performance defaults tuned for repeated online/verification calls.
@@ -134,7 +134,7 @@ class SimulationConfig:
     # Candidate family filter used by the legacy-style Dubins maneuver solver.
     # Supported values: "*", "L", "LS", "R", "RS", "*-L", "*-R", "S".
     dubinsmaneuver_ctrl_dir: str = "*"
-    connector_use_hybrid_local_rescue: bool = True
+    connector_use_hybrid_local_rescue: bool = False
     connector_use_plain_astar_fallback: bool = True
     # Prefer rsplan Reeds-Shepp connector for terminal pose-to-pose local links.
     use_rsplan_connector: bool = True

@@ -1160,6 +1160,7 @@ def build_segment_connector_path(
             (not accepted_points)
             and (not span_position_only)
             and use_custom_connector
+            and bool(getattr(cfg, "use_hybrid_astar", False))
             and bool(getattr(cfg, "connector_use_hybrid_local_rescue", True))
         ):
             points, length, diag = astar_planner.plan_hybrid_detailed(
