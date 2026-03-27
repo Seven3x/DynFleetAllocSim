@@ -29,6 +29,7 @@ from .hybrid_heading_selector import select_best_heading_path
 from .log_export import write_auction_big_log, write_coordination_log, write_event_log, write_verification_log
 from .neighbor_coordination import TaskRecord
 from .planner_astar import AStarPlanner
+from .path_quality_metrics import PathQualityMetrics, evaluate_path_quality, summarize_path_quality
 from .simulator import SimulationArtifacts, build_static_scenario
 from .visualization import draw_final_scene_on_axis, plot_final_scene
 
@@ -3096,6 +3097,86 @@ class OfflineSession:
     def export_logs(self, prefix: str | None = None) -> tuple[Path, Path, Path]:
         return self._session.export_logs(prefix=prefix)
 
+    def export_path_quality_report(self, prefix: str | None = None) -> tuple[Path, Path]:
+        if self._session.offline_reallocation_pending():
+            raise ValueError("offline edits pending; click Re-auction Now before exporting path quality")
+        assert self._session.artifacts is not None
+        assert self._session.engine is not None
+
+        output_dir = self._session.output_dir / "path_quality"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if prefix is None:
+            prefix = f"path_quality_{self._session._timestamp()}_step_{self._session.step}"
+
+        report_path = output_dir / f"{prefix}_per_vehicle.jsonl"
+        summary_path = output_dir / f"{prefix}_summary.json"
+
+        result = self._session.result()
+        planner = self._session.artifacts.planner
+        tasks_by_id = {task.id: task for task in result.tasks}
+        verify_logs_by_vehicle: dict[int, list[VerificationLog]] = {}
+        for item in result.verification_logs:
+            verify_logs_by_vehicle.setdefault(item.vehicle_id, []).append(item)
+
+        metrics_rows: list[tuple[int, PathQualityMetrics, dict[str, Any]]] = []
+        for vehicle in sorted(result.vehicles, key=lambda x: x.id):
+            astar_length = self._reference_astar_length(
+                planner=planner,
+                vehicle=vehicle,
+                tasks_by_id=tasks_by_id,
+            )
+            vehicle_logs = verify_logs_by_vehicle.get(vehicle.id, [])
+            fallback_used = any(log.dubins_used_fallback for log in vehicle_logs)
+            fallback_reasons = sorted(
+                {
+                    str(log.dubins_fallback_details).strip()
+                    for log in vehicle_logs
+                    if log.dubins_used_fallback and str(log.dubins_fallback_details).strip()
+                }
+            )
+            metrics = evaluate_path_quality(
+                world=self._session.artifacts.world,
+                points=vehicle.route_points,
+                turn_radius=vehicle.speed / max(vehicle.max_omega, 1e-9),
+                sample_step=min(0.25, float(getattr(self.cfg, "dubins_sample_step", 0.5))),
+                start_heading=float(vehicle.heading),
+                astar_length=astar_length,
+                fallback_used=fallback_used,
+                fallback_reason=" | ".join(fallback_reasons),
+                collision_margin=float(getattr(self.cfg, "dubins_collision_margin", 0.0)),
+            )
+            row = {
+                "mode": "offline",
+                "step": int(self._session.step),
+                "vehicle_id": int(vehicle.id),
+                "task_sequence": [int(tid) for tid in vehicle.task_sequence],
+                "task_count": len(vehicle.task_sequence),
+                "route_point_count": len(vehicle.route_points),
+                "system_total_time": float(result.system_total_time),
+                **metrics.to_dict(),
+            }
+            metrics_rows.append((vehicle.id, metrics, row))
+
+        with report_path.open("w", encoding="utf-8") as f:
+            for _, _, row in metrics_rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+        summary = summarize_path_quality([metrics for _, metrics, _ in metrics_rows])
+        summary_payload: dict[str, Any] = {
+            "mode": "offline",
+            "step": int(self._session.step),
+            "vehicle_count": len(result.vehicles),
+            "task_count": len(result.tasks),
+            "system_total_time": float(result.system_total_time),
+            "has_pending_reallocation": False,
+            "metrics": summary.to_dict(),
+            "files": {
+                "per_vehicle": str(report_path),
+            },
+        }
+        summary_path.write_text(json.dumps(summary_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return report_path, summary_path
+
     def export_task_ops_json(self, filename: str | None = None) -> Path:
         return self._session.export_task_ops_json(filename=filename)
 
@@ -3103,6 +3184,26 @@ class OfflineSession:
         count = self._session.replay_task_ops_json(path=path, reset_first=reset_first)
         self._invalidate_comparison_cache()
         return count
+
+    @staticmethod
+    def _reference_astar_length(
+        *,
+        planner: AStarPlanner,
+        vehicle: Vehicle,
+        tasks_by_id: dict[int, Task],
+    ) -> float | None:
+        current = vehicle.start_pos
+        total = 0.0
+        for tid in vehicle.task_sequence:
+            task = tasks_by_id.get(tid)
+            if task is None:
+                return None
+            _, length = planner.plan(current, task.position)
+            if not math.isfinite(length):
+                return None
+            total += float(length)
+            current = task.position
+        return total
 
 
 class OnlineSession:

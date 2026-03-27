@@ -18,6 +18,8 @@
 - `src/milp_sim/gui_app.py`：Tkinter + Matplotlib GUI
 - `src/milp_sim/main.py`：程序入口（批处理 + CLI + GUI）
 - `src/milp_sim/assignment_cost_experiment.py`：前缀路程代价对比分配实验（纯 A*，输出 PNG + JSON）
+- `src/milp_sim/path_quality_metrics.py`：平滑路径质量评估工具（单段路径指标 + 批量汇总）
+- `docs/path_quality_evaluation.md`：平滑路径规划评估标准、阈值、场景与接手说明
 
 ## 2. 主流程说明
 ### 2.1 快速竞拍
@@ -68,6 +70,12 @@ PYTHONPATH=src python -m milp_sim.main --interactive
 # 或
 PYTHONPATH=src python -m milp_sim.main --gui
 ```
+
+说明：
+- 离线模式的主要操作都在 GUI 内完成，不走命令行交互。
+- 在离线 GUI 中新增/取消任务、移动任务、修改障碍后，需要点击 `Re-auction Now` 才会重新计算分配结果。
+- 若界面状态里出现 `offline_reallocation_pending=True`，说明当前展示的不是最终可评估结果。
+- 离线 GUI 可通过 `Export Path Quality` 导出当前最终结果的路径质量评估。
 
 ### 3.3.1 离线校对差异增强场景（5 车 50 任务）
 新增场景文件：`examples/scenario_offline_5v50_corridor.json`
@@ -179,6 +187,9 @@ python -m milp_sim.assignment_cost_experiment --seed 7
 
 ## 5. GUI 功能
 - 左侧控制区：初始化/重置、Undo、保存快照、导出日志
+- 左侧控制区支持路径质量导出：
+  - `Export Path Quality`：导出当前离线最终结果的路径质量评估
+  - 若处于 `offline_reallocation_pending=True`，会拒绝导出并提示先点击 `Re-auction Now`
 - 左侧控制区支持任务操作脚本：
   - `Export Task Ops JSON`：导出本次会话中任务点新增/删除/移动操作（含 frame_idx/sim_time）
   - `Replay Task Ops JSON`：读取 JSON 并重置后回放，用于复现实验操作
@@ -216,6 +227,8 @@ python -m milp_sim.assignment_cost_experiment --seed 7
 - `outputs/snapshot_*.png`：Session/GUI/CLI 快照
 - `outputs/session_*_coordination_log.txt`：Session/GUI/CLI 协商日志导出
 - `outputs/session_*_verification_log.txt`：Session/GUI/CLI 校对日志导出
+- `outputs/path_quality/path_quality_*_per_vehicle.jsonl`：离线 GUI 路径质量逐车结果
+- `outputs/path_quality/path_quality_*_summary.json`：离线 GUI 路径质量汇总结果
 
 ## 7. 参数调优建议
 在 `src/milp_sim/config.py`：

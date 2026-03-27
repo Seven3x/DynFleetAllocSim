@@ -294,6 +294,8 @@ class _BaseGuiApp:
             ttk.Button(top, text="Save Scenario JSON", command=self._on_save_scenario_json).pack(fill="x", pady=3)
             ttk.Button(top, text="Save Scenario As...", command=self._on_save_scenario_json_as).pack(fill="x", pady=3)
         ttk.Button(top, text="Export Logs", command=self._on_export_logs).pack(fill="x", pady=3)
+        if self.enable_offline_tools:
+            ttk.Button(top, text="Export Path Quality", command=self._on_export_path_quality).pack(fill="x", pady=3)
         ttk.Button(top, text="Export Task Ops JSON", command=self._on_export_task_ops_json).pack(fill="x", pady=3)
         ttk.Button(top, text="Load Task Ops JSON", command=self._on_replay_task_ops_json).pack(fill="x", pady=3)
 
@@ -1093,6 +1095,20 @@ class _BaseGuiApp:
             )
         except Exception as exc:
             messagebox.showerror("Export Error", str(exc))
+
+    def _on_export_path_quality(self) -> None:
+        try:
+            if not hasattr(self.session, "export_path_quality_report"):
+                raise RuntimeError("Current session does not support path quality export.")
+            report, summary = self.session.export_path_quality_report()
+            self._refresh_all()
+            self.last_action_var.set(f"Path quality exported: {summary.name}")
+            messagebox.showinfo(
+                "Path Quality Exported",
+                f"Per-vehicle:\n{report}\n\nSummary:\n{summary}",
+            )
+        except Exception as exc:
+            messagebox.showerror("Path Quality Export Error", str(exc))
 
     def _on_export_task_ops_json(self) -> None:
         try:
