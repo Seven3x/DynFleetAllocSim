@@ -50,6 +50,12 @@
   - 已锁定未执行：从所属车辆任务序列移除并恢复容量，然后局部再分配
 
 ## 3. 如何运行
+推荐统一使用 `conda` 的 `milp` 环境，避免 `shapely`、`tkinter` 等依赖缺失：
+
+```bash
+conda run -n milp env PYTHONPATH=src python -m milp_sim.main --gui
+```
+
 ### 3.1 批处理（默认 Round 2 流程）
 ```bash
 ./run.sh
@@ -76,6 +82,7 @@ PYTHONPATH=src python -m milp_sim.main --gui
 - 在离线 GUI 中新增/取消任务、移动任务、修改障碍后，需要点击 `Re-auction Now` 才会重新计算分配结果。
 - 若界面状态里出现 `offline_reallocation_pending=True`，说明当前展示的不是最终可评估结果。
 - 离线 GUI 可通过 `Export Path Quality` 导出当前最终结果的路径质量评估。
+- 建议从 `conda run -n milp ...` 启动，当前仓库的 GUI 和路径评估测试已在该环境下验证。
 
 ### 3.3.1 离线校对差异增强场景（5 车 50 任务）
 新增场景文件：`examples/scenario_offline_5v50_corridor.json`

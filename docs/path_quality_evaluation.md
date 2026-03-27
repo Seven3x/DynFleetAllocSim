@@ -2,6 +2,26 @@
 
 本文档用于沉淀离线模式和在线模式的 Dubins 平滑路径评估标准，目标是让后续 agent 可以基于统一指标持续迭代，而不是依赖主观观察。
 
+## 0. 推荐环境
+
+统一使用 `conda` 的 `milp` 环境执行 GUI、评估导出和相关测试。
+
+推荐命令：
+
+```bash
+conda run -n milp env PYTHONPATH=src python -m milp_sim.main --gui
+```
+
+已验证事项：
+
+- `conda run -n milp env PYTHONPATH=src python -m unittest src.tests.test_path_quality_metrics`
+- `conda run -n milp env PYTHONPATH=src python -c "from milp_sim.gui_app import OfflineGuiApp; ..."`
+
+原因：
+
+- 当前默认 `delivery` 环境缺少 `shapely`
+- `milp` 环境已确认具备 `shapely` 和 `tkinter`
+
 ## 1. 适用范围
 
 - 离线模式：任务分配完成后，每段执行路径的平滑性、可行性和效率评估。
