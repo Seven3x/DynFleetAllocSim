@@ -3119,7 +3119,15 @@ class OfflineSession:
             verify_logs_by_vehicle.setdefault(item.vehicle_id, []).append(item)
 
         metrics_rows: list[tuple[int, PathQualityMetrics, dict[str, Any]]] = []
+        segment_usage_rates: list[float] = []
+        guard_fallback_rates: list[float] = []
+        dubins_length_ratios: list[float] = []
         for vehicle in sorted(result.vehicles, key=lambda x: x.id):
+            task_waypoint_indices = self._task_waypoint_indices(
+                route_points=vehicle.route_points,
+                task_sequence=vehicle.task_sequence,
+                tasks_by_id=tasks_by_id,
+            )
             astar_length = self._reference_astar_length(
                 planner=planner,
                 vehicle=vehicle,
@@ -3144,13 +3152,33 @@ class OfflineSession:
                 fallback_used=fallback_used,
                 fallback_reason=" | ".join(fallback_reasons),
                 collision_margin=float(getattr(self.cfg, "dubins_collision_margin", 0.0)),
+                task_waypoint_indices=task_waypoint_indices,
             )
+            segment_meta = list(getattr(vehicle, "route_segment_meta", []) or [])
+            segment_count = len(segment_meta)
+            dubins_segment_count = sum(1 for item in segment_meta if bool(item.get("used_dubins", False)))
+            guard_fallback_count = sum(1 for item in segment_meta if bool(item.get("guard_fallback", False)))
+            total_segment_length = sum(float(item.get("segment_length", 0.0)) for item in segment_meta)
+            total_dubins_length = sum(float(item.get("dubins_length", 0.0)) for item in segment_meta)
+            segment_dubins_usage_rate = (dubins_segment_count / segment_count) if segment_count > 0 else 0.0
+            guard_fallback_rate = (guard_fallback_count / segment_count) if segment_count > 0 else 0.0
+            dubins_length_ratio = (total_dubins_length / total_segment_length) if total_segment_length > 1e-9 else 0.0
+            segment_usage_rates.append(segment_dubins_usage_rate)
+            guard_fallback_rates.append(guard_fallback_rate)
+            dubins_length_ratios.append(dubins_length_ratio)
             row = {
                 "mode": "offline",
                 "step": int(self._session.step),
                 "vehicle_id": int(vehicle.id),
                 "task_sequence": [int(tid) for tid in vehicle.task_sequence],
                 "task_count": len(vehicle.task_sequence),
+                "segment_count": int(segment_count),
+                "dubins_segment_count": int(dubins_segment_count),
+                "guard_fallback_count": int(guard_fallback_count),
+                "segment_dubins_usage_rate": float(segment_dubins_usage_rate),
+                "guard_fallback_rate": float(guard_fallback_rate),
+                "dubins_length_ratio": float(dubins_length_ratio),
+                "route_segment_meta": segment_meta,
                 "route_point_count": len(vehicle.route_points),
                 "system_total_time": float(result.system_total_time),
                 **metrics.to_dict(),
@@ -3169,7 +3197,18 @@ class OfflineSession:
             "task_count": len(result.tasks),
             "system_total_time": float(result.system_total_time),
             "has_pending_reallocation": False,
-            "metrics": summary.to_dict(),
+            "metrics": {
+                **summary.to_dict(),
+                "mean_segment_dubins_usage_rate": (
+                    float(sum(segment_usage_rates) / len(segment_usage_rates)) if segment_usage_rates else 0.0
+                ),
+                "mean_guard_fallback_rate": (
+                    float(sum(guard_fallback_rates) / len(guard_fallback_rates)) if guard_fallback_rates else 0.0
+                ),
+                "mean_dubins_length_ratio": (
+                    float(sum(dubins_length_ratios) / len(dubins_length_ratios)) if dubins_length_ratios else 0.0
+                ),
+            },
             "files": {
                 "per_vehicle": str(report_path),
             },
@@ -3204,6 +3243,31 @@ class OfflineSession:
             total += float(length)
             current = task.position
         return total
+
+    @staticmethod
+    def _task_waypoint_indices(
+        *,
+        route_points: list[tuple[float, float]],
+        task_sequence: list[int],
+        tasks_by_id: dict[int, Task],
+    ) -> list[int]:
+        indices: list[int] = []
+        search_start = 1
+        for tid in task_sequence:
+            task = tasks_by_id.get(tid)
+            if task is None:
+                continue
+            found_idx: int | None = None
+            tx, ty = task.position
+            for idx in range(search_start, len(route_points)):
+                px, py = route_points[idx]
+                if abs(px - tx) <= 1e-9 and abs(py - ty) <= 1e-9:
+                    found_idx = idx
+                    search_start = idx + 1
+                    break
+            if found_idx is not None:
+                indices.append(found_idx)
+        return indices
 
 
 class OnlineSession:

@@ -21,6 +21,7 @@ conda run -n milp env PYTHONPATH=src python -m milp_sim.main --gui
 
 - 当前默认 `delivery` 环境缺少 `shapely`
 - `milp` 环境已确认具备 `shapely` 和 `tkinter`
+- `Hybrid A*` 已在本项目中废弃，不应作为后续调优方向
 
 ## 1. 适用范围
 
@@ -103,6 +104,17 @@ dkappa_i = |kappa_{i+1} - kappa_i|
   - 是否触发 A* 或其他兜底方案。
 - `fallback_reason`
   - 回退原因。
+- `segment_dubins_usage_rate`
+  - 最终任务段中仍保留 Dubins/connector 的比例。
+- `guard_fallback_rate`
+  - 因最终安全复核而被打回 A* 参考段的比例。
+- `dubins_length_ratio`
+  - 最终整车路线中，仍由 Dubins 几何贡献的长度占比。
+
+说明：
+
+- `success_rate` 只代表最终路线在当前安全裕度下是否可行，不代表 Dubins 本身保留得好。
+- 若 `success_rate` 高但 `dubins_length_ratio` 很低，通常说明系统主要靠 A* 安全回退保住了可行性。
 
 ## 4. 单次实验聚合指标
 
@@ -118,6 +130,9 @@ dkappa_i = |kappa_{i+1} - kappa_i|
 - `p95_curvature_violation_ratio`
 - `mean_curvature_jump_p95`
 - `mean_max_initial_turn_delta_rad`
+- `mean_segment_dubins_usage_rate`
+- `mean_guard_fallback_rate`
+- `mean_dubins_length_ratio`
 
 在线模式额外输出：
 
@@ -252,7 +267,9 @@ PQI = 35 * Feasibility
   "curvature_abs_p95": 0.43,
   "curvature_jump_p95": 0.27,
   "curvature_violation_ratio": 0.08,
-  "dubins_ratio": 0.74,
+  "segment_dubins_usage_rate": 0.74,
+  "guard_fallback_rate": 0.11,
+  "dubins_length_ratio": 0.23,
   "fallback_used": false,
   "fallback_reason": ""
 }
@@ -267,12 +284,25 @@ PQI = 35 * Feasibility
 
 这样做的原因是离线 GUI 当前稳定暴露的是每车最终 `route_points`，适合先形成一致、低风险的评估闭环。
 
+复杂场景批跑命令：
+
+```bash
+conda run -n milp env PYTHONPATH=src python -m milp_sim.path_quality_benchmark
+```
+
+默认输出：
+
+- `outputs/path_quality_benchmark/benchmark_summary.json`
+- `outputs/path_quality_benchmark/<scenario_name>/...`
+
 ## 10. 当前可复用工具
 
 当前仓库已新增：
 
 - `src/milp_sim/path_quality_metrics.py`
   - 单段路径评估与批量汇总工具。
+- `src/milp_sim/path_quality_benchmark.py`
+  - 复杂离线场景 benchmark，默认批量跑若干高难场景并汇总。
 - `src/tests/test_path_quality_metrics.py`
   - 基础指标测试，防止评估定义漂移。
 - 离线 GUI 导出入口：

@@ -31,6 +31,16 @@ def polyline_is_clear(world: WorldMap, points: List[Point2D], margin: float) -> 
     return not line.intersects(world.obstacle_union)
 
 
+def path_clearance_margin(cfg: SimulationConfig) -> float:
+    base_margin = float(getattr(cfg, "dubins_collision_margin", 0.0))
+    if bool(getattr(cfg, "trajectory_guard_use_vehicle_footprint", False)):
+        return max(
+            base_margin,
+            float(getattr(cfg, "vehicle_radius", 0.0)) + float(getattr(cfg, "safety_margin", 0.0)),
+        )
+    return base_margin
+
+
 def _dedupe_points(points: List[Point2D]) -> List[Point2D]:
     if not points:
         return []
@@ -123,6 +133,35 @@ def _sample_arc_through_waypoint(
     if not first or not second:
         return None
     return _dedupe_points(first + second[1:])
+
+
+def _joint_context_index(points: List[Point2D], center_idx: int, *, direction: int, min_span: float) -> int | None:
+    if direction not in (-1, 1):
+        raise ValueError("direction must be -1 or 1")
+    if center_idx <= 0 or center_idx >= len(points) - 1:
+        return None
+    traveled = 0.0
+    idx = center_idx
+    while True:
+        nxt = idx + direction
+        if nxt < 0 or nxt >= len(points):
+            return None
+        traveled += math.hypot(points[nxt][0] - points[idx][0], points[nxt][1] - points[idx][1])
+        idx = nxt
+        if traveled >= min_span - 1e-9:
+            return idx
+
+
+def _heading_between(src: Point2D, dst: Point2D) -> float:
+    return math.atan2(dst[1] - src[1], dst[0] - src[0])
+
+
+def _angle_bisector_heading(h1: float, h2: float) -> float:
+    sx = math.cos(h1) + math.cos(h2)
+    sy = math.sin(h1) + math.sin(h2)
+    if abs(sx) <= 1e-9 and abs(sy) <= 1e-9:
+        return h2
+    return math.atan2(sy, sx)
 
 
 def segment_is_clear(world: WorldMap, start: Point2D, end: Point2D, margin: float) -> bool:
@@ -279,10 +318,7 @@ def maybe_buffer_initial_turn_path(
     if abs(desired_delta) <= max_initial_turn + 1e-9:
         return path, length
 
-    clearance = max(
-        float(getattr(cfg, "dubins_collision_margin", 0.0)),
-        float(getattr(cfg, "vehicle_radius", 0.0)) + float(getattr(cfg, "safety_margin", 0.0)),
-    )
+    clearance = path_clearance_margin(cfg)
     needed_turn = max(0.0, abs(desired_delta) - max_initial_turn)
     candidate_steps = [
         min(abs(desired_delta), needed_turn),
@@ -337,6 +373,123 @@ def maybe_buffer_initial_turn_path(
     return path, length
 
 
+def rebuild_fallback_path_with_heading_release(
+    world: WorldMap,
+    cfg: SimulationConfig,
+    planner: AStarPlanner,
+    *,
+    start_pos: Point2D,
+    start_heading: float,
+    goal_pos: Point2D,
+    base_path: List[Point2D],
+    base_length: float,
+) -> Tuple[List[Point2D], float]:
+    if not base_path or not math.isfinite(base_length):
+        return base_path, base_length
+
+    clearance = path_clearance_margin(cfg)
+    initial_turn = path_initial_turn_delta(base_path, start_heading)
+    if initial_turn <= math.pi / 2.0 + 1e-9:
+        return base_path, base_length
+
+    best_path = list(base_path)
+    best_length = float(base_length)
+    best_score = float("inf")
+    for release_distance in (0.75, 1.0, 1.5, 2.0, 3.0, 4.0):
+        release_point = (
+            start_pos[0] + math.cos(start_heading) * release_distance,
+            start_pos[1] + math.sin(start_heading) * release_distance,
+        )
+        prefix = [start_pos, release_point]
+        if not world.point_is_free(release_point, clearance=clearance):
+            continue
+        if not polyline_is_clear(world, prefix, margin=clearance):
+            continue
+
+        tail_path, tail_length = planner.plan(release_point, goal_pos)
+        if not tail_path or not math.isfinite(tail_length):
+            continue
+
+        candidate = _dedupe_points(prefix + list(tail_path[1:]))
+        if len(candidate) < 2 or not polyline_is_clear(world, candidate, margin=clearance):
+            continue
+
+        candidate_initial_turn = path_initial_turn_delta(candidate, start_heading)
+        score = candidate_length = 0.0
+        for i in range(len(candidate) - 1):
+            candidate_length += math.hypot(candidate[i + 1][0] - candidate[i][0], candidate[i + 1][1] - candidate[i][1])
+        score = candidate_initial_turn + 0.02 * candidate_length
+        if score < best_score:
+            best_score = score
+            best_path = candidate
+            best_length = candidate_length
+
+    return best_path, best_length
+
+
+def stabilize_terminal_approach_path(
+    world: WorldMap,
+    cfg: SimulationConfig,
+    points: List[Point2D],
+) -> Tuple[List[Point2D], float]:
+    path = _dedupe_points(points)
+    if len(path) < 4:
+        return path, sum(
+            math.hypot(path[i + 1][0] - path[i][0], path[i + 1][1] - path[i][1]) for i in range(len(path) - 1)
+        )
+
+    clearance = path_clearance_margin(cfg)
+    goal = path[-1]
+    tail_window = min(len(path) - 2, 24)
+    best_path = list(path)
+    best_score = float("inf")
+    best_length = sum(math.hypot(path[i + 1][0] - path[i][0], path[i + 1][1] - path[i][1]) for i in range(len(path) - 1))
+
+    def _tail_score(candidate: List[Point2D]) -> tuple[float, float]:
+        tail = candidate[-min(len(candidate), 20) :]
+        signed_deltas: List[float] = []
+        prev_heading: float | None = None
+        for i in range(len(tail) - 1):
+            h = math.atan2(tail[i + 1][1] - tail[i][1], tail[i + 1][0] - tail[i][0])
+            if prev_heading is not None:
+                signed_deltas.append(wrap_to_pi(h - prev_heading))
+            prev_heading = h
+        wiggle_threshold = math.radians(3.0)
+        flips = 0
+        prev_sign = 0
+        energy = 0.0
+        for delta in signed_deltas:
+            if abs(delta) <= wiggle_threshold:
+                continue
+            energy += abs(delta)
+            sign = 1 if delta > 0.0 else -1
+            if prev_sign != 0 and sign != prev_sign:
+                flips += 1
+            prev_sign = sign
+        return float(flips), energy
+
+    for keep_back in range(2, tail_window + 1):
+        anchor_idx = len(path) - 1 - keep_back
+        anchor = path[anchor_idx]
+        shortcut = path[: anchor_idx + 1] + [goal]
+        if not polyline_is_clear(world, shortcut[-2:], margin=clearance):
+            continue
+        if not polyline_is_clear(world, shortcut, margin=clearance):
+            continue
+        flips, energy = _tail_score(shortcut)
+        candidate_length = sum(
+            math.hypot(shortcut[i + 1][0] - shortcut[i][0], shortcut[i + 1][1] - shortcut[i][1])
+            for i in range(len(shortcut) - 1)
+        )
+        score = 4.0 * flips + energy + 0.01 * candidate_length
+        if score < best_score - 1e-9:
+            best_score = score
+            best_path = shortcut
+            best_length = candidate_length
+
+    return best_path, best_length
+
+
 def smooth_task_joint_path(
     world: WorldMap,
     cfg: SimulationConfig,
@@ -359,21 +512,26 @@ def smooth_task_joint_path(
             )
         ),
     )
-    clearance = max(
-        float(getattr(cfg, "dubins_collision_margin", 0.0)),
-        float(getattr(cfg, "vehicle_radius", 0.0)) + float(getattr(cfg, "safety_margin", 0.0)),
-    )
-    # Keep this local and conservative: smooth only meaningful corners and never clip obstacles.
-    min_turn = math.radians(20.0)
-    base_cut = max(0.4, min(2.0, 0.9 * max(turn_radius, 1e-6)))
+    clearance = path_clearance_margin(cfg)
+    # Keep this local and conservative, but probe several cut sizes so hard task joints
+    # still get a chance to smooth even when the largest arc collides.
+    min_turn = math.radians(10.0)
+    base_cut = max(0.4, min(2.4, 1.0 * max(turn_radius, 1e-6)))
+    context_span = max(0.75, 3.0 * max_step)
 
     for idx in sorted(set(task_waypoint_indices), reverse=True):
         if idx <= 0 or idx >= len(out) - 1:
             continue
 
-        prev_pt = out[idx - 1]
+        prev_idx = _joint_context_index(out, idx, direction=-1, min_span=context_span)
+        next_idx = _joint_context_index(out, idx, direction=1, min_span=context_span)
+        if prev_idx is None or next_idx is None or prev_idx >= idx or next_idx <= idx:
+            prev_idx = idx - 1
+            next_idx = idx + 1
+
+        prev_pt = out[prev_idx]
         cur_pt = out[idx]
-        next_pt = out[idx + 1]
+        next_pt = out[next_idx]
 
         in_vec = (cur_pt[0] - prev_pt[0], cur_pt[1] - prev_pt[1])
         out_vec = (next_pt[0] - cur_pt[0], next_pt[1] - cur_pt[1])
@@ -392,23 +550,105 @@ def smooth_task_joint_path(
         if turn < min_turn:
             continue
 
-        cut = min(base_cut, 0.45 * in_len, 0.45 * out_len)
-        if cut <= max_step:
+        base_cut_limit = min(base_cut, 0.48 * in_len, 0.48 * out_len)
+        if base_cut_limit <= max_step:
             continue
 
-        arc_start = (cur_pt[0] - in_dir[0] * cut, cur_pt[1] - in_dir[1] * cut)
-        arc_end = (cur_pt[0] + out_dir[0] * cut, cur_pt[1] + out_dir[1] * cut)
-        arc_pts = _sample_arc_through_waypoint(arc_start, cur_pt, arc_end, max_step=max_step)
-        if arc_pts is None or len(arc_pts) < 3:
+        improved = False
+        for cut_scale in (1.0, 0.8, 0.65, 0.5, 0.35):
+            cut = base_cut_limit * cut_scale
+            if cut <= max_step:
+                continue
+
+            arc_start = (cur_pt[0] - in_dir[0] * cut, cur_pt[1] - in_dir[1] * cut)
+            arc_end = (cur_pt[0] + out_dir[0] * cut, cur_pt[1] + out_dir[1] * cut)
+            arc_pts = _sample_arc_through_waypoint(arc_start, cur_pt, arc_end, max_step=max_step)
+            if arc_pts is None or len(arc_pts) < 3:
+                continue
+
+            local_candidate = [prev_pt] + arc_pts + [next_pt]
+            if not polyline_is_clear(world, local_candidate, margin=clearance):
+                continue
+
+            out = out[:prev_idx] + local_candidate + out[next_idx + 1 :]
+            improved = True
+            break
+
+        if improved:
             continue
 
-        local_candidate = [prev_pt] + arc_pts + [next_pt]
-        if not polyline_is_clear(world, local_candidate, margin=clearance):
-            continue
-
-        out = out[: idx - 1] + local_candidate + out[idx + 2 :]
+        h_in = _heading_between(prev_pt, cur_pt)
+        h_out = _heading_between(cur_pt, next_pt)
+        tangent_heading = _angle_bisector_heading(h_in, h_out)
+        tangent_limit = min(0.45 * in_len, 0.45 * out_len)
+        for offset_scale in (0.35, 0.25, 0.18):
+            offset = min(tangent_limit, base_cut_limit * offset_scale)
+            if offset <= max_step:
+                continue
+            pre_pt = (
+                cur_pt[0] - math.cos(tangent_heading) * offset,
+                cur_pt[1] - math.sin(tangent_heading) * offset,
+            )
+            post_pt = (
+                cur_pt[0] + math.cos(tangent_heading) * offset,
+                cur_pt[1] + math.sin(tangent_heading) * offset,
+            )
+            bridge_candidate = [prev_pt, pre_pt, cur_pt, post_pt, next_pt]
+            if not polyline_is_clear(world, bridge_candidate, margin=clearance):
+                relaxed_margin = max(0.0, 0.5 * clearance)
+                if relaxed_margin + 1e-9 < clearance and not polyline_is_clear(
+                    world, bridge_candidate, margin=relaxed_margin
+                ):
+                    continue
+            out = out[:prev_idx] + bridge_candidate + out[next_idx + 1 :]
+            break
 
     return _dedupe_points(out)
+
+
+def smooth_task_segment_path(
+    world: WorldMap,
+    cfg: SimulationConfig,
+    points: List[Point2D],
+    task_waypoint_indices: List[int],
+) -> tuple[List[Point2D], List[int]]:
+    out = _dedupe_points(points)
+    if len(out) < 3 or not task_waypoint_indices:
+        return out, list(task_waypoint_indices)
+
+    clearance = path_clearance_margin(cfg)
+    new_points: List[Point2D] = [out[0]]
+    new_indices: List[int] = []
+    anchor = 0
+
+    for idx in task_waypoint_indices:
+        if idx <= anchor or idx >= len(out):
+            continue
+        segment = out[anchor : idx + 1]
+        simplified = simplify_reference_polyline(
+            world,
+            segment,
+            margin=clearance,
+            enable_shortcut=bool(getattr(cfg, "connector_shortcut_enable", True)),
+            enable_string_pull=bool(getattr(cfg, "connector_string_pull_enable", True)),
+            string_pull_passes=int(getattr(cfg, "connector_string_pull_passes", 2)),
+            split_turn_angle_threshold=0.0,
+        )
+        if len(simplified) < 2:
+            simplified = list(segment)
+
+        simplified[0] = segment[0]
+        simplified[-1] = segment[-1]
+        if not polyline_is_clear(world, simplified, margin=clearance):
+            simplified = list(segment)
+        if len(new_points) > 0:
+            new_points.extend(simplified[1:])
+        else:
+            new_points.extend(simplified)
+        new_indices.append(len(new_points) - 1)
+        anchor = idx
+
+    return _dedupe_points(new_points), new_indices
 
 
 def resample_path(points: List[Point2D], max_step: float) -> List[Point2D]:

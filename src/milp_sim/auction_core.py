@@ -4,6 +4,8 @@ import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from shapely.geometry import Point
+
 from .config import SimulationConfig
 from .cost_estimator import (
     fast_cost_estimate_from_state,
@@ -16,7 +18,16 @@ from .entities import Task, Vehicle
 from .hybrid_heading_selector import select_best_heading_path
 from .map_utils import WorldMap
 from .neighbor_coordination import CoordinationLog, TaskRecord, build_neighbors, run_coordination
-from .path_postprocess import maybe_buffer_initial_turn_path, resample_path, smooth_task_joint_path
+from .path_postprocess import (
+    rebuild_fallback_path_with_heading_release,
+    maybe_buffer_initial_turn_path,
+    path_clearance_margin,
+    polyline_is_clear,
+    resample_path,
+    smooth_task_joint_path,
+    smooth_task_segment_path,
+    stabilize_terminal_approach_path,
+)
 from .planner_astar import AStarPlanner
 from .verification import VerificationResult, verify_bid
 
@@ -31,6 +42,19 @@ def _terminal_heading_from_path(path: List[Tuple[float, float]], fallback: float
         if abs(dx) > 1e-9 or abs(dy) > 1e-9:
             return math.atan2(dy, dx)
     return fallback
+
+
+def _polyline_length(points: Sequence[Tuple[float, float]]) -> float:
+    total = 0.0
+    for i in range(len(points) - 1):
+        total += math.hypot(points[i + 1][0] - points[i][0], points[i + 1][1] - points[i][1])
+    return total
+
+
+def _planning_turn_radius(speed: float, max_omega: float, cfg: SimulationConfig) -> float:
+    base_radius = speed / max(max_omega, 1e-6)
+    scale = max(0.3, min(1.0, float(getattr(cfg, "planning_turn_radius_scale", 1.0))))
+    return base_radius * scale
 
 
 @dataclass
@@ -754,17 +778,22 @@ class AllocationEngine:
             self._recompute_vehicle_state(v)
             v.route_points = [v.start_pos]
             v.route_length = 0.0
+            v.route_segment_meta = []
             cur = v.start_pos
             cur_heading = v.heading
             task_waypoint_indices: List[int] = []
 
             for idx, tid in enumerate(v.task_sequence):
                 task = self.tasks_by_id[tid]
-                turn_radius = v.speed / max(v.max_omega, 1e-6)
+                turn_radius = _planning_turn_radius(v.speed, v.max_omega, self.cfg)
                 next_task_pos: Optional[Tuple[float, float]] = None
                 if idx + 1 < len(v.task_sequence):
                     nxt_task = self.tasks_by_id[v.task_sequence[idx + 1]]
                     next_task_pos = nxt_task.position
+                    if not getattr(self.world.obstacle_union, "is_empty", True):
+                        next_task_clearance = Point(nxt_task.position).distance(self.world.obstacle_union)
+                        if next_task_clearance + 1e-9 < path_clearance_margin(self.cfg):
+                            next_task_pos = None
                 target_heading = heading_to_point(cur, task.position)
                 base_astar_path, base_astar_len = self.planner.plan(cur, task.position)
                 if force_astar_only:
@@ -780,6 +809,7 @@ class AllocationEngine:
                     )
                     best_goal_heading = _terminal_heading_from_path(path, target_heading) if path else target_heading
                     chosen_trace = str(getattr(astar_meta, "debug_trace", "") or "astar_only")
+                    chosen_meta = astar_meta
                 else:
                     all_headings = goal_heading_candidates(
                         current_pos=cur,
@@ -806,7 +836,8 @@ class AllocationEngine:
                     )
                     best_goal_heading = heading_sel.chosen_heading
                     path, length = heading_sel.chosen_path, heading_sel.chosen_length
-                    chosen_trace = str(getattr(heading_sel.chosen_meta, "debug_trace", "") or "-")
+                    chosen_meta = heading_sel.chosen_meta
+                    chosen_trace = str(getattr(chosen_meta, "debug_trace", "") or "-")
                 if bool(getattr(self.cfg, "plan_debug_enabled", False)):
                     target_vid = int(getattr(self.cfg, "plan_debug_vehicle_id", -1))
                     target_tid = int(getattr(self.cfg, "plan_debug_task_id", -1))
@@ -857,27 +888,165 @@ class AllocationEngine:
                         )
                     ),
                 )
+                route_clearance = path_clearance_margin(self.cfg)
+                used_dubins = bool(
+                    (not force_astar_only)
+                    and chosen_meta is not None
+                    and (
+                        int(getattr(chosen_meta, "dubins_segments", 0)) > 0
+                        or float(getattr(chosen_meta, "dubins_ratio", 0.0)) > 1e-9
+                    )
+                )
+                original_dubins_ratio = (
+                    float(getattr(chosen_meta, "dubins_ratio", 0.0)) if used_dubins and chosen_meta is not None else 0.0
+                )
+                guard_fallback = False
                 path = resample_path(path, max_step=runtime_step)
                 path[0] = cur
                 path[-1] = task.position
+                if not force_astar_only and path and len(path) >= 4:
+                    path, length = stabilize_terminal_approach_path(
+                        world=self.world,
+                        cfg=self.cfg,
+                        points=path,
+                    )
+                    path[0] = cur
+                    path[-1] = task.position
+                if not polyline_is_clear(self.world, path, margin=route_clearance):
+                    fallback_path = resample_path(list(base_astar_path), max_step=runtime_step)
+                    if fallback_path:
+                        fallback_path[0] = cur
+                        fallback_path[-1] = task.position
+                    path = fallback_path if fallback_path else list(base_astar_path)
+                    length = base_astar_len
+                    best_goal_heading = _terminal_heading_from_path(path, target_heading)
+                    if not force_astar_only and path and len(path) >= 2 and math.isfinite(length):
+                        path, length = rebuild_fallback_path_with_heading_release(
+                            world=self.world,
+                            cfg=self.cfg,
+                            planner=self.planner,
+                            start_pos=cur,
+                            start_heading=cur_heading,
+                            goal_pos=task.position,
+                            base_path=path,
+                            base_length=length,
+                        )
+                        best_goal_heading = _terminal_heading_from_path(path, best_goal_heading)
+                    if not force_astar_only and path and len(path) >= 2 and math.isfinite(length):
+                        buffered_fallback_path, buffered_fallback_length = maybe_buffer_initial_turn_path(
+                            world=self.world,
+                            cfg=self.cfg,
+                            planner=self.planner,
+                            start_pos=cur,
+                            start_heading=cur_heading,
+                            task_pos=task.position,
+                            path=path,
+                            length=length,
+                            goal_heading=best_goal_heading,
+                            turn_radius=turn_radius,
+                        )
+                        if (
+                            buffered_fallback_path
+                            and math.isfinite(buffered_fallback_length)
+                            and polyline_is_clear(self.world, buffered_fallback_path, margin=route_clearance)
+                        ):
+                            path = buffered_fallback_path
+                            length = buffered_fallback_length
+                            best_goal_heading = _terminal_heading_from_path(path, best_goal_heading)
+                    guard_fallback = True
+                    used_dubins = False
+                    original_dubins_ratio = 0.0
+                    if polyline_is_clear(self.world, path, margin=route_clearance):
+                        self.event_logs.append(
+                            EventLog(
+                                step=self._round_idx,
+                                event_type="route_segment_guard_fallback",
+                                task_id=tid,
+                                message=f"vehicle=V{v.id} switched_to_astar_guarded_segment",
+                            )
+                        )
+                    else:
+                        self.event_logs.append(
+                            EventLog(
+                                step=self._round_idx,
+                                event_type="route_segment_guard_degraded",
+                                task_id=tid,
+                                message=(
+                                    f"vehicle=V{v.id} astar_segment_still_unsafe_at_clearance={route_clearance:.3f} "
+                                    f"from={cur} to={task.position}"
+                                ),
+                            )
+                        )
 
                 if len(path) > 1:
                     v.route_points.extend(path[1:])
                 task_waypoint_indices.append(len(v.route_points) - 1)
                 v.route_length += length
+                segment_length = _polyline_length(path)
+                v.route_segment_meta.append(
+                    {
+                        "task_id": int(tid),
+                        "segment_length": float(segment_length),
+                        "used_dubins": bool(used_dubins),
+                        "dubins_length": float(segment_length * max(0.0, min(1.0, original_dubins_ratio))),
+                        "guard_fallback": bool(guard_fallback),
+                        "fallback_used": bool(getattr(chosen_meta, "used_fallback", False)) if chosen_meta is not None else False,
+                        "fallback_reason": (
+                            str(getattr(chosen_meta, "fallback_reason", "") or getattr(chosen_meta, "fallback_details", ""))
+                            if chosen_meta is not None
+                            else ""
+                        ),
+                        "debug_trace": str(getattr(chosen_meta, "debug_trace", "") or "") if chosen_meta is not None else "",
+                    }
+                )
                 cur = task.position
                 # Keep segment handoff consistent with the actual geometric tail direction
                 # to avoid visual U-turn spikes at task joints.
                 cur_heading = _terminal_heading_from_path(path, best_goal_heading)
 
-            if (not force_astar_only) and len(v.route_points) >= 3 and len(task_waypoint_indices) >= 2:
-                v.route_points = smooth_task_joint_path(
+            preserve_dubins_geometry = bool(getattr(self.cfg, "preserve_dubins_route_geometry", True))
+            if (
+                (not force_astar_only)
+                and (not preserve_dubins_geometry)
+                and len(v.route_points) >= 3
+                and len(task_waypoint_indices) >= 2
+            ):
+                v.route_points, task_waypoint_indices = smooth_task_segment_path(
+                    world=self.world,
+                    cfg=self.cfg,
+                    points=v.route_points,
+                    task_waypoint_indices=task_waypoint_indices,
+                )
+                unsmoothed_route = list(v.route_points)
+                smoothed_route = smooth_task_joint_path(
                     world=self.world,
                     cfg=self.cfg,
                     points=v.route_points,
                     task_waypoint_indices=task_waypoint_indices,
                     turn_radius=v.speed / max(v.max_omega, 1e-6),
+                    
                 )
+                route_clearance = path_clearance_margin(self.cfg)
+                if polyline_is_clear(self.world, smoothed_route, margin=route_clearance):
+                    v.route_points = smoothed_route
+                else:
+                    v.route_points = unsmoothed_route
+
+            if v.route_segment_meta and task_waypoint_indices:
+                anchor = 0
+                for seg_idx, idx in enumerate(task_waypoint_indices):
+                    if seg_idx >= len(v.route_segment_meta) or idx <= anchor or idx >= len(v.route_points):
+                        anchor = idx
+                        continue
+                    segment = v.route_points[anchor : idx + 1]
+                    final_length = _polyline_length(segment)
+                    meta = v.route_segment_meta[seg_idx]
+                    original_length = max(1e-9, float(meta.get("segment_length", 0.0)))
+                    original_dubins_length = float(meta.get("dubins_length", 0.0))
+                    retained_ratio = max(0.0, min(1.0, original_dubins_length / original_length))
+                    meta["segment_length"] = float(final_length)
+                    meta["dubins_length"] = float(final_length * retained_ratio) if bool(meta.get("used_dubins", False)) else 0.0
+                    anchor = idx
 
 
 def run_static_auction(

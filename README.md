@@ -19,6 +19,7 @@
 - `src/milp_sim/main.py`：程序入口（批处理 + CLI + GUI）
 - `src/milp_sim/assignment_cost_experiment.py`：前缀路程代价对比分配实验（纯 A*，输出 PNG + JSON）
 - `src/milp_sim/path_quality_metrics.py`：平滑路径质量评估工具（单段路径指标 + 批量汇总）
+- `src/milp_sim/path_quality_benchmark.py`：复杂离线场景路径质量 benchmark（批量跑场景并汇总）
 - `docs/path_quality_evaluation.md`：平滑路径规划评估标准、阈值、场景与接手说明
 
 ## 2. 主流程说明
@@ -83,6 +84,8 @@ PYTHONPATH=src python -m milp_sim.main --gui
 - 若界面状态里出现 `offline_reallocation_pending=True`，说明当前展示的不是最终可评估结果。
 - 离线 GUI 可通过 `Export Path Quality` 导出当前最终结果的路径质量评估。
 - 建议从 `conda run -n milp ...` 启动，当前仓库的 GUI 和路径评估测试已在该环境下验证。
+- `Hybrid A*` 已在本项目中废弃，不再作为路径质量优化方向。
+- 路径质量导出除 `success_rate` 外，还会给出 `segment_dubins_usage_rate`、`guard_fallback_rate`、`dubins_length_ratio`，用于判断最终结果里还剩多少 Dubins。
 
 ### 3.3.1 离线校对差异增强场景（5 车 50 任务）
 新增场景文件：`examples/scenario_offline_5v50_corridor.json`
@@ -147,6 +150,18 @@ PYTHONPATH=src python -m milp_sim.assignment_cost_experiment --seed 11
 $env:PYTHONPATH = "src"
 python -m milp_sim.assignment_cost_experiment --seed 7
 ```
+
+### 3.5 复杂场景路径质量 Benchmark
+推荐在 `milp` 环境中运行：
+
+```bash
+conda run -n milp env PYTHONPATH=src python -m milp_sim.path_quality_benchmark
+```
+
+输出目录：
+
+- `outputs/path_quality_benchmark/benchmark_summary.json`
+- `outputs/path_quality_benchmark/<scenario_name>/...`
 
 运行后会：
 - 在终端打印两种模式下的任务分配、每车路程、系统总路程
@@ -236,6 +251,10 @@ python -m milp_sim.assignment_cost_experiment --seed 7
 - `outputs/session_*_verification_log.txt`：Session/GUI/CLI 校对日志导出
 - `outputs/path_quality/path_quality_*_per_vehicle.jsonl`：离线 GUI 路径质量逐车结果
 - `outputs/path_quality/path_quality_*_summary.json`：离线 GUI 路径质量汇总结果
+- 逐车结果额外包含：
+  - `segment_dubins_usage_rate`
+  - `guard_fallback_rate`
+  - `dubins_length_ratio`
 
 ## 7. 参数调优建议
 在 `src/milp_sim/config.py`：

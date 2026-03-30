@@ -65,7 +65,7 @@ class SimulationConfig:
     force_astar_only: bool = False
     # Pre-smooth A* polyline by line-of-sight shortcut before Dubins/fillet.
     astar_smooth_before_dubins: bool = True
-    # Hybrid A* path planning is disabled by default; keep the switch for compatibility.
+    # Deprecated no-op: Hybrid A* is intentionally disabled in this project.
     use_hybrid_astar: bool = False
     # If Hybrid A* fails, fall back to legacy A* + Dubins/fillet pipeline.
     hybrid_astar_fallback_to_legacy: bool = True
@@ -134,6 +134,7 @@ class SimulationConfig:
     # Candidate family filter used by the legacy-style Dubins maneuver solver.
     # Supported values: "*", "L", "LS", "R", "RS", "*-L", "*-R", "S".
     dubinsmaneuver_ctrl_dir: str = "*"
+    # Deprecated no-op: local hybrid rescue is intentionally disabled.
     connector_use_hybrid_local_rescue: bool = False
     connector_use_plain_astar_fallback: bool = True
     # Prefer rsplan Reeds-Shepp connector for terminal pose-to-pose local links.
@@ -157,6 +158,9 @@ class SimulationConfig:
     connector_shortcut_enable: bool = True
     connector_string_pull_enable: bool = True
     connector_string_pull_passes: int = 2
+    # Preserve final Dubins geometry in the delivered route instead of
+    # applying route-level beautification that can erase visible arcs.
+    preserve_dubins_route_geometry: bool = True
     connector_max_heading_error_for_straight: float = 0.35
     connector_short_span_heading_error_for_straight: float = 0.70
     connector_split_turn_angle_threshold: float = 0.40
@@ -172,12 +176,16 @@ class SimulationConfig:
     connector_local_hybrid_goal_heading_tolerance_rad: float = 0.95
     dubins_sample_step: float = 0.5
     dubins_collision_margin: float = 0.8
+    # When False, keep trajectory smoothing/guard checks aligned with the
+    # exported path-quality metric margin instead of inflating to full footprint.
+    trajectory_guard_use_vehicle_footprint: bool = False
     # Safety-first defaults: if local fillet smoothing is unsafe, keep A* geometry.
     dubins_fallback_to_astar: bool = True
     # Debug-only switch; when True, it may generate paths that clip obstacles.
     dubins_force_mode: bool = False
     # Blend terminal heading between "face current task" and "face next task".
     # Smaller value reduces local looping near close targets.
+    planning_turn_radius_scale: float = 0.82
     goal_heading_blend_turn_radius_factor: float = 4.0
     # Soft terminal-heading window around blended heading (radians).
     goal_heading_tolerance_rad: float = 1.2

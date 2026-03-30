@@ -31,6 +31,7 @@ class Vehicle:
     route_points: List[Point2D] = field(default_factory=list)
     history_points: List[Point2D] = field(default_factory=list)
     route_length: float = 0.0
+    route_segment_meta: List[dict] = field(default_factory=list)
 
     # Online runtime fields
     active_task_id: Optional[int] = None
@@ -48,6 +49,7 @@ class Vehicle:
         self.route_points = [self.start_pos]
         self.history_points = [self.start_pos]
         self.route_length = 0.0
+        self.route_segment_meta = []
         self.active_task_id = None
         self.active_goal_heading = None
         self.path_cursor = 0

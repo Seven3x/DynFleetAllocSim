@@ -32,6 +32,8 @@ class PathQualityMetricsTests(unittest.TestCase):
         self.assertAlmostEqual(metrics.max_initial_turn_delta_rad, 0.0, places=6)
         self.assertAlmostEqual(metrics.curvature_violation_ratio, 0.0, places=6)
         self.assertAlmostEqual(metrics.heading_jump_p95_rad, 0.0, places=6)
+        self.assertEqual(metrics.heading_sign_flip_count, 0)
+        self.assertAlmostEqual(metrics.oscillation_energy_rad, 0.0, places=6)
 
     def test_right_angle_path_has_heading_jump_and_lower_summary_score(self) -> None:
         straight = evaluate_path_quality(
@@ -51,15 +53,33 @@ class PathQualityMetricsTests(unittest.TestCase):
             astar_length=7.0,
             fallback_used=True,
             fallback_reason="unit_test",
+            task_waypoint_indices=[1],
         )
 
         self.assertGreater(corner.heading_jump_p95_rad, 0.0)
         self.assertGreater(corner.curvature_violation_ratio, 0.0)
+        self.assertGreater(corner.max_task_joint_turn_delta_rad, 0.0)
         summary = summarize_path_quality([straight, corner])
         self.assertEqual(summary.path_count, 2)
         self.assertGreater(summary.fallback_rate, 0.0)
         self.assertLess(summary.pqi_score, 100.0)
         self.assertGreaterEqual(summary.mean_max_initial_turn_delta_rad, 0.0)
+
+    def test_zigzag_path_reports_sign_flips_and_oscillation_energy(self) -> None:
+        metrics = evaluate_path_quality(
+            world=self.world,
+            points=[(2.0, 2.0), (4.0, 3.0), (6.0, 2.0), (8.0, 3.0), (10.0, 2.0)],
+            turn_radius=20.0,
+            sample_step=0.25,
+            start_heading=0.0,
+            astar_length=8.0,
+        )
+
+        self.assertGreater(metrics.heading_sign_flip_count, 0)
+        self.assertGreater(metrics.oscillation_energy_rad, 0.0)
+        summary = summarize_path_quality([metrics])
+        self.assertGreater(summary.mean_heading_sign_flip_count, 0.0)
+        self.assertGreater(summary.mean_oscillation_energy_rad, 0.0)
 
     def test_path_crossing_obstacle_is_detected(self) -> None:
         world = WorldMap(
@@ -78,6 +98,19 @@ class PathQualityMetricsTests(unittest.TestCase):
 
         self.assertFalse(metrics.collision_free)
         self.assertAlmostEqual(metrics.min_clearance, 0.0, places=6)
+
+    def test_task_waypoint_joint_turn_is_measured(self) -> None:
+        metrics = evaluate_path_quality(
+            world=self.world,
+            points=[(2.0, 2.0), (6.0, 2.0), (6.0, 6.0), (10.0, 6.0)],
+            turn_radius=10.0,
+            sample_step=1.0,
+            start_heading=0.0,
+            task_waypoint_indices=[1, 2],
+        )
+
+        self.assertGreater(metrics.mean_task_joint_turn_delta_rad, 0.0)
+        self.assertGreater(metrics.max_task_joint_turn_delta_rad, 0.0)
 
 
 if __name__ == "__main__":

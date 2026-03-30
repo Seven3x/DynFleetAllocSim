@@ -66,7 +66,8 @@ def select_best_heading_path(
     astar_length: Optional[float] = None,
     build_path_fn: Callable[..., Tuple[List[Point2D], float, DubinsHybridMeta]] = build_dubins_hybrid_path,
 ) -> HeadingSelectionResult:
-    use_hybrid_mode = bool(getattr(cfg, "use_hybrid_astar", False))
+    # Hybrid A* is intentionally disabled project-wide; keep legacy config fields inert.
+    use_hybrid_mode = False
     stop_on_first_non_fallback = bool(getattr(cfg, "hybrid_astar_stop_on_first_non_fallback", True))
     primary_disable_retry = bool(getattr(cfg, "hybrid_astar_primary_disable_retry", True))
     cfg_no_hybrid_retry = cfg

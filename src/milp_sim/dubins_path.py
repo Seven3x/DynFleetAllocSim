@@ -1156,40 +1156,6 @@ def build_segment_connector_path(
             else:
                 event_counts["connector_collision_reject"] += 1
 
-        if (
-            (not accepted_points)
-            and (not span_position_only)
-            and use_custom_connector
-            and bool(getattr(cfg, "use_hybrid_astar", False))
-            and bool(getattr(cfg, "connector_use_hybrid_local_rescue", True))
-        ):
-            points, length, diag = astar_planner.plan_hybrid_detailed(
-                start_pose=current_pose,
-                goal_pose=span_goal,
-                turn_radius=turn_radius,
-                step_size=float(getattr(cfg, "hybrid_astar_step_size", 1.0)),
-                heading_bins=hybrid_heading_bins,
-                max_expansions=hybrid_max_expansions,
-                goal_pos_tolerance=hybrid_goal_pos_tol,
-                goal_heading_tolerance=hybrid_goal_yaw_tol,
-                allow_reverse=allow_reverse,
-                reverse_penalty=float(getattr(cfg, "hybrid_astar_reverse_penalty", 1.22)),
-                heuristic_weight=float(getattr(cfg, "hybrid_astar_heuristic_weight", 1.05)),
-                near_goal_connector_expansions=rs_max_expansions,
-                near_goal_connector_depth=rs_max_depth,
-                near_goal_connector_radius_factor=max(1.5, corridor_radius / max(turn_radius, 1e-6)),
-                search_bbox=span_bbox,
-            )
-            if points and math.isfinite(length):
-                accepted_points = points
-                accepted_length = length
-                accepted_heading = span_goal[2]
-                success_counts["hybrid_local"] += 1
-                event_counts["connector_hybrid_local_success"] += 1
-                debug_parts.append(f"span{idx}:connector_hybrid_local_success")
-            elif getattr(diag, "reason", "") == "collision_on_connector":
-                event_counts["connector_collision_reject"] += 1
-
         if not accepted_points and (plain_astar_ok or span_position_only):
             span_astar_path, span_astar_len = astar_planner.plan(current_pose[:2], target_point)
             if span_astar_path and math.isfinite(span_astar_len):
@@ -1871,8 +1837,8 @@ def build_dubins_hybrid_path(
             meta.fallback_reason = _primary_reason_token(meta.fallback_details, default="hybrid_astar_fallback")
         return points, length, meta
 
-    # Primary mode: Hybrid A* on (x, y, yaw) state space.
-    if use_dubins_hybrid and bool(getattr(cfg, "use_hybrid_astar", False)):
+    # Hybrid A* is intentionally disabled project-wide.
+    if False:
         planner_clearance = max(0.0, float(getattr(astar_planner, "inflation_radius", 0.0)))
 
         def _try_hybrid_once(
